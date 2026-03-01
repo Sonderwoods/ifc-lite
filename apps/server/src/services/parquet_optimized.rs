@@ -274,9 +274,14 @@ pub fn serialize_to_parquet_optimized(
     let mut vertex_y: Vec<u16> = Vec::with_capacity(total_vertices);
     let mut vertex_z: Vec<u16> = Vec::with_capacity(total_vertices);
 
-    // Oct-encoded normals (2 bytes per normal instead of 12)
-    let mut normal_xy: Vec<u8> = if include_normals {
-        Vec::with_capacity(total_vertices * 2)
+    // Oct-encoded normals: separate x/y channels (avoids interleave-then-split)
+    let mut oct_nx: Vec<u8> = if include_normals {
+        Vec::with_capacity(total_vertices)
+    } else {
+        Vec::new()
+    };
+    let mut oct_ny: Vec<u8> = if include_normals {
+        Vec::with_capacity(total_vertices)
     } else {
         Vec::new()
     };
@@ -328,13 +333,19 @@ pub fn serialize_to_parquet_optimized(
             vertex_z.push(quantize_relative(z, bounds.min_z, bounds.max_z));
 
             if include_normals {
-                // Transform normals Z-up → Y-up, then oct-encode
-                let nx = mesh.normals[i * 3];
-                let ny = mesh.normals[i * 3 + 2]; // new Y = old Z
-                let nz = -mesh.normals[i * 3 + 1]; // new Z = -old Y
-                let encoded = oct_encode_normal(nx, ny, nz);
-                normal_xy.push(encoded[0]);
-                normal_xy.push(encoded[1]);
+                if mesh.normals.len() >= (i + 1) * 3 {
+                    // Transform normals Z-up → Y-up, then oct-encode
+                    let nx = mesh.normals[i * 3];
+                    let ny = mesh.normals[i * 3 + 2]; // new Y = old Z
+                    let nz = -mesh.normals[i * 3 + 1]; // new Z = -old Y
+                    let encoded = oct_encode_normal(nx, ny, nz);
+                    oct_nx.push(encoded[0]);
+                    oct_ny.push(encoded[1]);
+                } else {
+                    // Fallback: missing normal data → default up normal
+                    oct_nx.push(128);
+                    oct_ny.push(128);
+                }
             }
         }
 
@@ -440,18 +451,14 @@ pub fn serialize_to_parquet_optimized(
     };
 
     let vertex_batch = if include_normals {
-        // Split interleaved oct-normal bytes into separate x/y columns
-        let oct_x: Vec<u8> = normal_xy.iter().step_by(2).copied().collect();
-        let oct_y: Vec<u8> = normal_xy.iter().skip(1).step_by(2).copied().collect();
-
         RecordBatch::try_new(
             vertex_schema,
             vec![
                 Arc::new(UInt16Array::from(vertex_x)),
                 Arc::new(UInt16Array::from(vertex_y)),
                 Arc::new(UInt16Array::from(vertex_z)),
-                Arc::new(UInt8Array::from(oct_x)),
-                Arc::new(UInt8Array::from(oct_y)),
+                Arc::new(UInt8Array::from(oct_nx)),
+                Arc::new(UInt8Array::from(oct_ny)),
             ],
         )?
     } else {

@@ -520,29 +520,46 @@ function decodeV3QuantizedMesh(
   matR: Uint8Array, matG: Uint8Array, matB: Uint8Array, matA: Uint8Array,
   indices: Uint32Array, hasNormals: boolean
 ): MeshData[] {
-  // u16 vertex columns
-  const vertexX = vertexArrow.getChild('x')?.toArray() as Uint16Array;
-  const vertexY = vertexArrow.getChild('y')?.toArray() as Uint16Array;
-  const vertexZ = vertexArrow.getChild('z')?.toArray() as Uint16Array;
+  // u16 vertex columns — required for v3
+  const vertexX = vertexArrow.getChild('x')?.toArray() as Uint16Array | null;
+  const vertexY = vertexArrow.getChild('y')?.toArray() as Uint16Array | null;
+  const vertexZ = vertexArrow.getChild('z')?.toArray() as Uint16Array | null;
+  if (!vertexX || !vertexY || !vertexZ) {
+    throw new Error('Malformed v3 payload: missing required vertex columns (x, y, z)');
+  }
 
   // Oct-encoded normal columns (u8)
   const octNX = hasNormals ? (vertexArrow.getChild('oct_nx')?.toArray() as Uint8Array) : null;
   const octNY = hasNormals ? (vertexArrow.getChild('oct_ny')?.toArray() as Uint8Array) : null;
 
-  // Per-mesh bounding boxes for dequantization
-  const meshMinX = meshArrow.getChild('min_x')?.toArray() as Float32Array;
-  const meshMaxX = meshArrow.getChild('max_x')?.toArray() as Float32Array;
-  const meshMinY = meshArrow.getChild('min_y')?.toArray() as Float32Array;
-  const meshMaxY = meshArrow.getChild('max_y')?.toArray() as Float32Array;
-  const meshMinZ = meshArrow.getChild('min_z')?.toArray() as Float32Array;
-  const meshMaxZ = meshArrow.getChild('max_z')?.toArray() as Float32Array;
+  // Per-mesh bounding boxes — required for v3 dequantization
+  const meshMinX = meshArrow.getChild('min_x')?.toArray() as Float32Array | null;
+  const meshMaxX = meshArrow.getChild('max_x')?.toArray() as Float32Array | null;
+  const meshMinY = meshArrow.getChild('min_y')?.toArray() as Float32Array | null;
+  const meshMaxY = meshArrow.getChild('max_y')?.toArray() as Float32Array | null;
+  const meshMinZ = meshArrow.getChild('min_z')?.toArray() as Float32Array | null;
+  const meshMaxZ = meshArrow.getChild('max_z')?.toArray() as Float32Array | null;
+  if (!meshMinX || !meshMaxX || !meshMinY || !meshMaxY || !meshMinZ || !meshMaxZ) {
+    throw new Error('Malformed v3 payload: missing required mesh bounding box columns');
+  }
 
+  const meshCount = meshVertexOffsets.length;
+  const materialCount = matR.length;
   const instanceCount = entityIds.length;
   const meshes: MeshData[] = new Array(instanceCount);
 
   for (let i = 0; i < instanceCount; i++) {
     const meshIdx = meshIndices[i];
     const materialIdx = materialIndices[i];
+
+    // Validate instance references are within bounds
+    if (meshIdx >= meshCount) {
+      throw new Error(`Instance ${i}: mesh_index ${meshIdx} out of range (${meshCount} meshes)`);
+    }
+    if (materialIdx >= materialCount) {
+      throw new Error(`Instance ${i}: material_index ${materialIdx} out of range (${materialCount} materials)`);
+    }
+
     const vertexOffset = meshVertexOffsets[meshIdx];
     const vertexCount = meshVertexCounts[meshIdx];
     const indexOffset = meshIndexOffsets[meshIdx];
