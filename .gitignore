@@ -57,3 +57,4 @@ tests/models/local/*
 
 # Large IFC test fixtures (downloaded separately)
 rust/geometry/tests/*.ifc
+/.cache-rtc-fresh
