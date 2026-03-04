@@ -1,0 +1,13 @@
+
+# START SERVER
+cd C:\Users\mass\GitHub\ifc-lite
+$env:PORT="8080"
+$env:RUST_LOG="warn"
+.\target\release\ifc-lite-server.exe
+
+
+# SLUK BUILD
+Get-Process cargo,rustc -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# BUILD
+PS C:\Users\mass\GitHub\ifc-lite> cargo build -p ifc-lite-server --release
