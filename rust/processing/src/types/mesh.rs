@@ -5,6 +5,7 @@
 //! Mesh data types for serialization.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Individual mesh data with geometry and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,10 @@ pub struct MeshData {
     /// Optional source geometry item id for submesh outputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geometry_item_id: Option<u32>,
+    /// Optional IFC property set values keyed by IFC property names.
+    /// Primarily attached for IfcSpace/IfcZone so downstream tools can build room attribute UIs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, String>>,
 }
 
 impl MeshData {
@@ -60,6 +65,7 @@ impl MeshData {
             color,
             material_name: None,
             geometry_item_id: None,
+            properties: None,
         }
     }
 
@@ -84,6 +90,12 @@ impl MeshData {
     ) -> Self {
         self.material_name = material_name;
         self.geometry_item_id = geometry_item_id;
+        self
+    }
+
+    /// Attach optional IFC property set values.
+    pub fn with_properties(mut self, properties: Option<BTreeMap<String, String>>) -> Self {
+        self.properties = properties;
         self
     }
 

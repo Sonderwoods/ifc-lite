@@ -14,6 +14,14 @@ pub struct ParseResponse {
     pub cache_key: String,
     /// All meshes extracted from the IFC file.
     pub meshes: Vec<MeshData>,
+    /// IfcSite ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
+    /// Used by clients to relocate geometry between global and site-local coordinate systems.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_transform: Option<Vec<f64>>,
+    /// IfcBuilding ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
+    /// Used by clients to relocate geometry between global and building-local coordinate systems.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub building_transform: Option<Vec<f64>>,
     /// Model metadata.
     pub metadata: ModelMetadata,
     /// Processing statistics.

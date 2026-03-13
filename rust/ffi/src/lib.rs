@@ -11,7 +11,7 @@
 //! Build: `cargo build --release -p ifc-lite-ffi`
 //! Output: `target/release/ifc_lite_ffi.dll`
 
-use ifc_lite_processing::{process_geometry, ParseResponse};
+use ifc_lite_processing::{process_geometry, process_geometry_filtered, OpeningFilterMode, ParseResponse};
 use std::slice;
 
 /// Parse an IFC file and return JSON bytes.
@@ -64,6 +64,8 @@ pub unsafe extern "C" fn ifc_lite_parse(
     let response = ParseResponse {
         cache_key: String::new(),
         meshes: result.meshes,
+        site_transform: result.site_transform,
+        building_transform: result.building_transform,
         metadata: result.metadata,
         stats: result.stats,
     };
@@ -75,6 +77,76 @@ pub unsafe extern "C" fn ifc_lite_parse(
     };
 
     // Allocate and copy to caller
+    let len = json_bytes.len();
+    let ptr = Box::into_raw(json_bytes.into_boxed_slice()) as *mut u8;
+
+    *out_ptr = ptr;
+    *out_len = len;
+
+    0
+}
+
+/// Parse an IFC file with a configurable opening filter and return JSON bytes.
+///
+/// # Arguments
+/// - `path_ptr` / `path_len`: UTF-8 encoded file path
+/// - `opening_filter_mode`: 0 = Default, 1 = IgnoreAll, 2 = IgnoreOpaque
+/// - `out_ptr`: receives pointer to allocated JSON bytes
+/// - `out_len`: receives length of allocated JSON bytes
+///
+/// # Returns
+/// Same error codes as `ifc_lite_parse`.
+///
+/// # Safety
+/// Caller must free the returned buffer with `ifc_lite_free`.
+#[no_mangle]
+pub unsafe extern "C" fn ifc_lite_parse_ex(
+    path_ptr: *const u8,
+    path_len: usize,
+    opening_filter_mode: i32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    let path_bytes = slice::from_raw_parts(path_ptr, path_len);
+    let path_str = match std::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    let content = match std::fs::read_to_string(path_str) {
+        Ok(c) => c,
+        Err(_) => return 2,
+    };
+
+    let mode = match opening_filter_mode {
+        1 => OpeningFilterMode::IgnoreAll,
+        2 => OpeningFilterMode::IgnoreOpaque,
+        _ => OpeningFilterMode::Default,
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        process_geometry_filtered(&content, mode)
+    }));
+
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => return 3,
+    };
+
+    let response = ParseResponse {
+        cache_key: String::new(),
+        meshes: result.meshes,
+        site_transform: result.site_transform,
+        building_transform: result.building_transform,
+        metadata: result.metadata,
+        stats: result.stats,
+    };
+
+    let json_bytes = match serde_json::to_vec(&response) {
+        Ok(b) => b,
+        Err(_) => return 4,
+    };
+
     let len = json_bytes.len();
     let ptr = Box::into_raw(json_bytes.into_boxed_slice()) as *mut u8;
 
