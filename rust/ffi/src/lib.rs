@@ -64,6 +64,7 @@ pub unsafe extern "C" fn ifc_lite_parse(
     let response = ParseResponse {
         cache_key: String::new(),
         meshes: result.meshes,
+        mesh_coordinate_space: result.mesh_coordinate_space,
         site_transform: result.site_transform,
         building_transform: result.building_transform,
         metadata: result.metadata,
@@ -136,6 +137,7 @@ pub unsafe extern "C" fn ifc_lite_parse_ex(
     let response = ParseResponse {
         cache_key: String::new(),
         meshes: result.meshes,
+        mesh_coordinate_space: result.mesh_coordinate_space,
         site_transform: result.site_transform,
         building_transform: result.building_transform,
         metadata: result.metadata,

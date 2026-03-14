@@ -110,6 +110,7 @@ pub async fn parse_full(
     let response = ParseResponse {
         cache_key: cache_key.clone(),
         meshes: result.meshes,
+        mesh_coordinate_space: result.mesh_coordinate_space,
         site_transform: result.site_transform,
         building_transform: result.building_transform,
         metadata: result.metadata,

@@ -32,12 +32,59 @@ pub enum OpeningFilterMode {
 /// Result of processing an IFC file.
 pub struct ProcessingResult {
     pub meshes: Vec<MeshData>,
+    /// Declares the coordinate space used by serialized mesh vertices.
+    pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as column-major 4x4 matrix (in meters).
     pub site_transform: Option<Vec<f64>>,
     /// IfcBuilding ObjectPlacement as column-major 4x4 matrix (in meters).
     pub building_transform: Option<Vec<f64>>,
     pub metadata: ModelMetadata,
     pub stats: ProcessingStats,
+}
+
+const SITE_LOCAL_MESH_COORDINATE_SPACE: &str = "site_local";
+
+fn apply_inverse_rotation_in_place(values: &mut [f32], column_major_matrix: &[f64]) {
+    if values.len() < 3 || column_major_matrix.len() < 16 {
+        return;
+    }
+
+    let r00 = column_major_matrix[0];
+    let r10 = column_major_matrix[1];
+    let r20 = column_major_matrix[2];
+    let r01 = column_major_matrix[4];
+    let r11 = column_major_matrix[5];
+    let r21 = column_major_matrix[6];
+    let r02 = column_major_matrix[8];
+    let r12 = column_major_matrix[9];
+    let r22 = column_major_matrix[10];
+
+    const EPS: f64 = 1e-9;
+    let is_identity =
+        (r00 - 1.0).abs() < EPS && r10.abs() < EPS && r20.abs() < EPS &&
+        r01.abs() < EPS && (r11 - 1.0).abs() < EPS && r21.abs() < EPS &&
+        r02.abs() < EPS && r12.abs() < EPS && (r22 - 1.0).abs() < EPS;
+    if is_identity {
+        return;
+    }
+
+    for chunk in values.chunks_exact_mut(3) {
+        let x = chunk[0] as f64;
+        let y = chunk[1] as f64;
+        let z = chunk[2] as f64;
+        chunk[0] = (r00 * x + r10 * y + r20 * z) as f32;
+        chunk[1] = (r01 * x + r11 * y + r21 * z) as f32;
+        chunk[2] = (r02 * x + r12 * y + r22 * z) as f32;
+    }
+}
+
+fn convert_mesh_to_site_local(mesh: &mut MeshData, site_transform: Option<&Vec<f64>>) {
+    let Some(site_transform) = site_transform else {
+        return;
+    };
+
+    apply_inverse_rotation_in_place(&mut mesh.positions, site_transform);
+    apply_inverse_rotation_in_place(&mut mesh.normals, site_transform);
 }
 
 /// Job for processing a single entity.
@@ -573,8 +620,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                                 )
                             });
 
-                            out.push(
-                                MeshData::new(
+                            let mut mesh_data = MeshData::new(
                                     job.id,
                                     job.ifc_type.name().to_string(),
                                     sub_mesh.positions,
@@ -588,8 +634,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                                     presentation_layer.clone(),
                                 )
                                 .with_properties(space_zone_properties.clone())
-                                .with_style_metadata(material_name, Some(sub.geometry_id)),
-                            );
+                                .with_style_metadata(material_name, Some(sub.geometry_id));
+                            convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
+                            out.push(mesh_data);
                         }
 
                         if !out.is_empty() {
@@ -618,7 +665,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                         calculate_normals(&mut mesh);
                     }
 
-                    return vec![MeshData::new(
+                    let mut mesh_data = MeshData::new(
                         job.id,
                         job.ifc_type.name().to_string(),
                         mesh.positions,
@@ -627,7 +674,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                         element_color,
                     )
                     .with_element_metadata(global_id, name, presentation_layer)
-                    .with_properties(space_zone_properties)];
+                    .with_properties(space_zone_properties);
+                    convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
+                    return vec![mesh_data];
                 }
             }
 
@@ -653,6 +702,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
 
     ProcessingResult {
         meshes: meshes.clone(),
+        mesh_coordinate_space: Some(SITE_LOCAL_MESH_COORDINATE_SPACE.to_string()),
         site_transform,
         building_transform,
         metadata: ModelMetadata {
@@ -660,10 +710,8 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
             entity_count: total_entities,
             geometry_entity_count,
             coordinate_info: CoordinateInfo {
-                origin_shift: [rtc_offset.0, rtc_offset.1, rtc_offset.2],
-                is_geo_referenced: rtc_offset.0 != 0.0
-                    || rtc_offset.1 != 0.0
-                    || rtc_offset.2 != 0.0,
+                origin_shift: [0.0, 0.0, 0.0],
+                is_geo_referenced: site_entity_pos.is_some(),
             },
         },
         stats: ProcessingStats {

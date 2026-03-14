@@ -14,6 +14,11 @@ pub struct ParseResponse {
     pub cache_key: String,
     /// All meshes extracted from the IFC file.
     pub meshes: Vec<MeshData>,
+    /// Declares the coordinate space used by serialized mesh vertices.
+    /// `site_local` means clients should bake meshes directly and only apply
+    /// placement transforms on the block instance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
     /// Used by clients to relocate geometry between global and site-local coordinate systems.
     #[serde(skip_serializing_if = "Option::is_none")]
