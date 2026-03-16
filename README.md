@@ -1,3 +1,7 @@
+> **Rhino/Desktop Integration:** See [IfcLite-Rhino-Implementation.md](./IfcLite-Rhino-Implementation.md) for a detailed write-up on integrating IFC-Lite into a native C#/.NET desktop application via FFI — including the new `rust/ffi/` and `rust/processing/` crates, opening filter modes, and dual FFI/server architecture.
+
+---
+
 <table align="center">
 <tr>
 <td valign="top">

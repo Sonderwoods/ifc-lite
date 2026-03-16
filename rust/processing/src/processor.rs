@@ -515,8 +515,21 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         "Entity scanning complete"
     );
 
+    // When IgnoreAll, skip inner curves in IfcArbitraryProfileDefWithVoids so walls
+    // with window openings baked into the 2D profile (Revit export pattern) come out clean.
+    let skip_profile_voids = opening_filter == OpeningFilterMode::IgnoreAll;
+
     // Preprocess complex geometry
-    let mut router = GeometryRouter::with_units(content, &mut decoder);
+    let mut router = {
+        // Extract unit scale from the IFC file (scan for IFCPROJECT).
+        let tmp = GeometryRouter::with_units(content, &mut decoder);
+        let scale = tmp.unit_scale();
+        if skip_profile_voids {
+            GeometryRouter::with_scale_rtc_and_skip_voids(scale, (0.0, 0.0, 0.0), true)
+        } else {
+            tmp
+        }
+    };
 
     // Resolve IfcSite and IfcBuilding placement transforms.
     // The Site placement translation is used as the RTC offset so that mesh
@@ -582,7 +595,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                 return Vec::new();
             }
 
-            let local_router = GeometryRouter::with_scale_and_rtc(unit_scale, rtc_offset);
+            let local_router = GeometryRouter::with_scale_rtc_and_skip_voids(unit_scale, rtc_offset, skip_profile_voids);
             let global_id = job.global_id.clone();
             let name = job.name.clone();
             let presentation_layer = job.presentation_layer.clone();

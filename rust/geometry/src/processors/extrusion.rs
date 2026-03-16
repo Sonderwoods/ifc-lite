@@ -28,6 +28,13 @@ impl ExtrudedAreaSolidProcessor {
             profile_processor: ProfileProcessor::new(schema),
         }
     }
+
+    /// Create a processor that ignores inner curves in `IfcArbitraryProfileDefWithVoids`.
+    pub fn new_skip_profile_voids(schema: IfcSchema) -> Self {
+        Self {
+            profile_processor: ProfileProcessor::new_skip_voids(schema),
+        }
+    }
 }
 
 impl GeometryProcessor for ExtrudedAreaSolidProcessor {

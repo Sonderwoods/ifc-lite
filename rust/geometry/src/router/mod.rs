@@ -72,6 +72,17 @@ pub struct GeometryRouter {
 impl GeometryRouter {
     /// Create new router with default processors
     pub fn new() -> Self {
+        Self::new_with_options(false)
+    }
+
+    /// Create a router that ignores inner curves in `IfcArbitraryProfileDefWithVoids`,
+    /// producing solid wall meshes without window/door openings baked into profiles.
+    pub fn new_skip_profile_voids() -> Self {
+        Self::new_with_options(true)
+    }
+
+    /// Internal constructor with all option flags.
+    fn new_with_options(skip_profile_voids: bool) -> Self {
         let schema = IfcSchema::new();
         let schema_clone = schema.clone();
         let mut router = Self {
@@ -85,9 +96,12 @@ impl GeometryRouter {
         };
 
         // Register default P0 processors
-        router.register(Box::new(ExtrudedAreaSolidProcessor::new(
-            schema_clone.clone(),
-        )));
+        let extrusion_processor = if skip_profile_voids {
+            Box::new(ExtrudedAreaSolidProcessor::new_skip_profile_voids(schema_clone.clone()))
+        } else {
+            Box::new(ExtrudedAreaSolidProcessor::new(schema_clone.clone()))
+        };
+        router.register(extrusion_processor);
         router.register(Box::new(TriangulatedFaceSetProcessor::new()));
         router.register(Box::new(PolygonalFaceSetProcessor::new()));
         router.register(Box::new(MappedItemProcessor::new()));
@@ -169,6 +183,24 @@ impl GeometryRouter {
     /// Create router with both unit scale and RTC offset
     pub fn with_scale_and_rtc(unit_scale: f64, rtc_offset: (f64, f64, f64)) -> Self {
         let mut router = Self::new();
+        router.unit_scale = unit_scale;
+        router.rtc_offset = rtc_offset;
+        router
+    }
+
+    /// Create router with unit scale, RTC offset, and profile-void skipping.
+    /// When `skip_profile_voids` is true, inner curves in `IfcArbitraryProfileDefWithVoids`
+    /// are ignored so walls come out without window/door openings baked into profiles.
+    pub fn with_scale_rtc_and_skip_voids(
+        unit_scale: f64,
+        rtc_offset: (f64, f64, f64),
+        skip_profile_voids: bool,
+    ) -> Self {
+        let mut router = if skip_profile_voids {
+            Self::new_skip_profile_voids()
+        } else {
+            Self::new()
+        };
         router.unit_scale = unit_scale;
         router.rtc_offset = rtc_offset;
         router
