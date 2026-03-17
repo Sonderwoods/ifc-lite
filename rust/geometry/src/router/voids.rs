@@ -554,8 +554,14 @@ impl GeometryRouter {
         for opening in openings.iter() {
             match opening {
                 OpeningType::Rectangular(open_min, open_max, extrusion_dir, is_diagonal) => {
-                    // Use AABB clipping for all rectangular openings
-                    let (final_min, final_max) = if let Some(dir) = extrusion_dir {
+                    // For diagonal openings, skip AABB extension entirely.
+                    // extend_opening_along_direction projects along the extrusion direction
+                    // then takes axis-aligned min/max of the result, which balloons the box
+                    // for diagonal walls (e.g. a 1.5m opening becomes an 8m+ AABB that eats
+                    // most of the wall geometry).
+                    let (final_min, final_max) = if *is_diagonal {
+                        (*open_min, *open_max)
+                    } else if let Some(dir) = extrusion_dir {
                         // Extend along the actual extrusion direction to penetrate multi-layer walls
                         self.extend_opening_along_direction(*open_min, *open_max, wall_min, wall_max, *dir)
                     } else {
