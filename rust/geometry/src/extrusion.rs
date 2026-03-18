@@ -22,6 +22,21 @@ pub fn extrude_profile(
         ));
     }
 
+    // #region agent log H3/H4 - Profile bounds at extrusion entry
+    let (min_x, max_x, min_y, max_y) = profile.outer.iter().fold(
+        (f64::MAX, f64::MIN, f64::MAX, f64::MIN),
+        |(min_x, max_x, min_y, max_y), p| {
+            (min_x.min(p.x), max_x.max(p.x), min_y.min(p.y), max_y.max(p.y))
+        }
+    );
+    let profile_span = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2)).sqrt();
+    // Log to stderr for capture - H3/H4 hypothesis testing
+    if profile_span > 10.0 {
+        eprintln!("[DEBUG-H3H4] extrude_profile: span={:.2}m pts={} X=[{:.2},{:.2}] Y=[{:.2},{:.2}] depth={:.3}",
+            profile_span, profile.outer.len(), min_x, max_x, min_y, max_y, depth);
+    }
+    // #endregion
+
     // Check if profile has extreme aspect ratio (very elongated)
     // This detects profiles like railings that span building perimeters
     // and would create stretched triangles when triangulated
@@ -295,6 +310,9 @@ fn create_cap_mesh(triangulation: &Triangulation, z: f64, normal: Vector3<f64>, 
 
     // Add triangles
     for i in (0..triangulation.indices.len()).step_by(3) {
+        if i + 2 >= triangulation.indices.len() {
+            break;
+        }
         let i0 = base_index + triangulation.indices[i] as u32;
         let i1 = base_index + triangulation.indices[i + 1] as u32;
         let i2 = base_index + triangulation.indices[i + 2] as u32;

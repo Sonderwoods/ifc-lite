@@ -6,8 +6,8 @@
 
 use crate::error::ApiError;
 use crate::services::{
-    cache::DiskCache, extract_data_model, process_geometry, process_geometry_filtered,
-    process_streaming, serialize_data_model_to_parquet, serialize_to_parquet,
+    cache::DiskCache, extract_data_model, process_geometry_filtered, process_streaming,
+    serialize_data_model_to_parquet, serialize_to_parquet,
     serialize_to_parquet_optimized_with_stats, OpeningFilterMode, OptimizedStats, VERTEX_MULTIPLIER,
 };
 use crate::types::{MetadataResponse, ModelMetadata, ParseResponse, ProcessingStats, StreamEvent};
@@ -110,9 +110,6 @@ pub async fn parse_full(
     let response = ParseResponse {
         cache_key: cache_key.clone(),
         meshes: result.meshes,
-        mesh_coordinate_space: result.mesh_coordinate_space,
-        site_transform: result.site_transform,
-        building_transform: result.building_transform,
         metadata: result.metadata,
         stats: result.stats,
     };
