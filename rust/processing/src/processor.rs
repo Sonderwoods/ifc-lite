@@ -107,6 +107,18 @@ struct GeometryStyleInfo {
     material_name: Option<String>,
 }
 
+/// Raw data from IfcMaterialDefinitionRepresentation collected during pre-scan.
+struct MaterialDefinitionRepr {
+    material_id: u32,
+    styled_representation_ids: Vec<u32>,
+}
+
+/// Raw data from IfcRelAssociatesMaterial collected during pre-scan.
+struct RelAssociatesMaterialLink {
+    related_object_ids: Vec<u32>,
+    relating_material_id: u32,
+}
+
 #[derive(Debug, Clone)]
 struct PropertySetDefinition {
     name: Option<String>,
@@ -379,6 +391,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
     tracing::debug!("Built entity index");
 
     let mut geometry_style_index: FxHashMap<u32, GeometryStyleInfo> = FxHashMap::default();
+    let mut orphan_styled_items: FxHashMap<u32, GeometryStyleInfo> = FxHashMap::default();
+    let mut material_def_reprs: Vec<MaterialDefinitionRepr> = Vec::new();
+    let mut rel_associates_material: Vec<RelAssociatesMaterialLink> = Vec::new();
     let mut presentation_layer_by_assigned_id: FxHashMap<u32, String> = FxHashMap::default();
     let mut property_values_by_id: FxHashMap<u32, (String, String)> = FxHashMap::default();
     let mut property_sets_by_id: FxHashMap<u32, PropertySetDefinition> = FxHashMap::default();
@@ -400,7 +415,39 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
 
         if type_name == "IFCSTYLEDITEM" {
             if let Ok(styled_item) = decoder.decode_at(start, end) {
-                collect_geometry_style_info(&mut geometry_style_index, &styled_item, &mut decoder);
+                collect_geometry_style_info(
+                    &mut geometry_style_index,
+                    &mut orphan_styled_items,
+                    id,
+                    &styled_item,
+                    &mut decoder,
+                );
+            }
+            continue;
+        } else if type_name == "IFCMATERIALDEFINITIONREPRESENTATION" {
+            if let Ok(entity) = decoder.decode_at(start, end) {
+                if let Some(material_id) = entity.get_ref(3) {
+                    let styled_repr_ids = get_refs_from_list(&entity, 2).unwrap_or_default();
+                    if !styled_repr_ids.is_empty() {
+                        material_def_reprs.push(MaterialDefinitionRepr {
+                            material_id,
+                            styled_representation_ids: styled_repr_ids,
+                        });
+                    }
+                }
+            }
+            continue;
+        } else if type_name == "IFCRELASSOCIATESMATERIAL" {
+            if let Ok(entity) = decoder.decode_at(start, end) {
+                if let Some(relating_material_id) = entity.get_ref(5) {
+                    let related_ids = get_refs_from_list(&entity, 4).unwrap_or_default();
+                    if !related_ids.is_empty() {
+                        rel_associates_material.push(RelAssociatesMaterialLink {
+                            related_object_ids: related_ids,
+                            relating_material_id,
+                        });
+                    }
+                }
             }
             continue;
         } else if type_name == "IFCPRESENTATIONLAYERASSIGNMENT" {
@@ -482,6 +529,18 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         &rel_defines_by_properties,
     );
 
+    // Build material-based style index from IfcMaterialDefinitionRepresentation chain.
+    let material_style_index = build_material_style_index(
+        &material_def_reprs,
+        &orphan_styled_items,
+        &mut decoder,
+    );
+    let element_material_styles = build_element_material_styles(
+        &rel_associates_material,
+        &material_style_index,
+        &mut decoder,
+    );
+
     resolve_entity_lookups(
         &mut entity_jobs,
         &geometry_style_index,
@@ -494,6 +553,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         &void_index,
         &filling_by_opening,
         &geometry_style_index,
+        &element_material_styles,
         &mut decoder,
         opening_filter,
     );
@@ -574,6 +634,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
     let void_index_arc = Arc::new(filtered_void_index);
     let skipped_entity_ids = Arc::new(skipped_entity_ids);
     let geometry_style_index = Arc::new(geometry_style_index);
+    let element_material_styles = Arc::new(element_material_styles);
 
     let meshes: Vec<MeshData> = entity_jobs
         .into_par_iter()
@@ -621,10 +682,18 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                             }
 
                             let style = geometry_style_index.get(&sub.geometry_id);
-                            let color = style.map(|s| s.color).unwrap_or(element_color);
-                            let material_name = style
-                                .and_then(|s| s.material_name.as_ref())
-                                .map(ToString::to_string);
+                            let (color, material_name) = if let Some(s) = style {
+                                (s.color, s.material_name.clone())
+                            } else if let Some(picked) = element_material_styles
+                                .get(&job.id)
+                                .and_then(|candidates| {
+                                    pick_material_style_for_submesh(candidates, &out)
+                                })
+                            {
+                                (picked.color, picked.material_name.clone())
+                            } else {
+                                (element_color, None)
+                            };
                             let material_name = material_name.or_else(|| {
                                 infer_opening_subpart_material_name(
                                     &job.ifc_type,
@@ -686,10 +755,36 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                         mesh.indices,
                         element_color,
                     )
-                    .with_element_metadata(global_id, name, presentation_layer)
-                    .with_properties(space_zone_properties);
+                    .with_element_metadata(global_id.clone(), name.clone(), presentation_layer.clone())
+                    .with_properties(space_zone_properties.clone());
                     convert_mesh_to_site_local(&mut mesh_data, site_transform.as_ref());
-                    return vec![mesh_data];
+
+                    let mut out = vec![mesh_data];
+
+                    // Generate opening reveal (jamb/sill/head) meshes
+                    let reveals = local_router.generate_opening_reveals(
+                        &entity, &mut local_decoder, void_index_arc.as_ref(),
+                    );
+                    for (opening_id, mut reveal) in reveals {
+                        if reveal.is_empty() { continue; }
+                        if reveal.normals.is_empty() {
+                            calculate_normals(&mut reveal);
+                        }
+                        let mut reveal_data = MeshData::new(
+                            opening_id,
+                            "IfcOpeningReveal".to_string(),
+                            reveal.positions,
+                            reveal.normals,
+                            reveal.indices,
+                            element_color,
+                        )
+                        .with_element_metadata(global_id.clone(), name.clone(), presentation_layer.clone())
+                        .with_style_metadata(Some("OpeningReveal".to_string()), None);
+                        convert_mesh_to_site_local(&mut reveal_data, site_transform.as_ref());
+                        out.push(reveal_data);
+                    }
+
+                    return out;
                 }
             }
 
@@ -741,19 +836,27 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
 
 fn collect_geometry_style_info(
     geometry_styles: &mut FxHashMap<u32, GeometryStyleInfo>,
+    orphan_styled_items: &mut FxHashMap<u32, GeometryStyleInfo>,
+    styled_item_id: u32,
     styled_item: &DecodedEntity,
     decoder: &mut EntityDecoder,
 ) {
-    let Some(geometry_id) = styled_item.get_ref(0) else {
-        return;
-    };
+    let geometry_id = styled_item.get_ref(0);
 
-    if geometry_styles.contains_key(&geometry_id) {
-        return;
-    }
-
-    if let Some(style_info) = extract_style_info_from_styled_item(styled_item, decoder) {
-        geometry_styles.insert(geometry_id, style_info);
+    if let Some(gid) = geometry_id {
+        if geometry_styles.contains_key(&gid) {
+            return;
+        }
+        if let Some(style_info) = extract_style_info_from_styled_item(styled_item, decoder) {
+            geometry_styles.insert(gid, style_info);
+        }
+    } else {
+        // Orphan IfcStyledItem (null Item) — used by IfcMaterialDefinitionRepresentation chain.
+        if !orphan_styled_items.contains_key(&styled_item_id) {
+            if let Some(style_info) = extract_style_info_from_styled_item(styled_item, decoder) {
+                orphan_styled_items.insert(styled_item_id, style_info);
+            }
+        }
     }
 }
 
@@ -1071,6 +1174,7 @@ fn apply_opening_filter(
     void_index: &FxHashMap<u32, Vec<u32>>,
     filling_by_opening: &FxHashMap<u32, u32>,
     geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    element_material_styles: &FxHashMap<u32, Vec<GeometryStyleInfo>>,
     decoder: &mut EntityDecoder,
     mode: OpeningFilterMode,
 ) -> (std::collections::HashSet<u32>, FxHashMap<u32, Vec<u32>>) {
@@ -1109,7 +1213,7 @@ fn apply_opening_filter(
     // Mesh suppression uses element color + style traversal (is_opaque_opening).
     // Void suppression uses IfcRelFillsElement data when available.
     for (&id, job) in &filling_jobs {
-        if is_opaque_opening(job, geometry_style_index, decoder) {
+        if is_opaque_opening(job, geometry_style_index, element_material_styles, decoder) {
             skipped_entity_ids.insert(id);
         }
     }
@@ -1156,6 +1260,7 @@ fn apply_opening_filter(
 fn is_opaque_opening(
     job: &EntityJob,
     styles: &FxHashMap<u32, GeometryStyleInfo>,
+    element_material_styles: &FxHashMap<u32, Vec<GeometryStyleInfo>>,
     decoder: &mut EntityDecoder,
 ) -> bool {
     // 1. Entity name contains "glas" → glazed.
@@ -1227,6 +1332,15 @@ fn is_opaque_opening(
         }
     }
 
+    // 4. Check material-based styles for glass/transparency.
+    if let Some(candidates) = element_material_styles.get(&job.id) {
+        for candidate in candidates {
+            if has_glass_style(candidate) {
+                return false;
+            }
+        }
+    }
+
     true // No glass found → opaque
 }
 
@@ -1274,6 +1388,210 @@ fn infer_opening_subpart_material_name(
     }
 
     Some(format!("{}_Frame_{}", prefix, geometry_id))
+}
+
+/// Build a material_id → GeometryStyleInfo map from IfcMaterialDefinitionRepresentation chain.
+///
+/// Follows: IfcMaterialDefinitionRepresentation → IfcStyledRepresentation → IfcStyledItem (orphan).
+/// The orphan IfcStyledItem entities (with null Item) were collected during the pre-scan.
+fn build_material_style_index(
+    material_def_reprs: &[MaterialDefinitionRepr],
+    orphan_styled_items: &FxHashMap<u32, GeometryStyleInfo>,
+    decoder: &mut EntityDecoder,
+) -> FxHashMap<u32, GeometryStyleInfo> {
+    let mut index: FxHashMap<u32, GeometryStyleInfo> = FxHashMap::default();
+
+    for mdr in material_def_reprs {
+        // Resolve material name from IfcMaterial (attr 0 = Name).
+        let material_name = decoder
+            .decode_by_id(mdr.material_id)
+            .ok()
+            .and_then(|mat| normalize_optional_string(mat.get_string(0)));
+
+        for &styled_repr_id in &mdr.styled_representation_ids {
+            let Ok(styled_repr) = decoder.decode_by_id(styled_repr_id) else {
+                continue;
+            };
+            // IfcStyledRepresentation attr 3 = Items (list of IfcStyledItem refs)
+            let Some(item_ids) = get_refs_from_list(&styled_repr, 3) else {
+                continue;
+            };
+            for item_id in item_ids {
+                if let Some(style_info) = orphan_styled_items.get(&item_id) {
+                    let mut info = style_info.clone();
+                    // Prefer the IfcMaterial name over the surface style name.
+                    if info.material_name.is_none() {
+                        info.material_name = material_name.clone();
+                    }
+                    index.insert(mdr.material_id, info);
+                    break; // One style per material is sufficient.
+                }
+            }
+        }
+    }
+
+    index
+}
+
+/// Build element_id → Vec<GeometryStyleInfo> by resolving IfcRelAssociatesMaterial chains.
+///
+/// Handles: IfcMaterial (direct), IfcMaterialList, IfcMaterialConstituentSet (IFC4),
+/// IfcMaterialLayerSetUsage / IfcMaterialLayerSet (IFC2x3).
+fn build_element_material_styles(
+    rel_associates: &[RelAssociatesMaterialLink],
+    material_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    decoder: &mut EntityDecoder,
+) -> FxHashMap<u32, Vec<GeometryStyleInfo>> {
+    let mut result: FxHashMap<u32, Vec<GeometryStyleInfo>> = FxHashMap::default();
+
+    if material_style_index.is_empty() {
+        return result;
+    }
+
+    for link in rel_associates {
+        let styles = resolve_material_styles(link.relating_material_id, material_style_index, decoder);
+        if styles.is_empty() {
+            continue;
+        }
+        for &element_id in &link.related_object_ids {
+            result
+                .entry(element_id)
+                .or_insert_with(|| styles.clone());
+        }
+    }
+
+    result
+}
+
+/// Resolve all GeometryStyleInfo entries reachable from a relating material reference.
+fn resolve_material_styles(
+    material_ref_id: u32,
+    material_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    decoder: &mut EntityDecoder,
+) -> Vec<GeometryStyleInfo> {
+    // Direct IfcMaterial lookup.
+    if let Some(style) = material_style_index.get(&material_ref_id) {
+        return vec![style.clone()];
+    }
+
+    let Ok(entity) = decoder.decode_by_id(material_ref_id) else {
+        return Vec::new();
+    };
+
+    match entity.ifc_type {
+        // IfcMaterialList: attr 0 = Materials (list of IfcMaterial refs)
+        IfcType::IfcMaterialList => {
+            get_refs_from_list(&entity, 0)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| material_style_index.get(id).cloned())
+                .collect()
+        }
+        // IfcMaterialConstituentSet (IFC4): attr 2 = MaterialConstituents
+        IfcType::IfcMaterialConstituentSet => {
+            get_refs_from_list(&entity, 2)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|&constituent_id| {
+                    let constituent = decoder.decode_by_id(constituent_id).ok()?;
+                    // IfcMaterialConstituent attr 2 = Material (ref to IfcMaterial)
+                    let mat_id = constituent.get_ref(2)?;
+                    material_style_index.get(&mat_id).cloned()
+                })
+                .collect()
+        }
+        // IfcMaterialLayerSetUsage: attr 0 = ForLayerSet (ref to IfcMaterialLayerSet)
+        IfcType::IfcMaterialLayerSetUsage => {
+            let Some(layer_set_id) = entity.get_ref(0) else {
+                return Vec::new();
+            };
+            resolve_material_layer_set_styles(layer_set_id, material_style_index, decoder)
+        }
+        // IfcMaterialLayerSet: attr 0 = MaterialLayers (list of IfcMaterialLayer refs)
+        IfcType::IfcMaterialLayerSet => {
+            resolve_material_layer_set_styles(material_ref_id, material_style_index, decoder)
+        }
+        _ => {
+            // Unknown material type — try treating attr 0 as a nested material ref.
+            if let Some(inner_id) = entity.get_ref(0) {
+                if let Some(style) = material_style_index.get(&inner_id) {
+                    return vec![style.clone()];
+                }
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Resolve styles from an IfcMaterialLayerSet entity.
+fn resolve_material_layer_set_styles(
+    layer_set_id: u32,
+    material_style_index: &FxHashMap<u32, GeometryStyleInfo>,
+    decoder: &mut EntityDecoder,
+) -> Vec<GeometryStyleInfo> {
+    let Ok(layer_set) = decoder.decode_by_id(layer_set_id) else {
+        return Vec::new();
+    };
+    // IfcMaterialLayerSet attr 0 = MaterialLayers (list of IfcMaterialLayer refs)
+    get_refs_from_list(&layer_set, 0)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|&layer_id| {
+            let layer = decoder.decode_by_id(layer_id).ok()?;
+            // IfcMaterialLayer attr 0 = Material (ref to IfcMaterial)
+            let mat_id = layer.get_ref(0)?;
+            material_style_index.get(&mat_id).cloned()
+        })
+        .collect()
+}
+
+/// Pick the best material-based style for a sub-mesh when no direct IfcStyledItem exists.
+///
+/// Strategy: if there are multiple candidate material styles, assign the transparent/glass
+/// one to the first sub-mesh that hasn't already received a transparent style.
+/// This works because windows typically have exactly 2 materials (frame + glass).
+fn pick_material_style_for_submesh<'a>(
+    candidates: &'a [GeometryStyleInfo],
+    already_assigned: &[MeshData],
+) -> Option<&'a GeometryStyleInfo> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(&candidates[0]);
+    }
+
+    // Collect which candidate colors have already been used.
+    let already_used_colors: Vec<[f32; 4]> = already_assigned.iter().map(|m| m.color).collect();
+
+    // Prefer assigning a candidate whose color hasn't been used yet.
+    // Among unused candidates, prefer transparent ones (glass) first.
+    let unused_transparent = candidates.iter().find(|c| {
+        c.color[3] < 0.9 && !already_used_colors.iter().any(|u| colors_match(u, &c.color))
+    });
+    if let Some(t) = unused_transparent {
+        return Some(t);
+    }
+
+    let unused_opaque = candidates.iter().find(|c| {
+        c.color[3] >= 0.9 && !already_used_colors.iter().any(|u| colors_match(u, &c.color))
+    });
+    if let Some(o) = unused_opaque {
+        return Some(o);
+    }
+
+    // All candidates used — fall back to the most transparent one.
+    candidates
+        .iter()
+        .min_by(|a, b| a.color[3].partial_cmp(&b.color[3]).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Check if two RGBA colors are approximately equal.
+fn colors_match(a: &[f32; 4], b: &[f32; 4]) -> bool {
+    (a[0] - b[0]).abs() < 0.01
+        && (a[1] - b[1]).abs() < 0.01
+        && (a[2] - b[2]).abs() < 0.01
+        && (a[3] - b[3]).abs() < 0.01
 }
 
 /// Get default color based on IFC type.

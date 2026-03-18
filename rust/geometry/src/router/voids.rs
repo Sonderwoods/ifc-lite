@@ -443,9 +443,11 @@ impl GeometryRouter {
         // For rectangular openings, get individual bounds per representation item to handle
         // disconnected geometry (e.g., two separate window openings in one IfcOpeningElement)
         enum OpeningType {
-            /// Rectangular opening with AABB clipping
-            /// Fields: (min_bounds, max_bounds, extrusion_direction, is_diagonal)
-            Rectangular(Point3<f64>, Point3<f64>, Option<Vector3<f64>>, bool),
+            /// Axis-aligned rectangular opening with AABB clipping
+            Rectangular(Point3<f64>, Point3<f64>, Option<Vector3<f64>>),
+            /// Diagonal rectangular opening — carries the opening mesh so we can
+            /// compute tight bounds in rotated space from actual vertex positions
+            DiagonalRectangular(Mesh, Vector3<f64>),
             /// Non-rectangular opening (circular, arched, or floor openings with rotated footprint)
             /// Uses full CSG subtraction with actual mesh geometry
             NonRectangular(Mesh),
@@ -487,20 +489,30 @@ impl GeometryRouter {
                     if is_floor_opening && vertex_count > 0 {
                         openings.push(OpeningType::NonRectangular(opening_mesh.clone()));
                     } else {
-                        // Use AABB clipping for wall openings (X/Y extrusion)
-                        // Mark diagonal ones so we skip internal face generation (which causes artifacts)
-                        for (min_pt, max_pt, extrusion_dir) in item_bounds_with_dir {
-                            // Check if extrusion direction is diagonal (not axis-aligned)
-                            let is_diagonal = extrusion_dir.map(|dir| {
+                        // Check if any item has a diagonal extrusion direction
+                        let any_diagonal = item_bounds_with_dir.iter().any(|(_, _, extrusion_dir)| {
+                            extrusion_dir.map(|dir| {
                                 const AXIS_THRESHOLD: f64 = 0.95;
                                 let abs_x = dir.x.abs();
                                 let abs_y = dir.y.abs();
                                 let abs_z = dir.z.abs();
-                                // Diagonal if no single component dominates (>95% of magnitude)
                                 !(abs_x > AXIS_THRESHOLD || abs_y > AXIS_THRESHOLD || abs_z > AXIS_THRESHOLD)
-                            }).unwrap_or(false);
+                            }).unwrap_or(false)
+                        });
 
-                            openings.push(OpeningType::Rectangular(min_pt, max_pt, extrusion_dir, is_diagonal));
+                        if any_diagonal {
+                            // For diagonal walls, pass the full opening mesh so we can
+                            // compute tight bounds from actual vertex positions in rotated space.
+                            // All items share the same extrusion direction.
+                            let dir = item_bounds_with_dir.iter()
+                                .find_map(|(_, _, d)| *d)
+                                .unwrap_or(Vector3::new(1.0, 0.0, 0.0));
+                            openings.push(OpeningType::DiagonalRectangular(opening_mesh.clone(), dir));
+                        } else {
+                            // Use AABB clipping for axis-aligned wall openings (X/Y extrusion)
+                            for (min_pt, max_pt, extrusion_dir) in item_bounds_with_dir {
+                                openings.push(OpeningType::Rectangular(min_pt, max_pt, extrusion_dir));
+                            }
                         }
                     }
                 } else {
@@ -509,7 +521,7 @@ impl GeometryRouter {
                     let min_f64 = Point3::new(open_min.x as f64, open_min.y as f64, open_min.z as f64);
                     let max_f64 = Point3::new(open_max.x as f64, open_max.y as f64, open_max.z as f64);
 
-                    openings.push(OpeningType::Rectangular(min_f64, max_f64, None, false));
+                    openings.push(OpeningType::Rectangular(min_f64, max_f64, None));
                 }
             }
         }
@@ -549,37 +561,22 @@ impl GeometryRouter {
 
         // Track CSG operations to prevent excessive complexity
         let mut csg_operation_count = 0;
-        const MAX_CSG_OPERATIONS: usize = 10; // Limit to prevent runaway CSG
+        const MAX_CSG_OPERATIONS: usize = 10;
 
         for opening in openings.iter() {
             match opening {
-                OpeningType::Rectangular(open_min, open_max, extrusion_dir, is_diagonal) => {
-                    // For diagonal openings, skip AABB extension entirely.
-                    // extend_opening_along_direction projects along the extrusion direction
-                    // then takes axis-aligned min/max of the result, which balloons the box
-                    // for diagonal walls (e.g. a 1.5m opening becomes an 8m+ AABB that eats
-                    // most of the wall geometry).
-                    let (final_min, final_max) = if *is_diagonal {
-                        (*open_min, *open_max)
-                    } else if let Some(dir) = extrusion_dir {
-                        // Extend along the actual extrusion direction to penetrate multi-layer walls
+                OpeningType::Rectangular(open_min, open_max, extrusion_dir) => {
+                    let (final_min, final_max) = if let Some(dir) = extrusion_dir {
                         self.extend_opening_along_direction(*open_min, *open_max, wall_min, wall_max, *dir)
                     } else {
-                        // Fallback: use opening bounds as-is (no direction available)
                         (*open_min, *open_max)
                     };
-
-                    if *is_diagonal {
-                        // For diagonal openings, use AABB clipping WITHOUT internal faces
-                        // Internal faces for diagonal openings cause rotation artifacts
-                        result = self.cut_rectangular_opening_no_faces(&result, final_min, final_max);
-                    } else {
-                        // For axis-aligned openings, use AABB clipping (no internal faces)
-                        // Internal face generation is disabled for all openings because it causes
-                        // visual artifacts (rotated faces, thin lines). The opening cutout is still
-                        // geometrically correct - only the internal "reveal" faces are omitted.
-                        result = self.cut_rectangular_opening(&result, final_min, final_max, wall_min, wall_max);
-                    }
+                    result = self.cut_rectangular_opening(&result, final_min, final_max, wall_min, wall_max);
+                }
+                OpeningType::DiagonalRectangular(opening_mesh, extrusion_dir) => {
+                    result = self.cut_opening_in_rotated_space(
+                        &result, opening_mesh, wall_min, wall_max, *extrusion_dir,
+                    );
                 }
                 OpeningType::NonRectangular(opening_mesh) => {
                     // Safety: limit total CSG operations to prevent crashes on complex geometry
@@ -642,9 +639,231 @@ impl GeometryRouter {
     }
 
     /// Cut a rectangular opening from a mesh using optimized plane clipping
+    /// Cut an opening in a diagonal wall by rotating into a coordinate system
+    /// aligned with the extrusion direction, then performing AABB clipping there.
     ///
-    /// This is more efficient than full CSG because:
-    /// 1. Only processes triangles that intersect the opening bounds
+    /// Uses actual opening mesh vertex positions (not world-space AABB corners)
+    /// to compute tight bounds in the rotated space. This avoids the bloated
+    /// diamond-shaped AABB that world-space bounds produce for diagonal items.
+    fn cut_opening_in_rotated_space(
+        &self,
+        mesh: &Mesh,
+        opening_mesh: &Mesh,
+        wall_min: Point3<f64>,
+        wall_max: Point3<f64>,
+        extrusion_dir: Vector3<f64>,
+    ) -> Mesh {
+        use nalgebra::Rotation3;
+
+        // Build rotation that maps extrusion_dir → +X axis.
+        let target = Vector3::new(1.0, 0.0, 0.0);
+        let rotation = if let Some(rot) = Rotation3::rotation_between(&extrusion_dir, &target) {
+            rot
+        } else {
+            Rotation3::identity()
+        };
+        let inv_rotation = rotation.inverse();
+
+        // Compute tight AABB from actual opening mesh positions in rotated space
+        let mut rot_min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut rot_max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+
+        for chunk in opening_mesh.positions.chunks_exact(3) {
+            let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+            rot_min.x = rot_min.x.min(p.x);
+            rot_min.y = rot_min.y.min(p.y);
+            rot_min.z = rot_min.z.min(p.z);
+            rot_max.x = rot_max.x.max(p.x);
+            rot_max.y = rot_max.y.max(p.y);
+            rot_max.z = rot_max.z.max(p.z);
+        }
+
+        // Extend along X (= through-wall direction) to penetrate multi-layer walls
+        let wall_corners = [
+            Point3::new(wall_min.x, wall_min.y, wall_min.z),
+            Point3::new(wall_max.x, wall_min.y, wall_min.z),
+            Point3::new(wall_min.x, wall_max.y, wall_min.z),
+            Point3::new(wall_max.x, wall_max.y, wall_min.z),
+            Point3::new(wall_min.x, wall_min.y, wall_max.z),
+            Point3::new(wall_max.x, wall_min.y, wall_max.z),
+            Point3::new(wall_min.x, wall_max.y, wall_max.z),
+            Point3::new(wall_max.x, wall_max.y, wall_max.z),
+        ];
+
+        let mut wall_x_min = f64::INFINITY;
+        let mut wall_x_max = f64::NEG_INFINITY;
+        for wc in &wall_corners {
+            let rwc = rotation * wc;
+            wall_x_min = wall_x_min.min(rwc.x);
+            wall_x_max = wall_x_max.max(rwc.x);
+        }
+
+        rot_min.x = rot_min.x.min(wall_x_min);
+        rot_max.x = rot_max.x.max(wall_x_max);
+
+        // Rotate wall mesh into aligned space
+        let mut rotated_mesh = mesh.clone();
+        for chunk in rotated_mesh.positions.chunks_exact_mut(3) {
+            let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+            chunk[0] = p.x as f32;
+            chunk[1] = p.y as f32;
+            chunk[2] = p.z as f32;
+        }
+
+        // AABB clip in rotated space — now axis-aligned → clean rectangular cut
+        let clipped = self.cut_rectangular_opening_no_faces(&rotated_mesh, rot_min, rot_max);
+
+        // Rotate result back to world space
+        let mut result = clipped;
+        for chunk in result.positions.chunks_exact_mut(3) {
+            let p = inv_rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+            chunk[0] = p.x as f32;
+            chunk[1] = p.y as f32;
+            chunk[2] = p.z as f32;
+        }
+
+        result
+    }
+
+    /// Generate reveal (jamb/sill/head) meshes for each opening in an element.
+    ///
+    /// Returns a list of `(opening_id, reveal_mesh)` pairs. Each reveal mesh
+    /// contains the 4 side-face quads that line the inside of the opening hole,
+    /// connecting the front wall face to the back wall face.
+    ///
+    /// The reveal meshes are generated in the opening's rotated coordinate
+    /// system (where the extrusion direction is axis-aligned) to produce
+    /// clean rectangular faces even for diagonal walls.
+    pub fn generate_opening_reveals(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        void_index: &FxHashMap<u32, Vec<u32>>,
+    ) -> Vec<(u32, Mesh)> {
+        use nalgebra::Rotation3;
+
+        let opening_ids = match void_index.get(&element.id) {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => return Vec::new(),
+        };
+
+        // Get wall mesh bounds for wall thickness computation
+        let wall_mesh = match self.process_element(element, decoder) {
+            Ok(m) if !m.is_empty() => m,
+            _ => return Vec::new(),
+        };
+        let mut reveals = Vec::new();
+
+        for &opening_id in opening_ids.iter() {
+            let opening_entity = match decoder.decode_by_id(opening_id) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let opening_mesh = match self.process_element(&opening_entity, decoder) {
+                Ok(m) if !m.is_empty() => m,
+                _ => continue,
+            };
+
+            // Determine extrusion direction
+            let item_bounds = self.get_opening_item_bounds_with_direction(&opening_entity, decoder)
+                .unwrap_or_default();
+            let extrusion_dir = item_bounds.iter()
+                .find_map(|(_, _, d)| *d)
+                .unwrap_or(Vector3::new(1.0, 0.0, 0.0));
+
+            // Build rotation: extrusion_dir → +X
+            let target = Vector3::new(1.0, 0.0, 0.0);
+            let rotation = Rotation3::rotation_between(&extrusion_dir, &target)
+                .unwrap_or(Rotation3::identity());
+            let inv_rotation = rotation.inverse();
+
+            // Compute opening bounds in rotated space from actual mesh positions
+            let mut rot_min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut rot_max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for chunk in opening_mesh.positions.chunks_exact(3) {
+                let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                rot_min.x = rot_min.x.min(p.x);
+                rot_min.y = rot_min.y.min(p.y);
+                rot_min.z = rot_min.z.min(p.z);
+                rot_max.x = rot_max.x.max(p.x);
+                rot_max.y = rot_max.y.max(p.y);
+                rot_max.z = rot_max.z.max(p.z);
+            }
+
+            // Compute wall thickness extent in rotated space (X axis)
+            let mut wall_x_min = f64::INFINITY;
+            let mut wall_x_max = f64::NEG_INFINITY;
+            for chunk in wall_mesh.positions.chunks_exact(3) {
+                let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                wall_x_min = wall_x_min.min(p.x);
+                wall_x_max = wall_x_max.max(p.x);
+            }
+
+            // Reveal box in rotated space: opening Y/Z extent, wall X extent
+            let x0 = wall_x_min as f32;
+            let x1 = wall_x_max as f32;
+            let y0 = rot_min.y as f32;
+            let y1 = rot_max.y as f32;
+            let z0 = rot_min.z as f32;
+            let z1 = rot_max.z as f32;
+
+            // Build 4 side quads (2 triangles each) in rotated space
+            // Left (Y=y0): front-bottom, front-top, back-top, back-bottom
+            // Right (Y=y1), Bottom (Z=z0), Top (Z=z1)
+            let mut positions = Vec::with_capacity(4 * 4 * 3);
+            let mut normals = Vec::with_capacity(4 * 4 * 3);
+            let mut indices = Vec::with_capacity(4 * 2 * 3);
+
+            let quads: [(
+                [f32; 3], [f32; 3], [f32; 3], [f32; 3], // 4 corners
+                [f32; 3], // normal
+            ); 4] = [
+                // Left face (Y = y0, normal -Y)
+                ([x0,y0,z0], [x1,y0,z0], [x1,y0,z1], [x0,y0,z1], [0.0,-1.0,0.0]),
+                // Right face (Y = y1, normal +Y)
+                ([x0,y1,z0], [x0,y1,z1], [x1,y1,z1], [x1,y1,z0], [0.0,1.0,0.0]),
+                // Bottom face (Z = z0, normal -Z)
+                ([x0,y0,z0], [x0,y1,z0], [x1,y1,z0], [x1,y0,z0], [0.0,0.0,-1.0]),
+                // Top face (Z = z1, normal +Z)
+                ([x0,y0,z1], [x1,y0,z1], [x1,y1,z1], [x0,y1,z1], [0.0,0.0,1.0]),
+            ];
+
+            for (i, (v0, v1, v2, v3, n)) in quads.iter().enumerate() {
+                let base = (i * 4) as u32;
+                positions.extend_from_slice(v0);
+                positions.extend_from_slice(v1);
+                positions.extend_from_slice(v2);
+                positions.extend_from_slice(v3);
+                for _ in 0..4 {
+                    normals.extend_from_slice(n);
+                }
+                indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+            }
+
+            // Rotate all positions and normals back to world space
+            for chunk in positions.chunks_exact_mut(3) {
+                let p = inv_rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                chunk[0] = p.x as f32;
+                chunk[1] = p.y as f32;
+                chunk[2] = p.z as f32;
+            }
+            for chunk in normals.chunks_exact_mut(3) {
+                let n = inv_rotation * Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+                chunk[0] = n.x as f32;
+                chunk[1] = n.y as f32;
+                chunk[2] = n.z as f32;
+            }
+
+            let reveal = Mesh { positions, normals, indices };
+            if !reveal.is_empty() {
+                reveals.push((opening_id, reveal));
+            }
+        }
+
+        reveals
+    }
+
     /// Extend opening bounds along extrusion direction to match wall extent
     ///
     /// Projects wall corners onto the extrusion axis and extends the opening

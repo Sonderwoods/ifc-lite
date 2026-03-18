@@ -9,7 +9,7 @@
 
 use super::styling::{
     build_element_style_index, build_geometry_style_index, extract_building_rotation,
-    find_color_for_geometry, get_default_color_for_type,
+    find_color_for_geometry, get_default_color_for_type, pick_material_color_for_submesh,
 };
 use super::GeometryStats;
 use super::IfcAPI;
@@ -55,9 +55,13 @@ impl IfcAPI {
 
         // OPTIMIZATION: Collect all FacetedBrep IDs for batch processing
         // Also build void relationship index (host → openings)
+        // Also collect material styling data for glass/frame differentiation
         let mut scanner = EntityScanner::new(&content);
         let mut faceted_brep_ids: Vec<u32> = Vec::new();
         let mut void_index: rustc_hash::FxHashMap<u32, Vec<u32>> = rustc_hash::FxHashMap::default();
+        let mut orphan_styled_items: rustc_hash::FxHashMap<u32, [f32; 4]> = rustc_hash::FxHashMap::default();
+        let mut material_def_reprs: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut rel_associates_material: Vec<(Vec<u32>, u32)> = Vec::new();
 
         while let Some((id, type_name, start, end)) = scanner.next_entity() {
             if type_name == "IFCFACETEDBREP" {
@@ -71,8 +75,49 @@ impl IfcAPI {
                         void_index.entry(host_id).or_default().push(opening_id);
                     }
                 }
+            } else if type_name == "IFCSTYLEDITEM" {
+                // Collect orphan IfcStyledItem (null Item attr) for material chain resolution
+                if let Ok(styled_item) = decoder.decode_at_with_id(id, start, end) {
+                    if styled_item.get_ref(0).is_none() && !orphan_styled_items.contains_key(&id) {
+                        if let Some(styles_attr) = styled_item.get(1) {
+                            if let Some(color) = super::styling::extract_color_from_styles(styles_attr, &mut decoder) {
+                                orphan_styled_items.insert(id, color);
+                            }
+                        }
+                    }
+                }
+            } else if type_name == "IFCMATERIALDEFINITIONREPRESENTATION" {
+                if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+                    if let Some(material_id) = entity.get_ref(3) {
+                        if let Some(repr_list) = entity.get(2).and_then(|a| a.as_list()) {
+                            let ids: Vec<u32> = repr_list.iter().filter_map(|v| v.as_entity_ref()).collect();
+                            if !ids.is_empty() {
+                                material_def_reprs.push((material_id, ids));
+                            }
+                        }
+                    }
+                }
+            } else if type_name == "IFCRELASSOCIATESMATERIAL" {
+                if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+                    if let Some(relating_id) = entity.get_ref(5) {
+                        if let Some(related_list) = entity.get(4).and_then(|a| a.as_list()) {
+                            let eids: Vec<u32> = related_list.iter().filter_map(|v| v.as_entity_ref()).collect();
+                            if !eids.is_empty() {
+                                rel_associates_material.push((eids, relating_id));
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // Build element → material colors map
+        let element_material_colors = super::styling::build_element_material_colors(
+            &material_def_reprs,
+            &orphan_styled_items,
+            &rel_associates_material,
+            &mut decoder,
+        );
 
         // Create geometry router (without RTC offset initially)
         let mut router = GeometryRouter::with_units(&content, &mut decoder);
@@ -251,6 +296,7 @@ impl IfcAPI {
 
                     if has_submeshes {
                         let sub_meshes = sub_meshes_result.unwrap();
+                        let mut used_colors: Vec<[f32; 4]> = Vec::new();
                         for sub in sub_meshes.sub_meshes {
                             let mut mesh = sub.mesh;
                             let color = find_color_for_geometry(
@@ -258,8 +304,16 @@ impl IfcAPI {
                                 &geometry_styles,
                                 &mut decoder,
                             )
+                            .or_else(|| {
+                                element_material_colors
+                                    .get(&id)
+                                    .and_then(|candidates| {
+                                        pick_material_color_for_submesh(candidates, &used_colors)
+                                    })
+                            })
                             .or_else(|| style_index.get(&id).copied())
                             .unwrap_or(default_color);
+                            used_colors.push(color);
                             push_mesh_if_valid(&mut mesh, color);
                         }
                     } else {
@@ -1229,6 +1283,7 @@ impl IfcAPI {
                             if has_submeshes {
                                 // Use sub-meshes for multi-material elements (windows, doors, etc.)
                                 let sub_meshes = sub_meshes_result.unwrap();
+                                let mut used_colors: Vec<[f32; 4]> = Vec::new();
                                 for sub in sub_meshes.sub_meshes {
                                     let mut mesh = sub.mesh;
                                     if mesh.is_empty() {
@@ -1239,14 +1294,23 @@ impl IfcAPI {
                                     }
 
                                     // Look up color by geometry item ID (resolving MappedItem chains),
-                                    // then by element color, then default
+                                    // then by material-based colors, then element color, then default
                                     let color = find_color_for_geometry(
                                         sub.geometry_id,
                                         &pre_pass.geometry_styles,
                                         &mut decoder,
                                     )
+                                    .or_else(|| {
+                                        pre_pass
+                                            .element_material_colors
+                                            .get(&id)
+                                            .and_then(|candidates| {
+                                                pick_material_color_for_submesh(candidates, &used_colors)
+                                            })
+                                    })
                                     .or(element_color)
                                     .unwrap_or(default_color);
+                                    used_colors.push(color);
 
                                     total_vertices += mesh.positions.len() / 3;
                                     total_triangles += mesh.indices.len() / 3;
