@@ -429,9 +429,16 @@ impl GeometryRouter {
             if let Some(items_attr) = mapped_repr.get(3) {
                 let items = decoder.resolve_ref_list(items_attr)?;
                 for nested_item in items {
-                    // Recursively collect sub-meshes
+                    // Recursively collect sub-meshes, skipping unsupported items
+                    // (e.g. IfcGeometricSet annotations) rather than aborting the
+                    // entire collection — matches process_mapped_item_cached behaviour.
                     let count_before = sub_meshes.len();
-                    self.collect_submeshes_from_item(&nested_item, decoder, sub_meshes)?;
+                    if self
+                        .collect_submeshes_from_item(&nested_item, decoder, sub_meshes)
+                        .is_err()
+                    {
+                        continue;
+                    }
 
                     // Apply MappedItem transform to newly added sub-meshes
                     if let Some(mut transform) = mapping_transform.clone() {
@@ -443,10 +450,15 @@ impl GeometryRouter {
                 }
             }
         } else {
-            // Regular geometry item - process and record with its ID
-            let mesh = self.process_representation_item(item, decoder)?;
-            if !mesh.is_empty() {
-                sub_meshes.add(item.id, mesh);
+            // Regular geometry item - process and record with its ID.
+            // Skip unsupported types (e.g. IfcGeometricSet) gracefully.
+            match self.process_representation_item(item, decoder) {
+                Ok(mesh) => {
+                    if !mesh.is_empty() {
+                        sub_meshes.add(item.id, mesh);
+                    }
+                }
+                Err(_) => {}
             }
         }
 
