@@ -27,6 +27,12 @@ pub enum OpeningFilterMode {
 /// Result of processing an IFC file.
 pub struct ProcessingResult {
     pub meshes: Vec<MeshData>,
+    /// Declares the coordinate space used by serialized mesh vertices.
+    pub mesh_coordinate_space: Option<String>,
+    /// IfcSite ObjectPlacement as column-major 4x4 matrix (in meters).
+    pub site_transform: Option<Vec<f64>>,
+    /// IfcBuilding ObjectPlacement as column-major 4x4 matrix (in meters).
+    pub building_transform: Option<Vec<f64>>,
     pub metadata: ModelMetadata,
     pub stats: ProcessingStats,
 }
@@ -238,6 +244,9 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
 
     ProcessingResult {
         meshes: meshes.clone(),
+        mesh_coordinate_space: None,
+        site_transform: None,
+        building_transform: None,
         metadata: ModelMetadata {
             schema_version,
             entity_count: total_entities,
