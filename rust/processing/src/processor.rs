@@ -761,10 +761,16 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
 
                     let mut out = vec![mesh_data];
 
-                    // Generate opening reveal (jamb/sill/head) meshes
-                    let reveals = local_router.generate_opening_reveals(
-                        &entity, &mut local_decoder, void_index_arc.as_ref(),
-                    );
+                    // Generate opening reveal (jamb/sill/head) meshes — only for walls,
+                    // other host types (slabs, roofs, site) produce oversized reveals
+                    // because their bounding-box extent dwarfs the actual wall thickness.
+                    let reveals = if matches!(job.ifc_type, IfcType::IfcWall | IfcType::IfcWallStandardCase) {
+                        local_router.generate_opening_reveals(
+                            &entity, &mut local_decoder, void_index_arc.as_ref(),
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     for (opening_id, mut reveal) in reveals {
                         if reveal.is_empty() { continue; }
                         if reveal.normals.is_empty() {

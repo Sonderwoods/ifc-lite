@@ -914,33 +914,40 @@ impl GeometryRouter {
         result
     }
 
-    /// Generate reveal (jamb/sill/head) meshes for each opening in an element.
+    /// Generate reveal (jamb/sill/head) meshes for each opening in a wall element.
     ///
     /// Returns a list of `(opening_id, reveal_mesh)` pairs. Each reveal mesh
     /// contains the 4 side-face quads that line the inside of the opening hole,
     /// connecting the front wall face to the back wall face.
     ///
-    /// The reveal meshes are generated in the opening's rotated coordinate
-    /// system (where the extrusion direction is axis-aligned) to produce
-    /// clean rectangular faces even for diagonal walls.
+    /// The reveal bounds come from the IfcOpeningElement's **local-space** geometry
+    /// (before placement transform). Quads are built axis-aligned in local space
+    /// then transformed to world space, so reveals follow the wall's orientation.
     pub fn generate_opening_reveals(
         &self,
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
         void_index: &FxHashMap<u32, Vec<u32>>,
     ) -> Vec<(u32, Mesh)> {
-        use nalgebra::Rotation3;
-
         let opening_ids = match void_index.get(&element.id) {
             Some(ids) if !ids.is_empty() => ids,
             _ => return Vec::new(),
         };
 
-        // Get wall mesh bounds for wall thickness computation
-        let wall_mesh = match self.process_element(element, decoder) {
-            Ok(m) if !m.is_empty() => m,
-            _ => return Vec::new(),
-        };
+        // Get wall thickness from the wall's local-space mesh.
+        // Wall local AABB: X = length, Y = thickness, Z = height.
+        // The thinnest dimension is always the wall thickness.
+        let wall_thickness = self.process_element_with_transform(element, decoder)
+            .ok()
+            .and_then(|(m, _)| {
+                if m.is_empty() { return None; }
+                let (wmin, wmax) = m.bounds();
+                let dx = (wmax.x - wmin.x).abs();
+                let dy = (wmax.y - wmin.y).abs();
+                let dz = (wmax.z - wmin.z).abs();
+                Some(dx.min(dy).min(dz) as f64)
+            });
+
         let mut reveals = Vec::new();
 
         for &opening_id in opening_ids.iter() {
@@ -949,108 +956,90 @@ impl GeometryRouter {
                 Err(_) => continue,
             };
 
-            let opening_mesh = match self.process_element(&opening_entity, decoder) {
-                Ok(m) if !m.is_empty() => m,
+            // Get the opening mesh in LOCAL space + its placement transform separately.
+            // Building reveal quads from the local-space AABB ensures they align with
+            // the wall's orientation, not the world axes.
+            let (local_mesh, transform) = match self.process_element_with_transform(&opening_entity, decoder) {
+                Ok((m, t)) if !m.is_empty() => (m, t),
                 _ => continue,
             };
+            let (om, ox) = local_mesh.bounds();
+            let mut min = Point3::new(om.x as f64, om.y as f64, om.z as f64);
+            let mut max = Point3::new(ox.x as f64, ox.y as f64, ox.z as f64);
 
-            // Determine extrusion direction
-            let item_bounds = self.get_opening_item_bounds_with_direction(&opening_entity, decoder)
-                .unwrap_or_default();
-            let extrusion_dir = item_bounds.iter()
-                .find_map(|(_, _, d)| *d)
-                .unwrap_or(Vector3::new(1.0, 0.0, 0.0));
-
-            // Build rotation: extrusion_dir → +X
-            let target = Vector3::new(1.0, 0.0, 0.0);
-            let rotation = Rotation3::rotation_between(&extrusion_dir, &target)
-                .unwrap_or(Rotation3::identity());
-            let inv_rotation = rotation.inverse();
-
-            // Compute opening bounds in rotated space from actual mesh positions
-            let mut rot_min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-            let mut rot_max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for chunk in opening_mesh.positions.chunks_exact(3) {
-                let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-                rot_min.x = rot_min.x.min(p.x);
-                rot_min.y = rot_min.y.min(p.y);
-                rot_min.z = rot_min.z.min(p.z);
-                rot_max.x = rot_max.x.max(p.x);
-                rot_max.y = rot_max.y.max(p.y);
-                rot_max.z = rot_max.z.max(p.z);
-            }
-
-            // Compute wall thickness extent in rotated space (X axis)
-            let mut wall_x_min = f64::INFINITY;
-            let mut wall_x_max = f64::NEG_INFINITY;
-            for chunk in wall_mesh.positions.chunks_exact(3) {
-                let p = rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-                wall_x_min = wall_x_min.min(p.x);
-                wall_x_max = wall_x_max.max(p.x);
-            }
-
-            // Reveal box in rotated space: opening Y/Z extent, wall X extent
-            let x0 = wall_x_min as f32;
-            let x1 = wall_x_max as f32;
-            let y0 = rot_min.y as f32;
-            let y1 = rot_max.y as f32;
-            let z0 = rot_min.z as f32;
-            let z1 = rot_max.z as f32;
-
-            // Build 4 side quads (2 triangles each) in rotated space
-            // Left (Y=y0): front-bottom, front-top, back-top, back-bottom
-            // Right (Y=y1), Bottom (Z=z0), Top (Z=z1)
-            let mut positions = Vec::with_capacity(4 * 4 * 3);
-            let mut normals = Vec::with_capacity(4 * 4 * 3);
-            let mut indices = Vec::with_capacity(4 * 2 * 3);
-
-            let quads: [(
-                [f32; 3], [f32; 3], [f32; 3], [f32; 3], // 4 corners
-                [f32; 3], // normal
-            ); 4] = [
-                // Left face (Y = y0, normal -Y)
-                ([x0,y0,z0], [x1,y0,z0], [x1,y0,z1], [x0,y0,z1], [0.0,-1.0,0.0]),
-                // Right face (Y = y1, normal +Y)
-                ([x0,y1,z0], [x0,y1,z1], [x1,y1,z1], [x1,y1,z0], [0.0,1.0,0.0]),
-                // Bottom face (Z = z0, normal -Z)
-                ([x0,y0,z0], [x0,y1,z0], [x1,y1,z0], [x1,y0,z0], [0.0,0.0,-1.0]),
-                // Top face (Z = z1, normal +Z)
-                ([x0,y0,z1], [x1,y0,z1], [x1,y1,z1], [x0,y1,z1], [0.0,0.0,1.0]),
-            ];
-
-            for (i, (v0, v1, v2, v3, n)) in quads.iter().enumerate() {
-                let base = (i * 4) as u32;
-                positions.extend_from_slice(v0);
-                positions.extend_from_slice(v1);
-                positions.extend_from_slice(v2);
-                positions.extend_from_slice(v3);
-                for _ in 0..4 {
-                    normals.extend_from_slice(n);
+            // Clamp Y (depth through wall) to the wall's actual thickness.
+            // The opening extrusion intentionally overshoots the wall for clean
+            // boolean cuts, but reveals should only span the real wall depth.
+            if let Some(thickness) = wall_thickness {
+                let dy = max.y - min.y;
+                if dy > thickness + 1e-6 {
+                    max.y = min.y + thickness;
                 }
-                indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
             }
 
-            // Rotate all positions and normals back to world space
-            for chunk in positions.chunks_exact_mut(3) {
-                let p = inv_rotation * Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-                chunk[0] = p.x as f32;
-                chunk[1] = p.y as f32;
-                chunk[2] = p.z as f32;
-            }
-            for chunk in normals.chunks_exact_mut(3) {
-                let n = inv_rotation * Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
-                chunk[0] = n.x as f32;
-                chunk[1] = n.y as f32;
-                chunk[2] = n.z as f32;
-            }
-
-            let reveal = Mesh { positions, normals, indices };
+            let mut reveal = Self::build_reveal_quads_aabb(min, max);
             if !reveal.is_empty() {
+                // Transform reveal quads from local space to world space
+                let mut scaled_transform = transform;
+                self.scale_transform(&mut scaled_transform);
+                self.transform_mesh(&mut reveal, &scaled_transform);
                 reveals.push((opening_id, reveal));
             }
         }
 
         reveals
+    }
+
+    /// Build 4 side-face quads (jamb left, jamb right, sill, head) from an
+    /// axis-aligned bounding box. The AABB is the exact opening volume that was
+    /// cut from the wall, so the quads perfectly line the inside of the hole.
+    fn build_reveal_quads_aabb(min: Point3<f64>, max: Point3<f64>) -> Mesh {
+        let x0 = min.x as f32;
+        let x1 = max.x as f32;
+        let y0 = min.y as f32;
+        let y1 = max.y as f32;
+        let z0 = min.z as f32;
+        let z1 = max.z as f32;
+
+        // Degenerate check — skip if any dimension is essentially zero
+        if (x1 - x0).abs() < 1e-4 || (y1 - y0).abs() < 1e-4 || (z1 - z0).abs() < 1e-4 {
+            return Mesh::default();
+        }
+
+        let mut positions = Vec::with_capacity(4 * 4 * 3);
+        let mut normals = Vec::with_capacity(4 * 4 * 3);
+        let mut indices = Vec::with_capacity(4 * 2 * 3);
+
+        // 4 quads lining the inside of the AABB hole.
+        // In IFC opening local space: X = width along wall, Y = depth through wall, Z = height.
+        // Left jamb  (X = x0, normal pointing inward +X)
+        // Right jamb (X = x1, normal pointing inward -X)
+        // Sill       (Z = z0, normal pointing inward +Z)
+        // Head       (Z = z1, normal pointing inward -Z)
+        let quads: [([f32; 3], [f32; 3], [f32; 3], [f32; 3], [f32; 3]); 4] = [
+            // Left jamb (X = x0, normal +X — faces inward toward opening center)
+            ([x0,y0,z0], [x0,y1,z0], [x0,y1,z1], [x0,y0,z1], [1.0, 0.0, 0.0]),
+            // Right jamb (X = x1, normal -X)
+            ([x1,y0,z0], [x1,y0,z1], [x1,y1,z1], [x1,y1,z0], [-1.0, 0.0, 0.0]),
+            // Sill (Z = z0, normal +Z)
+            ([x0,y0,z0], [x0,y1,z0], [x1,y1,z0], [x1,y0,z0], [0.0, 0.0, 1.0]),
+            // Head (Z = z1, normal -Z)
+            ([x0,y0,z1], [x1,y0,z1], [x1,y1,z1], [x0,y1,z1], [0.0, 0.0,-1.0]),
+        ];
+
+        for (i, (v0, v1, v2, v3, n)) in quads.iter().enumerate() {
+            let base = (i * 4) as u32;
+            positions.extend_from_slice(v0);
+            positions.extend_from_slice(v1);
+            positions.extend_from_slice(v2);
+            positions.extend_from_slice(v3);
+            for _ in 0..4 {
+                normals.extend_from_slice(n);
+            }
+            indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+        }
+
+        Mesh { positions, normals, indices }
     }
 
     /// Extend opening bounds along extrusion direction to match wall extent
