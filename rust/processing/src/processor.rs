@@ -575,9 +575,11 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
         "Entity scanning complete"
     );
 
-    // When IgnoreAll, skip inner curves in IfcArbitraryProfileDefWithVoids so walls
-    // with window openings baked into the 2D profile (Revit export pattern) come out clean.
-    let skip_profile_voids = opening_filter == OpeningFilterMode::IgnoreAll;
+    // When IgnoreAll or IgnoreOpaque, skip inner curves in IfcArbitraryProfileDefWithVoids
+    // so walls with window openings baked into the 2D profile (Revit export pattern) come
+    // out clean. For IgnoreOpaque we also skip all profile voids because profiles don't
+    // carry enough info to distinguish glazed from opaque openings.
+    let skip_profile_voids = opening_filter != OpeningFilterMode::Default;
 
     // Preprocess complex geometry
     let mut router = {
@@ -1225,8 +1227,14 @@ fn apply_opening_filter(
     }
 
     if filling_by_opening.is_empty() {
-        // No IfcRelFillsElement — can't map voids to specific window/door entities.
-        return (skipped_entity_ids, void_index.clone());
+        // No IfcRelFillsElement at all — can't map voids to specific window/door entities.
+        // If any windows/doors were suppressed, clear all voids as a safe fallback
+        // (same strategy as IgnoreAll) because we have no way to tell which openings
+        // belong to opaque vs glazed fillings.
+        if skipped_entity_ids.is_empty() {
+            return (skipped_entity_ids, void_index.clone());
+        }
+        return (skipped_entity_ids, FxHashMap::default());
     }
 
     // Build openings_to_suppress from the explicit opening → filling mapping.
@@ -1241,12 +1249,28 @@ fn apply_opening_filter(
         return (skipped_entity_ids, void_index.clone());
     }
 
+    // Also suppress unmapped openings (those without IfcRelFillsElement) on any host
+    // that has at least one suppressed opening. This handles incomplete relationship
+    // data where some openings on a wall are mapped and others are not.
+    let mapped_opening_ids: std::collections::HashSet<u32> = filling_by_opening.keys().copied().collect();
+
     let mut filtered: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for (&host_id, openings) in void_index {
+        let host_has_suppressed = openings.iter().any(|oid| openings_to_suppress.contains(oid));
         let remaining: Vec<u32> = openings
             .iter()
             .copied()
-            .filter(|oid| !openings_to_suppress.contains(oid))
+            .filter(|oid| {
+                if openings_to_suppress.contains(oid) {
+                    return false;
+                }
+                // If this host has suppressed openings and this opening is unmapped,
+                // suppress it too — we can't verify it belongs to a glazed filling.
+                if host_has_suppressed && !mapped_opening_ids.contains(oid) {
+                    return false;
+                }
+                true
+            })
             .collect();
         if !remaining.is_empty() {
             filtered.insert(host_id, remaining);
