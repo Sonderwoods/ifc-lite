@@ -404,6 +404,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
     let mut faceted_brep_ids: Vec<u32> = Vec::new();
     let mut void_index: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut filling_by_opening: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut aggregation_children: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut entity_jobs: Vec<EntityJob> = Vec::with_capacity(2000);
     let mut schema_version = "IFC2X3".to_string();
     let mut total_entities = 0usize;
@@ -494,6 +495,15 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                     filling_by_opening.insert(opening_id, filling_id);
                 }
             }
+        } else if type_name == "IFCRELAGGREGATES" {
+            if let Ok(entity) = decoder.decode_at(start, end) {
+                // attr 4 = RelatingObject (parent), attr 5 = RelatedObjects (children)
+                if let Some(parent_id) = entity.get_ref(4) {
+                    if let Some(children) = get_refs_from_list(&entity, 5) {
+                        aggregation_children.entry(parent_id).or_default().extend(children);
+                    }
+                }
+            }
         } else if type_name == "IFCSITE" && site_entity_pos.is_none() {
             site_entity_pos = Some((start, end));
         } else if type_name == "IFCBUILDING" && building_entity_pos.is_none() {
@@ -518,6 +528,21 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                     presentation_layer: None,
                     space_zone_properties: None,
                 });
+            }
+        }
+    }
+
+    // Propagate voids from parent elements to their aggregated children.
+    // In IFC, openings (IfcRelVoidsElement) target the parent wall, but when the
+    // wall is decomposed into IfcBuildingElementPart children via IfcRelAggregates,
+    // the actual geometry lives in the parts. We copy the parent's voids to each child
+    // so that opening subtraction fires on the parts that carry the 3D mesh.
+    for (parent_id, children) in &aggregation_children {
+        if let Some(voids) = void_index.get(parent_id).cloned() {
+            if !voids.is_empty() {
+                for &child_id in children {
+                    void_index.entry(child_id).or_default().extend(voids.iter().copied());
+                }
             }
         }
     }
@@ -766,7 +791,7 @@ pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMod
                     // Generate opening reveal (jamb/sill/head) meshes — only for walls,
                     // other host types (slabs, roofs, site) produce oversized reveals
                     // because their bounding-box extent dwarfs the actual wall thickness.
-                    let reveals = if matches!(job.ifc_type, IfcType::IfcWall | IfcType::IfcWallStandardCase) {
+                    let reveals = if matches!(job.ifc_type, IfcType::IfcWall | IfcType::IfcWallStandardCase | IfcType::IfcBuildingElementPart) {
                         local_router.generate_opening_reveals(
                             &entity, &mut local_decoder, void_index_arc.as_ref(),
                         )

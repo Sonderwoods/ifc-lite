@@ -84,6 +84,7 @@ impl GeometryRouter {
             "IFCSTAIR", "IFCSTAIRFLIGHT", "IFCRAMP", "IFCRAMPFLIGHT",
             "IFCDOOR", "IFCWINDOW", "IFCFURNISHINGELEMENT", "IFCBUILDINGELEMENTPROXY",
             "IFCMEMBER", "IFCCURTAINWALL", "IFCPILE", "IFCSHADINGDEVICE",
+            "IFCBUILDINGELEMENTPART",
         ];
 
         while let Some((_id, type_name, start, end)) = scanner.next_entity() {
