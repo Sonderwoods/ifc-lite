@@ -216,10 +216,16 @@ impl GeometryRouter {
         self.rtc_offset
     }
 
-    /// Check if RTC offset is active (non-zero)
+    /// Check if RTC offset is active (non-zero).
+    ///
+    /// NOTE: Hard-disabled — returns false regardless of `rtc_offset`.
+    /// RTC caused parts of buildings to drift apart (per-mesh veto left some
+    /// meshes in world-space while others were shifted into site-local).
+    /// Trust the IFC's own coordinates instead; accept f32 precision loss on
+    /// georeferenced models. Re-enable by restoring the original body.
     #[inline]
     pub fn has_rtc_offset(&self) -> bool {
-        self.rtc_offset.0 != 0.0 || self.rtc_offset.1 != 0.0 || self.rtc_offset.2 != 0.0
+        false
     }
 
     /// Get the current unit scale factor
@@ -266,15 +272,10 @@ impl GeometryRouter {
             return;
         }
 
-        // Use batch processing for parallel triangulation.
-        // Convert RTC from meters to file units so the Brep processor
-        // subtracts the offset in the same coordinate space as the vertices.
+        // RTC disabled — pass a zero offset so BREP vertices come out in the
+        // same coordinate space as all other meshes. See `has_rtc_offset`.
         let processor = FacetedBrepProcessor::new();
-        let rtc_file_units = (
-            self.rtc_offset.0 / self.unit_scale,
-            self.rtc_offset.1 / self.unit_scale,
-            self.rtc_offset.2 / self.unit_scale,
-        );
+        let rtc_file_units = (0.0, 0.0, 0.0);
         let results = processor.process_batch(brep_ids, decoder, rtc_file_units);
 
         // Store results in cache (preallocate to avoid rehashing)
@@ -313,21 +314,6 @@ impl GeometryRouter {
     /// Get schema reference
     pub fn schema(&self) -> &IfcSchema {
         &self.schema
-    }
-
-    /// Resolve an element's ObjectPlacement to a scaled world-space transform matrix.
-    /// Returns the 4x4 matrix as a flat column-major array of 16 f64 values.
-    /// The translation component is scaled from file units to meters.
-    pub fn resolve_scaled_placement(
-        &self,
-        entity: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-    ) -> Result<[f64; 16]> {
-        let mut transform = self.get_placement_transform_from_element(entity, decoder)?;
-        self.scale_transform(&mut transform);
-        let mut result = [0.0f64; 16];
-        result.copy_from_slice(transform.as_slice());
-        Ok(result)
     }
 }
 

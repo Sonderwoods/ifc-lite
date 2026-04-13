@@ -24,11 +24,15 @@ const LARGE_COORD_THRESHOLD: f64 = 1000.0;
 
 /// Post-process meshes to ensure all positions are in uniform site-local coordinates.
 ///
-/// The upstream processing pipeline applies RTC (Relative To Center) via a per-mesh
-/// heuristic that can leave some meshes in world-space while others are in site-local.
-/// This function detects and fixes the inconsistency by subtracting the site placement
-/// translation from any mesh still in world-space, using f64 precision to avoid jitter.
+/// DISABLED — RTC has been turned off project-wide (see `router::has_rtc_offset`).
+/// With RTC off, all meshes already share the same coordinate space straight from
+/// the IFC file, so there is nothing to normalize. Re-enable by removing the early
+/// return if RTC is ever turned back on.
 fn normalize_to_site_local(result: &mut ProcessingResult) {
+    let _ = result;
+    return;
+
+    #[allow(unreachable_code)]
     let site_tx: f64;
     let site_ty: f64;
     let site_tz: f64;
