@@ -24,12 +24,23 @@ const MAX_PROFILE_DEPTH: u32 = 16;
 /// Profile processor - processes IFC profiles into 2D contours
 pub struct ProfileProcessor {
     schema: IfcSchema,
+    /// When true, inner curves in `IfcArbitraryProfileDefWithVoids` are ignored.
+    /// Used by `OpeningFilterMode::IgnoreAll` to produce clean wall meshes when
+    /// the IFC exporter (e.g. Revit) bakes window/door openings directly into
+    /// the wall profile instead of using `IfcRelVoidsElement`.
+    skip_profile_voids: bool,
 }
 
 impl ProfileProcessor {
     /// Create new profile processor
     pub fn new(schema: IfcSchema) -> Self {
-        Self { schema }
+        Self { schema, skip_profile_voids: false }
+    }
+
+    /// Create a profile processor that ignores inner curves in
+    /// `IfcArbitraryProfileDefWithVoids`, producing solid profiles.
+    pub fn new_skip_voids(schema: IfcSchema) -> Self {
+        Self { schema, skip_profile_voids: true }
     }
 
     /// Process any IFC profile definition
@@ -700,7 +711,9 @@ impl ProfileProcessor {
         let mut result = Profile2D::new(outer_points);
 
         // Check if this is IfcArbitraryProfileDefWithVoids (has inner curves)
-        if profile.ifc_type == IfcType::IfcArbitraryProfileDefWithVoids {
+        // When skip_profile_voids is set (IgnoreAll mode), we skip the inner curves
+        // so that walls with window/door voids baked into the profile come out clean.
+        if profile.ifc_type == IfcType::IfcArbitraryProfileDefWithVoids && !self.skip_profile_voids {
             // Get inner curves list (attribute 3)
             if let Some(inner_curves_attr) = profile.get(3) {
                 let inner_curves = decoder.resolve_ref_list(inner_curves_attr)?;

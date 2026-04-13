@@ -30,6 +30,7 @@ export default defineConfig({
       '@ifc-lite/export': path.resolve(__dirname, '../../packages/export/src'),
       '@ifc-lite/cache': path.resolve(__dirname, '../../packages/cache/src'),
       '@ifc-lite/ifcx': path.resolve(__dirname, '../../packages/ifcx/src'),
+      '@ifc-lite/sdk': path.resolve(__dirname, '../../packages/sdk/src'),
       '@ifc-lite/wasm': path.resolve(__dirname, '../../packages/wasm/pkg/ifc-lite.js'),
       '@ifc-lite/sdk': path.resolve(__dirname, '../../packages/sdk/src'),
       '@ifc-lite/lens': path.resolve(__dirname, '../../packages/lens/src'),

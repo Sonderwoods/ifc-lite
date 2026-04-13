@@ -1,0 +1,67 @@
+
+# START SERVER
+cd C:\Users\mass\GitHub\Linkajou\ifc-lite
+$env:PORT="8080"
+$env:RUST_LOG="warn"
+$env:MAX_FILE_SIZE_MB = "2000"
+$env:REQUEST_TIMEOUT_SECS = "1800"
+.\target\release\ifc-lite-server.exe
+
+
+# SLUK BUILD
+Get-Process cargo,rustc -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# BUILD
+cd C:\Users\mass\GitHub\Linkajou\ifc-lite
+cargo build -p ifc-lite-server --release
+
+
+# Build alt + copy to linkajou (BAT)
+cd C:\Users\mass\GitHub\Linkajou\ifc-lite\apps\server
+
+$env:MAX_FILE_SIZE_MB="2048"   # or your value
+cargo build --release -p ifc-lite-server 
+cargo build --release -p ifc-lite-ffi
+cd C:\Users\mass\GitHub\Linkajou\ifc-lite\
+cp target/release/ifc_lite_ffi.dll ../LINK_EP.LINK_RH/tools/ifc-lite/
+cp target/release/ifc-lite-server.exe ../LINK_EP.LINK_RH/tools/ifc-lite/
+
+
+
+#evt kør server
+cargo run --release
+
+
+
+
+
+
+
+
+
+
+# Build + ship
+cd C:\Users\mass\GitHub\Linkajou\ifc-lite
+
+# 1. In ifc-lite repo — build the FFI DLL
+cargo build --release -p ifc-lite-ffi
+# → target/release/ifc_lite_ffi.dll
+
+# 2. Copy to Linkajou tools folder
+cp target/release/ifc_lite_ffi.dll ../LINK_EP.LINK_RH/tools/ifc-lite/
+
+# 3. (Optional) Build server with firewall fix
+cargo build --release -p ifc-lite-server
+cp target/release/ifc-lite-server.exe ../LINK_EP.LINK_RH/tools/ifc-lite/
+
+#Then build Linkajou in Visual Studio — the DLL gets copied to bin\Debug\tools\ifc-lite\ automatically.
+
+
+
+### new (POWERSHELL)
+cd Linkajou\ifc-lite
+cargo build --release -p ifc-lite-ffi
+cargo build --release -p ifc-lite-server
+
+Copy-Item .\target\release\ifc_lite_ffi.dll ..\LINK_EP.LINK_RH\tools\ifc-lite\ -Force
+Copy-Item .\target\release\ifc-lite-server.exe ..\LINK_EP.LINK_RH\tools\ifc-lite\ -Force
