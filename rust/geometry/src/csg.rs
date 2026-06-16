@@ -187,6 +187,116 @@ impl ClippingProcessor {
         polygons_a + polygons_b <= MAX_CSG_POLYGONS
     }
 
+    /// Returns true only if the mesh is a closed 2-manifold solid: after welding coincident
+    /// vertices, every edge is shared by exactly two triangles and no triangle is degenerate.
+    ///
+    /// csgrs boolean operations are only well-defined on closed manifold solids. Open shells
+    /// or non-manifold geometry (common with malformed non-rectangular IfcOpeningElements) can
+    /// drive csgrs's BSP construction into unbounded recursion — a stack overflow that aborts
+    /// the entire host process and cannot be caught by `catch_unwind`. Callers use this to skip
+    /// the csgrs call (leaving the host uncut) rather than risk the crash.
+    fn is_closed_manifold(mesh: &Mesh) -> bool {
+        use std::collections::HashMap;
+
+        let tri_count = mesh.indices.len() / 3;
+        if tri_count < 4 || mesh.indices.len() % 3 != 0 {
+            return false;
+        }
+        if mesh.positions.iter().any(|v| !v.is_finite()) {
+            return false;
+        }
+
+        let (min, max) = mesh.bounds();
+        let span = (max.x - min.x).max(max.y - min.y).max(max.z - min.z) as f64;
+        if !span.is_finite() || span <= 0.0 {
+            return false;
+        }
+        // Weld coincident vertices at ~1 ppm of the model span so shared edges line up.
+        let quantum = (span / 1.0e6).max(1.0e-9);
+        let vert_count = mesh.positions.len() / 3;
+        let mut canonical: HashMap<(i64, i64, i64), u32> = HashMap::with_capacity(vert_count);
+        let mut remap = vec![0u32; vert_count];
+        for v in 0..vert_count {
+            let key = (
+                (mesh.positions[v * 3] as f64 / quantum).round() as i64,
+                (mesh.positions[v * 3 + 1] as f64 / quantum).round() as i64,
+                (mesh.positions[v * 3 + 2] as f64 / quantum).round() as i64,
+            );
+            let next = canonical.len() as u32;
+            remap[v] = *canonical.entry(key).or_insert(next);
+        }
+
+        // Every edge of a closed 2-manifold is shared by exactly two triangles.
+        let mut edge_faces: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in 0..tri_count {
+            let a = remap[mesh.indices[t * 3] as usize];
+            let b = remap[mesh.indices[t * 3 + 1] as usize];
+            let c = remap[mesh.indices[t * 3 + 2] as usize];
+            if a == b || b == c || a == c {
+                return false; // degenerate triangle
+            }
+            for (u, w) in [(a, b), (b, c), (c, a)] {
+                let edge = if u < w { (u, w) } else { (w, u) };
+                *edge_faces.entry(edge).or_insert(0) += 1;
+            }
+        }
+        edge_faces.values().all(|&n| n == 2)
+    }
+
+    /// Returns true if any face of `a` lies in (nearly) the same plane as any face of `b`,
+    /// i.e. the two solids share coplanar face contact (e.g. an opening flush with a wall
+    /// face). This is the dominant trigger for csgrs BSP non-convergence: the shared split
+    /// planes make the partition fail to make progress and recurse without bound. Cheap here
+    /// because callers already cap operands to a small polygon count.
+    fn has_coplanar_face_contact(a: &Mesh, b: &Mesh) -> bool {
+        fn face_planes(m: &Mesh) -> Vec<(Vector3<f64>, f64)> {
+            let tris = m.indices.len() / 3;
+            let mut planes = Vec::with_capacity(tris);
+            let p = |i: usize| {
+                Point3::new(
+                    m.positions[i * 3] as f64,
+                    m.positions[i * 3 + 1] as f64,
+                    m.positions[i * 3 + 2] as f64,
+                )
+            };
+            for t in 0..tris {
+                let v0 = p(m.indices[t * 3] as usize);
+                let v1 = p(m.indices[t * 3 + 1] as usize);
+                let v2 = p(m.indices[t * 3 + 2] as usize);
+                let n = (v1 - v0).cross(&(v2 - v0));
+                let len = n.norm();
+                if len < 1e-12 {
+                    continue; // degenerate face — no well-defined plane
+                }
+                let n = n / len;
+                planes.push((n, n.dot(&v0.coords)));
+            }
+            planes
+        }
+
+        // Plane-offset tolerance relative to model size so this is unit-agnostic.
+        let (min, max) = a.bounds();
+        let span = (max.x - min.x).max(max.y - min.y).max(max.z - min.z) as f64;
+        let d_eps = (span * 1.0e-5).max(1.0e-6);
+        const NORMAL_EPS: f64 = 1.0e-4; // ~0.0006° off parallel
+
+        let planes_a = face_planes(a);
+        let planes_b = face_planes(b);
+        for (na, da) in &planes_a {
+            for (nb, db) in &planes_b {
+                let dot = na.dot(nb);
+                if dot.abs() > 1.0 - NORMAL_EPS {
+                    // Align offsets when the normals point opposite ways.
+                    let db_aligned = if dot > 0.0 { *db } else { -*db };
+                    if (da - db_aligned).abs() < d_eps {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Create a new clipping processor
     pub fn new() -> Self {
         Self { epsilon: 1e-6 }
@@ -759,6 +869,19 @@ impl ClippingProcessor {
             return Ok(host_mesh.clone());
         }
 
+        // Guard against csgrs BSP non-convergence. csgrs 0.20.1 can recurse without bound
+        // (stack overflow that aborts the whole host process, uncatchable by catch_unwind)
+        // even on small, perfectly valid closed manifolds when the operands have coplanar
+        // face contact — e.g. an opening sitting flush in a wall, where the shared split
+        // planes make the BSP partition fail to make progress. Leave the host uncut in that
+        // case (matches the low-polygon guard above).
+        if !Self::is_closed_manifold(host_mesh)
+            || !Self::is_closed_manifold(opening_mesh)
+            || Self::has_coplanar_face_contact(host_mesh, opening_mesh)
+        {
+            return Ok(host_mesh.clone());
+        }
+
         // Perform CSG difference (host - opening)
         let result_csg = host_csg.difference(&opening_csg);
 
@@ -1051,6 +1174,14 @@ impl ClippingProcessor {
             return Ok(merged);
         }
 
+        // Guard against csgrs BSP non-convergence on open/non-manifold operands (see
+        // is_closed_manifold): fall back to a plain merge rather than risk a stack overflow.
+        if !Self::is_closed_manifold(mesh_a) || !Self::is_closed_manifold(mesh_b) {
+            let mut merged = mesh_a.clone();
+            merged.merge(mesh_b);
+            return Ok(merged);
+        }
+
         // Perform CSG union
         let result_csg = csg_a.union(&csg_b);
 
@@ -1079,6 +1210,12 @@ impl ClippingProcessor {
         }
 
         if !Self::can_run_csgrs_operation(&csg_a, &csg_b) {
+            return Ok(Mesh::new());
+        }
+
+        // Guard against csgrs BSP non-convergence on open/non-manifold operands (see
+        // is_closed_manifold): skip rather than risk a stack overflow.
+        if !Self::is_closed_manifold(mesh_a) || !Self::is_closed_manifold(mesh_b) {
             return Ok(Mesh::new());
         }
 
