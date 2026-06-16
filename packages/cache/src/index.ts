@@ -45,7 +45,10 @@ export type {
   CacheReadOptions,
   CacheHeaderInfo,
   CacheReadResult,
-  IfcDataStore,
+  CachedEntityIndexColumns,
+  CacheEntityIndex,
+  CacheEntityRef,
+  CacheDataStore,
 } from './types.js';
 
 // Utilities

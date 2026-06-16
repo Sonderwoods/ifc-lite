@@ -50,12 +50,14 @@ import {
 } from '@/components/ui/alert';
 import { Progress } from '@/components/ui/progress';
 import { useViewerStore } from '@/store';
+import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { toast } from '@/components/ui/toast';
 import { ensureModelExportReady } from '@/services/desktop-export';
 import { StepExporter, MergedExporter, Ifc5Exporter, IFC5_KNOWN_PROP_NAMES, type MergeModelInput, type ExportProgress, type StepExportProgress } from '@ifc-lite/export';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import { spliceScheduleIntoExport } from '@/sdk/adapters/export-schedule-splice';
 
 type ExportScope = 'single' | 'merged';
 type SchemaVersion = 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
@@ -84,6 +86,9 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
   // Also get legacy single-model state for backward compatibility
   const legacyIfcDataStore = useViewerStore((s) => s.ifcDataStore);
   const legacyGeometryResult = useViewerStore((s) => s.geometryResult);
+  // Optional extension host — emits the export.run action when present
+  // so the local pattern miner can spot load → export workflows.
+  const extensionHost = useOptionalExtensionHost();
 
   const [open, setOpen] = useState(false);
   const [schema, setSchema] = useState<SchemaVersion | ''>('');
@@ -314,6 +319,10 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
     if (!schema) return;
     if (exportScope === 'single' && !selectedModel) return;
 
+    // Action log: content-free emit so the miner can spot
+    // "load → export" patterns. Format label only — no path / data.
+    extensionHost?.emitAction('export.run', { format: outputInfo.ext.replace(/^\./, '') });
+
     setIsExporting(true);
     setExportResult(null);
     setExportProgress(null);
@@ -387,6 +396,12 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
       }
 
       if (!selectedModel) return;
+      // IFC5 export needs a parsed data store + geometry. Native-metadata
+      // models don't carry these, so bail with a descriptive error rather
+      // than passing nulls through.
+      if (!selectedModel.ifcDataStore) {
+        throw new Error('Selected model has no parsed IFC data store available for export');
+      }
       const mutationView = getMutationView(selectedModelId);
       const baseName = selectedModel.name.replace(/\.[^.]+$/, '');
 
@@ -515,7 +530,18 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
 
         setExportProgress(null);
 
-        const blob = new Blob([toBlobPart(result.content)], { type: 'text/plain' });
+        // Splice pending schedule tasks into the STEP via the shared
+        // helper. Same contract every export surface uses so bugs
+        // can't differ between the dialog, the quick button, and the
+        // SDK adapter.
+        const state = useViewerStore.getState();
+        const spliced = spliceScheduleIntoExport(result, selectedModelId, selectedModel.ifcDataStore as IfcDataStore, {
+          scheduleData: state.scheduleData ?? null,
+          scheduleIsEdited: state.scheduleIsEdited === true,
+          scheduleSourceModelId: state.scheduleSourceModelId ?? null,
+        });
+
+        const blob = new Blob([toBlobPart(spliced.content)], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -538,7 +564,7 @@ export function ExportDialog({ trigger }: ExportDialogProps) {
     } finally {
       setIsExporting(false);
     }
-  }, [selectedModel, selectedModelId, schema, isIfc5, exportScope, includeGeometry, applyMutations, changesOnly, visibleOnly, onlyKnownProperties, getMutationView, getLocalHiddenIds, getLocalIsolatedIds, modifiedCount, models]);
+  }, [selectedModel, selectedModelId, schema, isIfc5, exportScope, includeGeometry, applyMutations, changesOnly, visibleOnly, onlyKnownProperties, getMutationView, getLocalHiddenIds, getLocalIsolatedIds, modifiedCount, models, extensionHost, outputInfo]);
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>

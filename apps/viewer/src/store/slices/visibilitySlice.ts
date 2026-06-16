@@ -11,7 +11,14 @@
 
 import type { StateCreator } from 'zustand';
 import type { TypeVisibility, EntityRef } from '../types.js';
-import { TYPE_VISIBILITY_DEFAULTS } from '../constants.js';
+import {
+  getPersistedTypeVisibility,
+  TYPE_VISIBILITY_STORAGE_KEYS,
+  TYPE_VISIBILITY_SEMANTIC_DEFAULTS,
+  getPersistedTypeViewMode,
+  TYPE_VIEW_MODE_STORAGE_KEY,
+  type TypeViewMode,
+} from '../constants.js';
 
 export interface VisibilitySlice {
   // State (legacy - single model)
@@ -20,6 +27,15 @@ export interface VisibilitySlice {
   /** Class-level filter (from Class tab type-group clicks) — independent of isolatedEntities */
   classFilter: { ids: Set<number>; label: string } | null;
   typeVisibility: TypeVisibility;
+  /** 3D view mode for the Model/Types switch (#957 follow-up). 'model' shows
+   *  placed occurrences (default); 'types' shows the type-library shapes. */
+  typeViewMode: TypeViewMode;
+  /** True when the rendered geometry contains any type-library geometry
+   *  (geometryClass 1 = orphan type, 2 = instanced type) — i.e. the Model/Types
+   *  switch has something to reveal in "Types" mode. Derived from the merged
+   *  mesh set by ViewportContainer; most models carry only occurrence geometry
+   *  (class 0), so the switch stays hidden for them. */
+  hasTypeGeometry: boolean;
 
   // State (multi-model)
   /** Hidden entities per model */
@@ -43,7 +59,15 @@ export interface VisibilitySlice {
   clearAllFilters: () => void;
   showAll: () => void;
   isEntityVisible: (id: number) => boolean;
-  toggleTypeVisibility: (type: 'spaces' | 'openings' | 'site') => void;
+  toggleTypeVisibility: (type: 'spaces' | 'spatialZones' | 'openings' | 'site' | 'ifcAnnotations' | 'ifcGrid') => void;
+  /** Restore every type-visibility toggle to its semantic default (and persist). */
+  resetTypeVisibility: () => void;
+  /** Set the Model/Types 3D view mode (and persist). */
+  setTypeViewMode: (mode: TypeViewMode) => void;
+  /** Set whether the current geometry contains type-library geometry — drives
+   *  whether the Model/Types switch renders at all. Runtime-only (not persisted);
+   *  re-derived from geometry on every load. */
+  setHasTypeGeometry: (value: boolean) => void;
   /** Set all hidden entities at once (for BCF viewpoint application) */
   setHiddenEntities: (ids: Set<number>) => void;
   /** Set all isolated entities at once (for BCF viewpoint with defaultVisibility=false) */
@@ -75,11 +99,11 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
   hiddenEntities: new Set(),
   isolatedEntities: null,
   classFilter: null,
-  typeVisibility: {
-    spaces: TYPE_VISIBILITY_DEFAULTS.SPACES,
-    openings: TYPE_VISIBILITY_DEFAULTS.OPENINGS,
-    site: TYPE_VISIBILITY_DEFAULTS.SITE,
-  },
+  // Read persisted toggles fresh so the user's choices survive reloads.
+  typeVisibility: getPersistedTypeVisibility(),
+  typeViewMode: getPersistedTypeViewMode(),
+  // Derived from geometry at load time — no model is open yet, so default false.
+  hasTypeGeometry: false,
 
   // Initial state (multi-model)
   hiddenEntitiesByModel: new Map(),
@@ -194,12 +218,49 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
     return true;
   },
 
-  toggleTypeVisibility: (type) => set((state) => ({
-    typeVisibility: {
-      ...state.typeVisibility,
-      [type]: !state.typeVisibility[type],
-    },
-  })),
+  toggleTypeVisibility: (type) => set((state) => {
+    const next = !state.typeVisibility[type];
+    // Persist every type-visibility toggle so user choice survives
+    // reloads. Keyed by type so clearing one preference (e.g. for
+    // testing or to reset to defaults) doesn't nuke the others.
+    if (typeof window !== 'undefined') {
+      const storageKey = TYPE_VISIBILITY_STORAGE_KEYS[type];
+      try { localStorage.setItem(storageKey, String(next)); }
+      catch { /* private-mode storage rejection — non-fatal */ }
+    }
+    return {
+      typeVisibility: { ...state.typeVisibility, [type]: next },
+    };
+  }),
+
+  resetTypeVisibility: () => set(() => {
+    // Restore semantic defaults and persist them per-key (same storage
+    // pattern as toggleTypeVisibility) so the reset survives reloads.
+    if (typeof window !== 'undefined') {
+      (Object.keys(TYPE_VISIBILITY_STORAGE_KEYS) as (keyof typeof TYPE_VISIBILITY_STORAGE_KEYS)[])
+        .forEach((key) => {
+          try { localStorage.setItem(TYPE_VISIBILITY_STORAGE_KEYS[key], String(TYPE_VISIBILITY_SEMANTIC_DEFAULTS[key])); }
+          catch { /* private-mode storage rejection — non-fatal */ }
+        });
+    }
+    return { typeVisibility: { ...TYPE_VISIBILITY_SEMANTIC_DEFAULTS } };
+  }),
+
+  setTypeViewMode: (mode) => set(() => {
+    if (typeof window !== 'undefined') {
+      try { localStorage.setItem(TYPE_VIEW_MODE_STORAGE_KEY, mode); }
+      catch { /* private-mode storage rejection — non-fatal */ }
+    }
+    return { typeViewMode: mode };
+  }),
+
+  setHasTypeGeometry: (value) => set((state) => (
+    // Return the SAME state reference when unchanged — a fresh `{}` would still
+    // merge into a new state object and notify every subscriber (incl. the
+    // whole-state useSyncExternalStore in ViewportContainer). Same ref → Zustand
+    // skips the notification entirely.
+    state.hasTypeGeometry === value ? state : { hasTypeGeometry: value }
+  )),
 
   // Actions (multi-model)
   hideEntityInModel: (modelId, expressId) => set((state) => {

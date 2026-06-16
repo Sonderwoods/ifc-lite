@@ -19,6 +19,7 @@ import {
 import type { FileAttachment } from './types.js';
 import type { ScriptEditorSelection } from './types.js';
 import { formatDiagnosticsForPrompt, type ScriptDiagnostic } from './script-diagnostics.js';
+import { buildAuthoringContract } from '@ifc-lite/extensions';
 
 const MAX_ATTACHMENT_ROWS_IN_PROMPT = 5;
 const MAX_ATTACHMENT_TEXT_PREVIEW_CHARS = 1200;
@@ -54,6 +55,21 @@ export interface ScriptEditorPromptContext {
 export interface PromptTaskContext {
   userPrompt?: string;
   diagnostics?: ScriptDiagnostic[];
+  /**
+   * Personal prompt overlay from the active flavor (RFC §06.4). When
+   * present, it's appended at the very end of the system prompt
+   * inside a clearly-delimited block so we can cache the everything-
+   * else portion across users and only invalidate the tail.
+   */
+  personalOverlay?: string;
+  /**
+   * When set, append the AI authoring contract from
+   * `@ifc-lite/extensions` (manifest schema + widget DSL + capability
+   * catalogue + style rules). Used when the chat classifier flags an
+   * authoring intent. Cached separately so non-authoring turns don't
+   * pay for the extra tokens.
+   */
+  includeAuthoringContract?: boolean;
 }
 
 interface NamespacedMethod {
@@ -98,6 +114,69 @@ function buildIntentMethodSection(intent: LlmTaskIntent): string {
     lines.push(`- \`bim.${namespace}.${method.name}(...)\`: ${synopsis}`);
   }
   return lines.join('\n');
+}
+
+function buildStoreCheatSheet(): string {
+  const storeNamespace = NAMESPACE_SCHEMAS.find((schema) => schema.name === 'store');
+  if (!storeNamespace) return '';
+
+  return [
+    '## BIM.STORE CHEAT SHEET',
+    '`bim.store.*` edits a parsed model in place — use it when the user already has',
+    'a model loaded and wants raw STEP-level edits, NOT when building a new model from',
+    'scratch (that\'s `bim.create`).',
+    '',
+    '- `addEntity(modelId, { type, attributes })` — inject a STEP entity. `attributes`',
+    '  follows EntityExtractor output: numbers → REAL/integer, `"#42"` → ref, `".AREA."` → enum,',
+    '  `null` → `$`, arrays → STEP list. Returns `{ modelId, expressId }`.',
+    '- `removeEntity(entity)` — tombstones existing source entities or forgets overlay-only ones.',
+    '- `setPositionalAttribute(entity, index, value)` — edit a non-IfcRoot attribute by',
+    '  zero-based STEP argument index. Use this for `IfcRectangleProfileDef.XDim` (index 3),',
+    '  `YDim` (index 4), `IfcCartesianPoint.Coordinates` (index 0), etc. Use `bim.mutate.setAttribute`',
+    '  for IfcRoot attributes (Name, Description, ObjectType, Tag).',
+    '- High-level builders anchor a new element to an existing IfcBuildingStorey:',
+    '    `addColumn(modelId, storeyId, { Position, Width, Depth, Height })`',
+    '    `addWall(modelId, storeyId, { Start, End, Thickness, Height })`',
+    '    `addBeam(modelId, storeyId, { Start, End, Width, Height })`',
+    '    `addSlab(modelId, storeyId, { Position, Width, Depth, Thickness })`             // rectangle',
+    '    `addSlab(modelId, storeyId, { Profile: "polygon", OuterCurve: [[x,y],…], Thickness })`',
+    '    `addRoof(modelId, storeyId, { … same shape as addSlab — emits .FLAT_ROOF. })`',
+    '    `addPlate(modelId, storeyId, { … same shape as addSlab — IfcPlate, PredefinedType? })`',
+    '    `addSpace(modelId, storeyId, { Position, Width, Depth, Height, LongName? })`     // room rectangle',
+    '    `addSpace(modelId, storeyId, { Profile: "polygon", OuterCurve, Height })`        // room polygon',
+    '    `addDoor(modelId, storeyId, { Position, Width, Height, FrameThickness?, OperationType? })`',
+    '    `addWindow(modelId, storeyId, { Position, Width, Height, FrameThickness?, PartitioningType? })`',
+    '    `addMember(modelId, storeyId, { Start, End, Width, Height, PredefinedType? })`   // brace/post/strut',
+    '  Each emits ~12 STEP entities (placement chain → profile → solid → representation +',
+    '  IfcRelContainedInSpatialStructure, except `addSpace` which uses IfcRelAggregates).',
+    '  Coords are storey-local metres. Polygon outlines need ≥3 points; the polyline is auto-closed.',
+    '- Edits accumulate in an overlay; they show up after `bim.export.ifc(bim.query.all())`',
+    '  or when the viewer next renders. Use `bim.mutate.undo(modelId)` to roll back.',
+    '',
+    'Canonical examples:',
+    '```js',
+    '// Resize a rectangular profile from 0.3×0.4 to 0.6×0.4',
+    'const profile = bim.query.byId("arch", 35);',
+    'bim.store.setPositionalAttribute(profile, 3, 0.6);   // XDim',
+    '',
+    '// Drop a wall on the first storey',
+    'const storeyId = bim.query.byType("IfcBuildingStorey")[0].ref.expressId;',
+    'bim.store.addWall("arch", storeyId, {',
+    '  Start: [0, 0, 0], End: [5, 0, 0],',
+    '  Thickness: 0.2, Height: 3, Name: "North Wall",',
+    '});',
+    '',
+    '// Add a custom IfcCartesianPoint, then reference it from another entity',
+    'const pt = bim.store.addEntity("arch", {',
+    '  type: "IfcCartesianPoint",',
+    '  attributes: [[1.0, 2.0, 0.0]],',
+    '});',
+    'console.log("Allocated", pt.expressId);',
+    '',
+    '// Drop an entity entirely',
+    'bim.store.removeEntity(unwantedRef);',
+    '```',
+  ].join('\n');
 }
 
 function buildCreateContractCheatSheet(): string {
@@ -280,11 +359,19 @@ export function buildSystemPrompt(
   const intent = inferPromptIntent(task);
   const intentSection = buildIntentMethodSection(intent);
   const createContractCheatSheet = buildCreateContractCheatSheet();
+  const storeCheatSheet = buildStoreCheatSheet();
   const placementSemantics = buildPlacementSemanticsSection();
   const inspectionGuidance = buildInspectionGuidance();
 
   let prompt = `You are an IFC/BIM scripting assistant embedded in ifc-lite, a web-based IFC viewer with a live 3D viewport.
 You write JavaScript code that executes in a sandboxed environment with a global \`bim\` object.
+
+## SANDBOX CONSTRAINTS (read first)
+Scripts run inside a QuickJS-WASM sandbox, NOT in a browser context.
+You DO have: \`bim\`, \`console\` (log/info/warn/error).
+You do NOT have: \`document\`, \`window\`, \`navigator\`, \`location\`, \`globalThis.*\`, \`fetch\`, \`XMLHttpRequest\`, \`localStorage\`, \`indexedDB\`, \`setTimeout\`/\`setInterval\`, \`eval\`, \`Function(...)\`, dynamic \`import()\`, ES module \`import\`/\`export\`, or any DOM API.
+For UI side-effects use \`bim.viewer.*\` (colorize, isolate, fly, section). For data use \`bim.query\`, \`bim.properties\`, \`bim.export\`. For chat-attached files use \`bim.files.*\`.
+If a previous attempt referenced \`document\`, \`window\`, or \`fetch\`, rewrite using the sandbox APIs above. The sandbox will reject those globals at runtime with a "not defined" error.
 
 ## YOUR CAPABILITIES
 - Create complete IFC buildings from scratch (walls, slabs, columns, beams, stairs, roofs)
@@ -326,9 +413,11 @@ ${intentSection}
 4. Keep scripts concise — avoid unnecessary abstractions
 5. Coordinates are in meters. Z is up. Do NOT assume every create method is storey-relative — use the method-specific placement rules below.
 6. For create or explicit rewrite turns, wrap runnable code in a \`\`\`js\`\`\` fence. For repair turns, return exactly one \`\`\`ifc-script-edits\`\`\` fence containing SEARCH/REPLACE blocks and no \`\`\`js\`\`\` fence.
-7. If the user asks to modify existing data, use \`bim.mutate\` or \`bim.query\` — NOT \`bim.create\`
+7. If the user asks to modify existing data, use \`bim.mutate\`, \`bim.store\`, or \`bim.query\` — NOT \`bim.create\`
    - Use \`bim.mutate.setAttribute(entity, "Description", "...")\` for root IFC attributes like \`Name\`, \`Description\`, \`ObjectType\`, or \`Tag\`
    - Use \`bim.mutate.setProperty(entity, "Pset_Name", "PropName", value)\` only for IfcPropertySet or quantity data
+   - Use \`bim.store.setPositionalAttribute(entity, index, value)\` for positional STEP-argument edits (profile dimensions, \`IfcCartesianPoint.Coordinates\`, and other index-addressed attributes — even when they have a symbolic name) — see BIM.STORE CHEAT SHEET
+   - Use \`bim.store.addEntity\` / \`bim.store.removeEntity\` to inject or drop raw STEP entities in an already-loaded model. Do NOT use \`bim.create\` for these — \`bim.create\` builds a fresh project
    - Distinguish occurrence vs type edits: occurrence/entity-specific changes belong on the occurrence; shared defaults and inherited type properties belong on the related \`Ifc...Type\` entity
    - If CURRENT MODEL STATE marks a selection as \`kind=type\`, treat it as a type object and avoid describing it as one physical placed occurrence
    - When an occurrence is selected, inspect \`bim.query.typeProperties(entity)\` before editing inherited values; mutate the type entity when the intent is to change all occurrences that share that type
@@ -352,6 +441,8 @@ ${intentSection}
 19. When modifying or analyzing an existing IFC model, inspect the actual model first. Use ${inspectionGuidance} instead of guessing hierarchy or metadata.
 
 ${createContractCheatSheet}
+
+${storeCheatSheet}
 
 ${placementSemantics}
 - \`addIfcDoor\` and \`addIfcWindow\` do not infer host-wall orientation. If you place them next to angled walls, they will stay world-aligned unless you build the wall void another way.
@@ -392,6 +483,39 @@ for (let i = 0; i < storeyCount; i++) {
 - If doors or windows appear rotated 90° relative to a wall, you probably used standalone \`addIfcDoor\` / \`addIfcWindow\` where a wall \`Openings\` payload was needed.
 - If repeated elements appear only at one level, you probably reused one storey reference instead of iterating over the intended storeys.
 - If repeated world-placement elements stack at the base level, first check whether their Z coordinates include the current storey elevation.
+
+## SCHEDULING / 4D (IfcTask, IfcWorkSchedule, IfcRelSequence)
+- ifc-lite ships a Gantt panel in the lower workspace that plays a construction-sequence animation driven by IfcTask dates and the products each task controls.
+- Creating a schedule from scratch:
+  \`\`\`js
+  const h = bim.create.project({ Name: "Demo" });
+  const storey = bim.create.addIfcBuildingStorey(h, { Name: "Ground", Elevation: 0 });
+  const wallA = bim.create.addIfcWall(h, storey, { Start: [0,0,0], End: [5,0,0], Thickness: 0.2, Height: 3 });
+
+  const schedule = bim.create.addIfcWorkSchedule(h, {
+    Name: "Construction schedule",
+    StartTime: "2024-05-01T08:00:00",
+    FinishTime: "2024-06-30T17:00:00",
+    PredefinedType: "PLANNED",
+  });
+  const task = bim.create.addIfcTask(h, {
+    Name: "Install wall A",
+    PredefinedType: "INSTALLATION",
+    ScheduleStart: "2024-05-06T08:00:00",
+    ScheduleFinish: "2024-05-10T17:00:00",
+    ScheduleDuration: "P5D",
+  });
+  bim.create.assignTasksToWorkSchedule(h, schedule, [task]);
+  bim.create.assignProductsToTask(h, task, [wallA]);   // products reveal in the 4D animation
+  // bim.create.addIfcRelSequence(h, prevTask, task, { SequenceType: "FINISH_START", TimeLag: "P2D" });
+  // bim.create.nestTasks(h, summaryTask, [task]);    // WBS hierarchy
+  \`\`\`
+- Dates are ISO 8601 (\`2024-05-01T08:00:00\`). Durations are ISO 8601 (\`P5D\`, \`PT8H\`).
+- IfcTask.PredefinedType is an enum — prefer CONSTRUCTION, INSTALLATION, DEMOLITION, RENOVATION over free strings.
+- For milestones (e.g. "handover"), set \`IsMilestone: true\` and omit or equate start/finish.
+- \`assignProductsToTask\` is the bridge that lets the 4D Gantt animation reveal/hide elements as time advances. Always bind tasks to the elements they construct when the user wants the viewport to animate.
+- Reading an existing schedule: \`bim.schedule.data()\` returns { workSchedules, tasks, sequences }. Use it to inspect or validate a construction plan.
+- **CSV / Excel / PDF → schedule workflow:** when the user attaches a spreadsheet or PDF with activities and dates, parse it with \`bim.files.csv(name)\` (for CSV) or \`bim.files.text(name)\` (for text-extracted PDF/Excel content converted upstream). Map each row to an \`addIfcTask(...)\` call and resolve the \`products\` column — an IFC type like \`IfcWall\` expands to every matching entity, a globalId maps to one specific entity — into \`expressId\`s to feed \`assignProductsToTask\`. The \`Construction schedule (4D)\` script template is a ready-made starting point.
 
 ## API REFERENCE
 ${apiRef}
@@ -659,6 +783,25 @@ if (!rows) {
   if (task?.diagnostics && task.diagnostics.length > 0) {
     prompt += `\n\n## ACTIVE DIAGNOSTICS`;
     prompt += `\n${formatDiagnosticsForPrompt(task.diagnostics)}`;
+  }
+
+  if (task?.includeAuthoringContract) {
+    // AI extension authoring contract (RFC §04.5/§11). Deterministic
+    // for a given SDK version so a hosted cache layer hits cleanly.
+    // Inject the live SDK version so the AI emits a compatible
+    // `engines.ifcLiteSdk` range instead of guessing a future major.
+    const sdkVersion = typeof __APP_VERSION__ === 'string' && __APP_VERSION__.length > 0
+      ? __APP_VERSION__
+      : undefined;
+    prompt += `\n\n${buildAuthoringContract({ currentSdkVersion: sdkVersion })}`;
+  }
+
+  if (task?.personalOverlay && task.personalOverlay.trim().length > 0) {
+    // Personal prompt overlay — durable user preferences captured by
+    // the memory loop (RFC §06.4). Cached separately so the rest of
+    // the prompt stays cacheable across users.
+    prompt += `\n\n## PERSONAL CONTEXT (from the user's flavor)`;
+    prompt += `\n${task.personalOverlay.trim()}`;
   }
 
   return prompt;

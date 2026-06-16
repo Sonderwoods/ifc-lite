@@ -28,7 +28,15 @@
  * ```
  */
 
-export * from './client';
-export * from './types';
-export { decodeParquetGeometry, decodeOptimizedParquetGeometry, isParquetAvailable } from './parquet-decoder';
-export { decodeDataModel, type DataModel, type Quantity, type QuantitySet } from './data-model-decoder';
+export * from './client.js';
+export * from './types.js';
+export { decodeParquetGeometry, decodeOptimizedParquetGeometry, isParquetAvailable } from './parquet-decoder.js';
+export {
+  decodeDataModel,
+  type DataModel,
+  type Quantity,
+  type QuantitySet,
+  type ClassificationAssociation,
+  type MaterialAssociation,
+  type DocumentAssociation,
+} from './data-model-decoder.js';

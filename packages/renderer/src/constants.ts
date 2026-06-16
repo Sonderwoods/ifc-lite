@@ -47,11 +47,18 @@ export const CAMERA_CONSTANTS = {
   /** Far plane multiplier of distance */
   FAR_DISTANCE_MULTIPLIER: 10,
 
-  // Gimbal lock prevention
-  /** Minimum phi angle to prevent gimbal lock at poles */
-  MIN_PHI: 0.15,
-  /** Maximum phi angle to prevent gimbal lock at poles */
-  MAX_PHI: Math.PI - 0.15,
+  // Polar angle constraints (gimbal-lock protection)
+  // Phi is clamped just off the two poles (±Y). camera.up stays world Y
+  // throughout, so the orbit math (sinφ in the tangent) is well-defined
+  // for any phi ∈ [MIN_PHI, π − MIN_PHI]. The full sphere minus the exact
+  // poles is reachable — top/bottom/front/back/left/right presets all fit
+  // inside this range without needing per-preset clamp overrides.
+  //
+  // Pattern matches yomotsu/camera-controls and Autodesk Viewer.
+  /** Minimum phi angle. Top preset uses this — keeps phi off the +Y pole. */
+  MIN_PHI: 0.01,
+  /** Maximum phi angle. Bottom preset uses this — keeps phi off the −Y pole. */
+  MAX_PHI: Math.PI - 0.01,
   /** Sin phi threshold for pole detection */
   POLE_THRESHOLD: 0.05,
 
@@ -74,28 +81,6 @@ export const CAMERA_CONSTANTS = {
 } as const;
 
 // ============================================================================
-// BVH Constants
-// ============================================================================
-
-export const BVH_CONSTANTS = {
-  /** Minimum mesh count to trigger BVH construction */
-  THRESHOLD: 100,
-  /** Maximum primitives per leaf node */
-  MAX_PRIMITIVES_PER_LEAF: 4,
-  /** Maximum tree depth */
-  MAX_DEPTH: 32,
-} as const;
-
-// ============================================================================
-// Error Handling Constants
-// ============================================================================
-
-export const ERROR_CONSTANTS = {
-  /** Rate limit for render error logging (ms) */
-  RENDER_ERROR_THROTTLE_MS: 1000,
-} as const;
-
-// ============================================================================
 // Pipeline Constants
 // ============================================================================
 
@@ -111,30 +96,14 @@ export const PIPELINE_CONSTANTS = {
   DEFAULT_SAMPLE_COUNT: 4,
 
   // Depth buffer
-  /** Depth format for reverse-Z */
-  DEPTH_FORMAT: 'depth32float' as const,
-} as const;
-
-// ============================================================================
-// Lighting Constants (for shaders)
-// ============================================================================
-
-export const LIGHTING_CONSTANTS = {
-  // Directional lights (normalized directions)
-  SUN_LIGHT: { x: 0.5, y: 1.0, z: 0.3 } as const,
-  FILL_LIGHT: { x: -0.5, y: 0.3, z: -0.3 } as const,
-  RIM_LIGHT: { x: 0.0, y: 0.2, z: -1.0 } as const,
-
-  // Hemisphere colors
-  SKY_COLOR: { r: 0.3, g: 0.35, b: 0.4 } as const,
-  GROUND_COLOR: { r: 0.15, g: 0.1, b: 0.08 } as const,
-
-  // Intensities
-  AMBIENT_INTENSITY: 0.25,
-  DIFFUSE_SUN_INTENSITY: 0.55,
-  DIFFUSE_FILL_INTENSITY: 0.15,
-  RIM_INTENSITY: 0.15,
-  WRAP_FACTOR: 0.3,
+  /**
+   * Depth/stencil format used by RenderPipeline. Switched from depth32float
+   * to depth24plus-stencil8 when the 3D section work introduced a render
+   * pass shared by the main opaque, the section-plane preview, and the 2D
+   * overlay cap — WebGPU requires a single depth-stencil format across all
+   * pipelines that write to the same pass attachment.
+   */
+  DEPTH_FORMAT: 'depth24plus-stencil8' as const,
 } as const;
 
 // ============================================================================
@@ -150,15 +119,4 @@ export const BATCH_CONSTANTS = {
   BYTES_PER_VERTEX: 7 * 4,
   /** Bytes per index (uint32) */
   BYTES_PER_INDEX: 4,
-} as const;
-
-// ============================================================================
-// Pick Constants
-// ============================================================================
-
-export const PICK_CONSTANTS = {
-  /** Maximum meshes to create for picking during streaming */
-  MAX_PICK_MESH_CREATION: 500,
-  /** Pick buffer format */
-  BUFFER_FORMAT: 'rgba8unorm' as const,
 } as const;

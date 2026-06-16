@@ -8,7 +8,7 @@
  * Extracted from Viewport.tsx for reusability
  */
 
-import { useViewerStore } from '../store.js';
+import { useViewerStore } from '../store/index.js';
 
 /**
  * Selection-related store state and actions
@@ -50,10 +50,20 @@ export function useVisibilityState() {
 export function useToolState() {
   const activeTool = useViewerStore((state) => state.activeTool);
   const sectionPlane = useViewerStore((state) => state.sectionPlane);
+  const sectionPickMode = useViewerStore((state) => state.sectionPickMode);
+  const setSectionPlaneFromFace = useViewerStore((state) => state.setSectionPlaneFromFace);
+  const setSectionPickMode = useViewerStore((state) => state.setSectionPickMode);
+  const setSectionPickPreview = useViewerStore((state) => state.setSectionPickPreview);
+  const setSectionCustomDistance = useViewerStore((state) => state.setSectionCustomDistance);
 
   return {
     activeTool,
     sectionPlane,
+    sectionPickMode,
+    setSectionPlaneFromFace,
+    setSectionPickMode,
+    setSectionPickPreview,
+    setSectionCustomDistance,
   };
 }
 
@@ -202,14 +212,22 @@ export function useContextMenuState() {
 export function useColorUpdateState() {
   const pendingColorUpdates = useViewerStore((state) => state.pendingColorUpdates);
   const pendingMeshColorUpdates = useViewerStore((state) => state.pendingMeshColorUpdates);
+  const pendingMeshRemovals = useViewerStore((state) => state.pendingMeshRemovals);
+  const pendingMeshTranslations = useViewerStore((state) => state.pendingMeshTranslations);
   const clearPendingColorUpdates = useViewerStore((state) => state.clearPendingColorUpdates);
   const clearPendingMeshColorUpdates = useViewerStore((state) => state.clearPendingMeshColorUpdates);
+  const clearPendingMeshRemovals = useViewerStore((state) => state.clearPendingMeshRemovals);
+  const clearPendingMeshTranslations = useViewerStore((state) => state.clearPendingMeshTranslations);
 
   return {
     pendingColorUpdates,
     pendingMeshColorUpdates,
+    pendingMeshRemovals,
+    pendingMeshTranslations,
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
+    clearPendingMeshRemovals,
+    clearPendingMeshTranslations,
   };
 }
 

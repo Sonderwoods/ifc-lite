@@ -26,19 +26,27 @@
 
     [:octicons-arrow-right-24: Server Guide](guide/server.md)
 
--   :material-monitor:{ .lg .middle } __Desktop App__
+-   :material-monitor:{ .lg .middle } __Build for Desktop__
 
     ---
 
-    Native Tauri app for offline use, large files, and multi-threaded performance.
+    Build your own native Tauri app on the packages for offline use, large files, and multi-threaded performance.
 
-    [:octicons-arrow-right-24: Desktop Guide](guide/desktop.md)
+    [:octicons-arrow-right-24: Building for Desktop](guide/desktop.md)
+
+-   :material-puzzle-outline:{ .lg .middle } __Extensions & Flavors__
+
+    ---
+
+    Install sandboxed extensions, bundle them into switchable flavors, or have the AI author one for you.
+
+    [:octicons-arrow-right-24: Extensions](guide/extensions.md) · [:octicons-arrow-right-24: Flavors](guide/flavors.md) · [:octicons-arrow-right-24: Privacy](guide/privacy.md)
 
 </div>
 
 ## What is IFClite?
 
-**IFClite** is an open-source toolkit for working with IFC (Industry Foundation Classes) files. It runs in the browser, on a server, or as a native desktop app.
+**IFClite** is an open-source toolkit for working with IFC (Industry Foundation Classes) files. It runs in the browser or on a server, and the packages let you build your own native desktop app.
 
 **What you can do with it:**
 
@@ -65,7 +73,7 @@ flowchart TD
     Q2 -->|Yes, Three.js or Babylon.js| Integration[Use @ifc-lite/geometry + your engine]
     Q2 -->|No, start fresh| Q3{Where will it run?}
     Q3 -->|Browser| WebGPU["Use the built-in WebGPU viewer"]
-    Q3 -->|Desktop| Tauri["Use the Tauri desktop app"]
+    Q3 -->|Desktop| Tauri["Build your own Tauri desktop app"]
     Q3 -->|Server for my team| Server["Set up the Rust server"]
 ```
 
@@ -75,7 +83,7 @@ flowchart TD
 | **Three.js** | Adding IFC to an existing Three.js app (WebGL) | [Three.js Tutorial](tutorials/threejs-integration.md) |
 | **Babylon.js** | Adding IFC to an existing Babylon.js app (WebGL) | [Babylon.js Tutorial](tutorials/babylonjs-integration.md) |
 | **Server** | Teams, large files (100 MB+), caching for repeat access | [Server Guide](guide/server.md) |
-| **Desktop (Tauri)** | Offline use, very large files (500 MB+), multi-threading | [Desktop Guide](guide/desktop.md) |
+| **Build for Desktop** | Your own offline native app, very large files (500 MB+), multi-threading | [Building for Desktop](guide/desktop.md) |
 
 ## Quick Examples
 
@@ -92,8 +100,8 @@ flowchart TD
     import { IfcParser } from '@ifc-lite/parser';
 
     const parser = new IfcParser();
-    const result = await parser.parse(buffer);
-    console.log(`Found ${result.entityCount} entities`);
+    const store = await parser.parseColumnar(buffer);
+    console.log(`Found ${store.entityCount} entities`);
     ```
 
 === "3D viewer (WebGPU)"
@@ -117,9 +125,12 @@ flowchart TD
 
     const parser = new IfcParser();
     const store = await parser.parseColumnar(buffer);
-    const geometryResult = await geometry.process(new Uint8Array(buffer));
+    const meshes = [];
+    for await (const event of geometry.processAdaptive(new Uint8Array(buffer))) {
+      if (event.type === 'batch') meshes.push(...event.meshes);
+    }
 
-    renderer.loadGeometry(geometryResult);
+    renderer.loadGeometry(meshes);
     renderer.fitToView();
     renderer.render();
     ```
@@ -202,9 +213,9 @@ Three.js and Babylon.js integrations work with WebGL and don't require WebGPU. S
 
     Set up server-based processing
 
--   [:material-monitor: __Desktop App__](guide/desktop.md)
+-   [:material-monitor: __Building for Desktop__](guide/desktop.md)
 
-    Native app for large files
+    Build your own native app for large files
 
 -   [:material-school: __Build a Viewer__](tutorials/building-viewer.md)
 

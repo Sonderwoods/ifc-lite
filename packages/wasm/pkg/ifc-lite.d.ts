@@ -1,444 +1,150 @@
 /* tslint:disable */
 /* eslint-disable */
 
-export class GeoReferenceJs {
+export class ClashRunResult {
+  private constructor();
+  free(): void;
+  [Symbol.dispose](): void;
+  readonly a: Uint32Array;
+  readonly b: Uint32Array;
+  readonly bounds: Float64Array;
+  readonly points: Float64Array;
+  readonly status: Uint8Array;
+  readonly distance: Float64Array;
+}
+
+export class ClashSession {
+  free(): void;
+  [Symbol.dispose](): void;
+  constructor();
+  /**
+   * Ingest N elements from flat arenas.
+   *
+   * - `positions`: concatenated per-element vertex coords (x,y,z,...)
+   * - `pos_ranges`: 2 per element = [float_offset, float_len]
+   * - `indices`: concatenated per-element LOCAL (0-based) triangle indices
+   * - `idx_ranges`: 2 per element = [idx_offset, idx_len]
+   * - `aabbs`: 6 per element = [minx,miny,minz,maxx,maxy,maxz]
+   */
+  ingest(positions: Float32Array, pos_ranges: Uint32Array, indices: Uint32Array, idx_ranges: Uint32Array, aabbs: Float32Array): void;
+  /**
+   * Run one rule. `group_a`/`group_b` are GLOBAL element indices; an empty
+   * `group_b` means a self-clash within `group_a`. `mode`: 0 = hard,
+   * 1 = clearance. Records carry GLOBAL element indices.
+   */
+  runRule(group_a: Uint32Array, group_b: Uint32Array, mode: number, tolerance: number, clearance: number, report_touch: boolean): ClashRunResult;
+}
+
+export class GridAxisCollection {
   private constructor();
   free(): void;
   [Symbol.dispose](): void;
   /**
-   * Transform local coordinates to map coordinates
+   * Get the axis at `index`. Returns `undefined` for out-of-bounds index.
    */
-  localToMap(x: number, y: number, z: number): Float64Array;
+  getAxis(index: number): GridAxisJs | undefined;
   /**
-   * Transform map coordinates to local coordinates
+   * Number of grid axes.
    */
-  mapToLocal(e: number, n: number, h: number): Float64Array;
+  readonly length: number;
   /**
-   * Get 4x4 transformation matrix (column-major for WebGL)
-   */
-  toMatrix(): Float64Array;
-  /**
-   * Get CRS name
-   */
-  readonly crsName: string | undefined;
-  /**
-   * Get rotation angle in radians
-   */
-  readonly rotation: number;
-  /**
-   * Eastings (X offset)
-   */
-  eastings: number;
-  /**
-   * Northings (Y offset)
-   */
-  northings: number;
-  /**
-   * Orthogonal height (Z offset)
-   */
-  orthogonal_height: number;
-  /**
-   * X-axis abscissa (cos of rotation)
-   */
-  x_axis_abscissa: number;
-  /**
-   * X-axis ordinate (sin of rotation)
-   */
-  x_axis_ordinate: number;
-  /**
-   * Scale factor
-   */
-  scale: number;
-}
-
-export class GpuGeometry {
-  free(): void;
-  [Symbol.dispose](): void;
-  /**
-   * Set the RTC (Relative To Center) offset applied to coordinates
-   */
-  set_rtc_offset(x: number, y: number, z: number): void;
-  /**
-   * Get IFC type name by index
-   */
-  getIfcTypeName(index: number): string | undefined;
-  /**
-   * Get metadata for a specific mesh
-   */
-  getMeshMetadata(index: number): GpuMeshMetadata | undefined;
-  /**
-   * Create a new empty GPU geometry container
-   */
-  constructor();
-  /**
-   * Get number of meshes in this geometry batch
-   */
-  readonly meshCount: number;
-  /**
-   * Get length of indices array (in u32 elements)
-   */
-  readonly indicesLen: number;
-  /**
-   * Get pointer to indices array for zero-copy view
-   */
-  readonly indicesPtr: number;
-  /**
-   * Get X component of RTC offset
-   */
-  readonly rtcOffsetX: number;
-  /**
-   * Get Y component of RTC offset
-   */
-  readonly rtcOffsetY: number;
-  /**
-   * Get Z component of RTC offset
-   */
-  readonly rtcOffsetZ: number;
-  /**
-   * Check if RTC offset is active (non-zero)
-   */
-  readonly hasRtcOffset: boolean;
-  /**
-   * Get length of vertex data array (in f32 elements, not bytes)
-   */
-  readonly vertexDataLen: number;
-  /**
-   * Get pointer to vertex data for zero-copy view
-   *
-   * SAFETY: View is only valid until next WASM allocation!
-   * Create view, upload to GPU, then discard view immediately.
-   */
-  readonly vertexDataPtr: number;
-  /**
-   * Get total vertex count
-   */
-  readonly totalVertexCount: number;
-  /**
-   * Get byte length of indices (for GPU buffer creation)
-   */
-  readonly indicesByteLength: number;
-  /**
-   * Get total triangle count
-   */
-  readonly totalTriangleCount: number;
-  /**
-   * Get byte length of vertex data (for GPU buffer creation)
-   */
-  readonly vertexDataByteLength: number;
-  /**
-   * Check if geometry is empty
+   * Whether the collection is empty.
    */
   readonly isEmpty: boolean;
 }
 
-export class GpuInstancedGeometry {
-  free(): void;
-  [Symbol.dispose](): void;
-  /**
-   * Create new instanced geometry
-   */
-  constructor(geometry_id: bigint);
-  readonly geometryId: bigint;
-  readonly indicesLen: number;
-  readonly indicesPtr: number;
-  readonly vertexCount: number;
-  readonly instanceCount: number;
-  readonly triangleCount: number;
-  readonly vertexDataLen: number;
-  readonly vertexDataPtr: number;
-  readonly instanceDataLen: number;
-  readonly instanceDataPtr: number;
-  readonly indicesByteLength: number;
-  readonly vertexDataByteLength: number;
-  readonly instanceExpressIdsPtr: number;
-  readonly instanceDataByteLength: number;
-}
-
-export class GpuInstancedGeometryCollection {
-  free(): void;
-  [Symbol.dispose](): void;
-  get(index: number): GpuInstancedGeometry | undefined;
-  constructor();
-  /**
-   * Get geometry by index with pointer access over owned buffers.
-   * This avoids exposing references tied to collection lifetime.
-   */
-  getRef(index: number): GpuInstancedGeometryRef | undefined;
-  readonly length: number;
-}
-
-export class GpuInstancedGeometryRef {
+export class GridAxisJs {
   private constructor();
   free(): void;
   [Symbol.dispose](): void;
-  readonly geometryId: bigint;
-  readonly indicesLen: number;
-  readonly indicesPtr: number;
-  readonly instanceCount: number;
-  readonly vertexDataLen: number;
-  readonly vertexDataPtr: number;
-  readonly instanceDataLen: number;
-  readonly instanceDataPtr: number;
-  readonly indicesByteLength: number;
-  readonly vertexDataByteLength: number;
-  readonly instanceExpressIdsPtr: number;
-  readonly instanceDataByteLength: number;
-}
-
-export class GpuMeshMetadata {
-  private constructor();
-  free(): void;
-  [Symbol.dispose](): void;
-  readonly expressId: number;
-  readonly indexCount: number;
-  readonly ifcTypeIdx: number;
-  readonly indexOffset: number;
-  readonly vertexCount: number;
-  readonly vertexOffset: number;
-  readonly color: Float32Array;
+  /**
+   * End endpoint `[x, y, z]` in renderer Y-up world space (metres).
+   */
+  readonly end: Float32Array;
+  /**
+   * Axis tag (e.g. `"A"`, `"1"`); empty string when unauthored.
+   */
+  readonly tag: string;
+  /**
+   * Start endpoint `[x, y, z]` in renderer Y-up world space (metres).
+   */
+  readonly start: Float32Array;
+  /**
+   * Express ID of the `IfcGridAxis`.
+   */
+  readonly axisId: number;
+  /**
+   * Express ID of the owning `IfcGrid`.
+   */
+  readonly gridId: number;
 }
 
 export class IfcAPI {
   free(): void;
   [Symbol.dispose](): void;
   /**
-   * Parse IFC file and return individual meshes with express IDs and colors
-   * This matches the MeshData[] format expected by the viewer
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const collection = api.parseMeshes(ifcData);
-   * for (let i = 0; i < collection.length; i++) {
-   *   const mesh = collection.get(i);
-   *   console.log('Express ID:', mesh.expressId);
-   *   console.log('Positions:', mesh.positions);
-   *   console.log('Color:', mesh.color);
-   * }
-   * ```
-   */
-  parseMeshes(content: string): MeshCollection;
-  /**
-   * Parse IFC file with streaming mesh batches for progressive rendering
-   * Calls the callback with batches of meshes, yielding to browser between batches
-   *
-   * Options:
-   * - `batchSize`: Number of meshes per batch (default: 25)
-   * - `onBatch(meshes, progress)`: Called for each batch of meshes
-   * - `onRtcOffset({x, y, z, hasRtc})`: Called early with RTC offset for camera/world setup
-   * - `onColorUpdate(Map<id, color>)`: Called with style updates after initial render
-   * - `onComplete(stats)`: Called when parsing completes with stats including rtcOffset
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * await api.parseMeshesAsync(ifcData, {
-   *   batchSize: 100,
-   *   onRtcOffset: (rtc) => {
-   *     if (rtc.hasRtc) {
-   *       // Model uses large coordinates - adjust camera/world origin
-   *       viewer.setWorldOffset(rtc.x, rtc.y, rtc.z);
-   *     }
-   *   },
-   *   onBatch: (meshes, progress) => {
-   *     for (const mesh of meshes) {
-   *       scene.add(createThreeMesh(mesh));
-   *     }
-   *     console.log(`Progress: ${progress.percent}%`);
-   *   },
-   *   onComplete: (stats) => {
-   *     console.log(`Done! ${stats.totalMeshes} meshes`);
-   *     // stats.rtcOffset also available here: {x, y, z, hasRtc}
-   *   }
-   * });
-   * ```
-   */
-  parseMeshesAsync(content: string, options: any): Promise<any>;
-  /**
-   * Fast pre-pass: scans for geometry entities ONLY (skips style/void/material resolution).
-   * Returns job list + unit scale + RTC offset in ~1-2s instead of ~6s.
-   * Geometry workers can start immediately with default colors + no void subtraction.
-   * A parallel style worker can run buildPrePassOnce for correct colors later.
-   */
-  buildPrePassFast(data: Uint8Array): any;
-  /**
    * Run the pre-pass ONCE and return serialized results for worker distribution.
    * Takes raw bytes (&[u8]) to avoid TextDecoder overhead.
    */
   buildPrePassOnce(data: Uint8Array): any;
   /**
-   * Parse a subset of IFC geometry entities by index range.
-   *
-   * Performs the full pre-pass (entity index, combined style/void/brep scan)
-   * but only processes geometry entities whose index (in the combined
-   * simple + complex job list) falls within `[start_idx, end_idx)`.
-   *
-   * This enables Web Worker parallelization: each worker processes a
-   * disjoint slice of the entity list while sharing the same pre-pass data.
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * // Worker 1: entities 0..500
-   * const batch1 = api.parseMeshesSubset(content, 0, 500);
-   * // Worker 2: entities 500..1000
-   * const batch2 = api.parseMeshesSubset(content, 500, 1000);
-   * ```
-   */
-  parseMeshesSubset(content: string, start_idx: number, end_idx: number, skip_expensive: boolean): MeshCollection;
-  /**
-   * Parse IFC file and return GPU-ready geometry for zero-copy upload
-   *
-   * This method generates geometry that is:
-   * - Pre-interleaved (position + normal per vertex)
-   * - Coordinate-converted (Z-up to Y-up)
-   * - Ready for direct GPU upload via pointer access
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const gpuGeom = api.parseToGpuGeometry(ifcData);
-   *
-   * // Get WASM memory for zero-copy views
-   * const memory = api.getMemory();
-   *
-   * // Create views directly into WASM memory (NO COPY!)
-   * const vertexView = new Float32Array(
-   *   memory.buffer,
-   *   gpuGeom.vertexDataPtr,
-   *   gpuGeom.vertexDataLen
-   * );
-   * const indexView = new Uint32Array(
-   *   memory.buffer,
-   *   gpuGeom.indicesPtr,
-   *   gpuGeom.indicesLen
-   * );
-   *
-   * // Upload directly to GPU (single copy: WASM → GPU)
-   * device.queue.writeBuffer(vertexBuffer, 0, vertexView);
-   * device.queue.writeBuffer(indexBuffer, 0, indexView);
-   *
-   * // Free when done
-   * gpuGeom.free();
-   * ```
-   */
-  parseToGpuGeometry(content: string): GpuGeometry;
-  /**
-   * Parse IFC file and return instanced geometry grouped by geometry hash
-   * This reduces draw calls by grouping identical geometries with different transforms
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const collection = api.parseMeshesInstanced(ifcData);
-   * for (let i = 0; i < collection.length; i++) {
-   *   const geometry = collection.get(i);
-   *   console.log('Geometry ID:', geometry.geometryId);
-   *   console.log('Instances:', geometry.instanceCount);
-   *   for (let j = 0; j < geometry.instanceCount; j++) {
-   *     const inst = geometry.getInstance(j);
-   *     console.log('  Express ID:', inst.expressId);
-   *     console.log('  Transform:', inst.transform);
-   *   }
-   * }
-   * ```
-   */
-  parseMeshesInstanced(content: string): InstancedMeshCollection;
-  /**
    * Process geometry for a subset of pre-scanned entities.
    * Takes raw bytes and pre-pass data from buildPrePassOnce.
    */
-  processGeometryBatch(data: Uint8Array, jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array): MeshCollection;
+  processGeometryBatch(data: Uint8Array, jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, void_keys: Uint32Array, void_counts: Uint32Array, void_values: Uint32Array, style_ids: Uint32Array, style_colors: Uint8Array, plane_angle_to_radians?: number | null, material_element_ids?: Uint32Array | null, material_color_counts?: Uint32Array | null, material_colors_rgba?: Uint8Array | null): MeshCollection;
   /**
-   * Parse IFC file with streaming GPU-ready geometry batches
+   * Streaming pre-pass: emits geometry jobs in chunks via a JS callback
+   * instead of waiting for the full file scan to complete.
    *
-   * Yields batches of GPU-ready geometry for progressive rendering with zero-copy upload.
-   * Uses fast-first-frame streaming: simple geometry (walls, slabs) first.
+   * Single linear walk over the file:
+   *   1. Builds the entity index incrementally from the same scan that
+   *      collects geometry jobs (a separate index scan would double
+   *      wall-clock).
+   *   2. As soon as `IFCPROJECT` has been seen, the unit scale and the
+   *      first ~50 geometry jobs have been collected, resolves
+   *      `unitScale` + `rtcOffset` and emits a `meta` callback so the
+   *      JS host can spin up geometry process workers.
+   *   3. Emits `jobs` callbacks every `chunk_size` jobs (or fewer if
+   *      the meta phase already buffered some).
+   *   4. Emits `complete` with the total job count at end of scan.
    *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const memory = api.getMemory();
+   * On a 986 MB / 14 M-entity file this drops time-to-first-geometry
+   * from ~17 s (full pre-pass + worker spawn + first batch) to ~3 s
+   * (first 100 K bytes scanned + meta + first chunk).
    *
-   * await api.parseToGpuGeometryAsync(ifcData, {
-   *   batchSize: 25,
-   *   onBatch: (gpuGeom, progress) => {
-   *     // Create zero-copy views
-   *     const vertexView = new Float32Array(
-   *       memory.buffer,
-   *       gpuGeom.vertexDataPtr,
-   *       gpuGeom.vertexDataLen
-   *     );
-   *
-   *     // Upload to GPU
-   *     device.queue.writeBuffer(vertexBuffer, 0, vertexView);
-   *
-   *     // IMPORTANT: Free immediately after upload!
-   *     gpuGeom.free();
-   *   },
-   *   onComplete: (stats) => {
-   *     console.log(`Done! ${stats.totalMeshes} meshes`);
-   *   }
-   * });
-   * ```
+   * The callback receives a single `JsValue` argument shaped as one of:
+   *   `{ type: "meta", unitScale, rtcOffset: [x,y,z], needsShift, buildingRotation? }`
+   *   `{ type: "jobs", jobs: Uint32Array }`     // [id, start, end] triples
+   *   `{ type: "complete", totalJobs }`
    */
-  parseToGpuGeometryAsync(content: string, options: any): Promise<any>;
+  buildPrePassStreaming(data: Uint8Array, on_event: Function, chunk_size: number, disabled_type_names: string[] | null | undefined, skip_type_geometry: boolean): any;
   /**
-   * Parse IFC file with streaming instanced geometry batches for progressive rendering
-   * Groups identical geometries and yields batches of InstancedGeometry
-   * Uses fast-first-frame streaming: simple geometry (walls, slabs) first
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * await api.parseMeshesInstancedAsync(ifcData, {
-   *   batchSize: 25,  // Number of unique geometries per batch
-   *   onBatch: (geometries, progress) => {
-   *     for (const geom of geometries) {
-   *       renderer.addInstancedGeometry(geom);
-   *     }
-   *   },
-   *   onComplete: (stats) => {
-   *     console.log(`Done! ${stats.totalGeometries} unique geometries, ${stats.totalInstances} instances`);
-   *   }
-   * });
-   * ```
+   * Parse the file and return structured per-axis data (tag + endpoints) in
+   * the renderer's Y-up world space (RTC-subtracted, metres). Use this when
+   * you also need the axis tags (to render grid bubbles / labels).
    */
-  parseMeshesInstancedAsync(content: string, options: any): Promise<any>;
+  parseGridAxes(content: string): GridAxisCollection;
   /**
-   * Parse IFC file to GPU-ready instanced geometry for zero-copy upload
+   * Parse the file and return every `IfcGridAxis` as a flat `Float32Array`
+   * of 3D line-list vertices `[x0,y0,z0, x1,y1,z1, …]` (one segment per
+   * axis) in the renderer's Y-up world space (RTC-subtracted, metres). Feed
+   * straight to a line pipeline (e.g. `uploadAnnotationLines3D`).
    *
-   * Groups identical geometries by hash for efficient GPU instancing.
-   * Returns a collection of instanced geometries with pointer access.
+   * Returns an empty array when the file has no grids, so the caller can
+   * clear the overlay cheaply.
    */
-  parseToGpuInstancedGeometry(content: string): GpuInstancedGeometryCollection;
+  parseGridLines(content: string): Float32Array;
   /**
-   * Process instanced geometry for a subset of pre-scanned entities.
-   * Takes raw bytes and pre-pass data from buildPrePassOnce.
+   * Parse the file and return every `IfcAlignment` directrix as a flat
+   * `Float32Array` of 3D line-list vertices `[x0,y0,z0, x1,y1,z1, …]` in
+   * the renderer's Y-up world space (RTC-subtracted, metres). Consecutive
+   * samples form line segments. Feed straight to
+   * `renderer.uploadAnnotationLines3D(...)`.
+   *
+   * Returns an empty array when the file has no alignments (or none with a
+   * resolvable Axis curve), so the caller can clear the overlay cheaply.
    */
-  processInstancedGeometryBatch(data: Uint8Array, jobs_flat: Uint32Array, unit_scale: number, rtc_x: number, rtc_y: number, rtc_z: number, needs_shift: boolean, style_ids: Uint32Array, style_colors: Uint8Array): InstancedMeshCollection;
-  /**
-   * Parse IFC file with zero-copy mesh data
-   * Maximum performance - returns mesh with direct memory access
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const mesh = await api.parseZeroCopy(ifcData);
-   *
-   * // Create TypedArray views (NO COPYING!)
-   * const memory = await api.getMemory();
-   * const positions = new Float32Array(
-   *   memory.buffer,
-   *   mesh.positions_ptr,
-   *   mesh.positions_len
-   * );
-   *
-   * // Upload directly to GPU
-   * gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
-   * ```
-   */
-  parseZeroCopy(content: string): ZeroCopyMesh;
+  parseAlignmentLines(content: string): Float32Array;
   /**
    * Extract raw profile polygons from all building elements with `IfcExtrudedAreaSolid`
    * representations.
@@ -463,71 +169,88 @@ export class IfcAPI {
    */
   extractProfiles(content: string, model_index: number): ProfileCollection;
   /**
-   * Debug: Test processing entity #953 (FacetedBrep wall)
-   */
-  debugProcessEntity953(content: string): string;
-  /**
-   * Debug: Test processing a single wall
-   */
-  debugProcessFirstWall(content: string): string;
-  /**
    * Get WASM memory for zero-copy access
    */
   getMemory(): any;
   /**
-   * Clear the cached entity index (call after streaming is complete)
+   * Populate `cached_entity_index` from pre-extracted column arrays.
+   *
+   * Used by the streaming pre-pass to share its already-built entity
+   * index across worker realms via SAB-backed Uint32Arrays — every
+   * process worker would otherwise re-scan the entire file in
+   * `processGeometryBatch`'s lazy build path (~5 s on a 1 GB IFC),
+   * even though the pre-pass worker built the same index minutes
+   * earlier.
+   *
+   * Building an `FxHashMap` from the three input slices costs ~1 s on
+   * 14 M entries — about 4–5× faster than re-scanning the file. After
+   * this call, the next `processGeometryBatch` skips the lazy build
+   * branch and reuses the populated cache by `Arc::clone()`.
+   *
+   * `lengths[i]` is the byte length of entity `ids[i]`, so the cache
+   * stores `(start, start + length)` to match the existing tuple layout.
+   *
+   * Idempotent in the sense that repeated calls REPLACE the cache —
+   * supports the parser-worker pattern of reusing one IfcAPI across
+   * multiple loads with different files.
+   */
+  setEntityIndex(ids: Uint32Array, starts: Uint32Array, lengths: Uint32Array): void;
+  /**
+   * Toggle the "render multilayer walls as a single solid" mode (issue #540).
+   *
+   * When `enabled` is `true`, every subsequent `processGeometryBatch` call
+   * will suppress geometry emission for `IfcBuildingElementPart` entities
+   * whose `IfcRelAggregates` parent wall is sliceable (has an
+   * `IfcMaterialLayerSetUsage`) AND has its own `Representation`. The
+   * parent wall keeps its per-layer sub-mesh colouring, so the visual
+   * result is the same as the layered render but with one mesh per wall
+   * instead of one per layer part — much cheaper for both CPU and GPU.
+   *
+   * Default is `false`. Pass `true` before calling `processGeometryBatch`.
+   */
+  setMergeLayers(enabled: boolean): void;
+  /**
+   * Clear the cached entity index (call between loads when reusing
+   * the same `IfcAPI` instance — e.g. the parser worker keeps one
+   * `IfcAPI` alive across multiple `parse` requests).
+   *
+   * Panics if the cache Mutex is poisoned. Poisoning means an
+   * earlier panic occurred while the lock was held — silently
+   * continuing would mean operating on an inconsistent cache, so
+   * fail fast.
    */
   clearPrePassCache(): void;
+  /**
+   * Select the tessellation detail level applied by every subsequent
+   * `processGeometryBatch` call (issue #976, step 4).
+   *
+   * `level` is one of `"lowest" | "low" | "medium" | "high" | "highest"`
+   * (case-insensitive). `"medium"` is the default and reproduces the
+   * engine's historical hardcoded densities byte-for-byte; lower levels
+   * trade curved-surface smoothness for throughput, higher levels reduce
+   * faceting on pipes / cylinders / NURBS at a triangle-count cost.
+   * Pass `null`/`undefined` to reset to the default.
+   *
+   * Set BEFORE processing — meshes already emitted are not regenerated.
+   * Throws on an unrecognized level so typos fail loudly instead of
+   * silently rendering at the wrong density.
+   */
+  setTessellationQuality(level?: string | null): void;
+  /**
+   * Enable or disable per-entity geometry fingerprinting in
+   * `processGeometryBatch`, used by the viewer's revision-diff feature.
+   *
+   * Pass a positive `tolerance` (metres) to enable — it is the quantization
+   * grid the hash snaps positions to (larger = more tolerant of float noise,
+   * smaller = catches finer edits; the `f32` precision floor of model-local
+   * coordinates means values below ~1 mm mostly hash noise). Pass `null`/
+   * `undefined` (or a non-positive value) to disable. Default: disabled.
+   */
+  setComputeGeometryHashes(tolerance?: number | null): void;
   /**
    * Create and initialize the IFC API
    */
   constructor();
-  /**
-   * Extract georeferencing information from IFC content
-   * Returns null if no georeferencing is present
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const georef = api.getGeoReference(ifcData);
-   * if (georef) {
-   *   console.log('CRS:', georef.crsName);
-   *   const [e, n, h] = georef.localToMap(10, 20, 5);
-   * }
-   * ```
-   */
-  getGeoReference(content: string): GeoReferenceJs | undefined;
-  /**
-   * Parse IFC file and return mesh with RTC offset for large coordinates
-   * This handles georeferenced models by shifting to centroid
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const result = api.parseMeshesWithRtc(ifcData);
-   * const rtcOffset = result.rtcOffset;
-   * const meshes = result.meshes;
-   *
-   * // Convert local coords back to world:
-   * if (rtcOffset.isSignificant()) {
-   *   const [wx, wy, wz] = rtcOffset.toWorld(localX, localY, localZ);
-   * }
-   * ```
-   */
-  parseMeshesWithRtc(content: string): MeshCollectionWithRtc;
-  /**
-   * Parse IFC file with streaming events
-   * Calls the callback function for each parse event
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * await api.parseStreaming(ifcData, (event) => {
-   *   console.log('Event:', event);
-   * });
-   * ```
-   */
-  parseStreaming(content: string, callback: Function): Promise<any>;
   /**
    * Fast entity scanning using SIMD-accelerated Rust scanner
    * Returns array of entity references for data model parsing
@@ -548,24 +271,9 @@ export class IfcAPI {
    */
   scanGeometryEntitiesFast(content: string): any;
   /**
-   * Fast scan that only returns metadata-relevant entity refs.
-   * This drastically reduces transfer size for huge-file metadata hydration.
-   */
-  scanRelevantEntitiesFastBytes(data: Uint8Array): any;
-  /**
-   * Parse IFC file (traditional - waits for completion)
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const result = await api.parse(ifcData);
-   * console.log('Entities:', result.entityCount);
-   * ```
-   */
-  parse(content: string): Promise<any>;
-  /**
-   * Parse IFC file and extract symbolic representations (Plan, Annotation, FootPrint)
-   * These are 2D curves used for architectural drawings instead of sectioning 3D geometry
+   * Parse IFC file and extract symbolic representations (Plan,
+   * Annotation, FootPrint, Axis). These are 2D curves used for
+   * architectural drawings instead of sectioning 3D geometry.
    *
    * Example:
    * ```javascript
@@ -589,37 +297,6 @@ export class IfcAPI {
   readonly is_ready: boolean;
 }
 
-export class InstanceData {
-  private constructor();
-  free(): void;
-  [Symbol.dispose](): void;
-  readonly expressId: number;
-  readonly color: Float32Array;
-  readonly transform: Float32Array;
-}
-
-export class InstancedGeometry {
-  private constructor();
-  free(): void;
-  [Symbol.dispose](): void;
-  get_instance(index: number): InstanceData | undefined;
-  readonly geometryId: bigint;
-  readonly instance_count: number;
-  readonly indices: Uint32Array;
-  readonly normals: Float32Array;
-  readonly positions: Float32Array;
-}
-
-export class InstancedMeshCollection {
-  private constructor();
-  free(): void;
-  [Symbol.dispose](): void;
-  get(index: number): InstancedGeometry | undefined;
-  readonly totalInstances: number;
-  readonly totalGeometries: number;
-  readonly length: number;
-}
-
 export class MeshCollection {
   private constructor();
   free(): void;
@@ -629,14 +306,19 @@ export class MeshCollection {
    */
   hasRtcOffset(): boolean;
   /**
-   * Convert local coordinates to world coordinates
-   * Use this to convert mesh positions back to original IFC coordinates
-   */
-  localToWorld(x: number, y: number, z: number): Float64Array;
-  /**
-   * Get mesh at index
+   * Get mesh at index (clones — non-destructive). Prefer `takeMesh` on the
+   * hot streaming path; this stays for callers that read meshes more than once.
    */
   get(index: number): MeshDataJs | undefined;
+  /**
+   * #1097 perf: MOVE the mesh at `index` out of the collection (the Vec
+   * buffers are `std::mem::take`-n, leaving an empty stub). The streaming
+   * worker reads each mesh exactly once, so moving avoids the full vertex-
+   * data clone `get` pays — one fewer copy of positions/normals/indices/uvs/
+   * texture per mesh (the JS getters still do the single Rust→JS copy). Calling
+   * it twice for the same index yields the second call an empty mesh.
+   */
+  takeMesh(index: number): MeshDataJs | undefined;
   /**
    * Get RTC offset X (for converting local coords back to world coords)
    * Add this to local X coordinates to get world X coordinates
@@ -664,31 +346,26 @@ export class MeshCollection {
    */
   readonly buildingRotation: number | undefined;
   /**
+   * Express ids for the per-entity geometry fingerprints, parallel to
+   * [`Self::geometry_hash_values`]. Empty unless geometry hashing was
+   * enabled via `IfcAPI.setComputeGeometryHashes`.
+   */
+  readonly geometryHashIds: Uint32Array;
+  /**
+   * Number of per-entity geometry fingerprints recorded.
+   */
+  readonly geometryHashCount: number;
+  /**
+   * Per-entity geometry fingerprints as a `BigUint64Array`, parallel to
+   * [`Self::geometry_hash_ids`]. `u64` is exposed (not hex strings) so JS
+   * can compare with `===` and key maps without allocation. Empty unless
+   * geometry hashing was enabled.
+   */
+  readonly geometryHashValues: BigUint64Array;
+  /**
    * Get number of meshes
    */
   readonly length: number;
-}
-
-export class MeshCollectionWithRtc {
-  private constructor();
-  free(): void;
-  [Symbol.dispose](): void;
-  /**
-   * Get mesh at index
-   */
-  get(index: number): MeshDataJs | undefined;
-  /**
-   * Get the RTC offset
-   */
-  readonly rtcOffset: RtcOffsetJs;
-  /**
-   * Get number of meshes
-   */
-  readonly length: number;
-  /**
-   * Get the mesh collection
-   */
-  readonly meshes: MeshCollection;
 }
 
 export class MeshDataJs {
@@ -700,17 +377,58 @@ export class MeshDataJs {
    */
   readonly expressId: number;
   /**
+   * True when this mesh carries a surface texture (#961).
+   */
+  readonly hasTexture: boolean;
+  /**
+   * Decoded RGBA8 texture bytes (`width*height*4`). Empty when untextured.
+   */
+  readonly textureRgba: Uint8Array;
+  /**
    * Get vertex count
    */
   readonly vertexCount: number;
+  /**
+   * Optional SurfaceColour for the "Shading" GLB-export choice — only
+   * present when the file authored a distinct DiffuseColour. JS sees
+   * `undefined` when absent (most files).
+   */
+  readonly shadingColor: Float32Array | undefined;
+  readonly textureWidth: number;
+  /**
+   * Geometry provenance for the viewer's Model/Types switch (#957 follow-up):
+   * 0 = occurrence, 1 = orphan type geometry (no occurrence), 2 = instanced
+   * type geometry (hidden in Model mode, shown in Types mode).
+   */
+  readonly geometryClass: number;
+  readonly textureHeight: number;
   /**
    * Get triangle count
    */
   readonly triangleCount: number;
   /**
+   * Sampler wrap for the S axis (`IfcSurfaceTexture.RepeatS`): true = repeat.
+   */
+  readonly textureRepeatS: boolean;
+  /**
+   * Sampler wrap for the T axis (`IfcSurfaceTexture.RepeatT`): true = repeat.
+   */
+  readonly textureRepeatT: boolean;
+  /**
+   * Per-vertex texture coordinates as Float32Array (u, v pairs). Empty when
+   * the mesh is untextured.
+   */
+  readonly uvs: Float32Array;
+  /**
    * Get color as [r, g, b, a] array
    */
   readonly color: Float32Array;
+  /**
+   * Per-element local-frame origin (Float64Array[3], WebGL Y-up, metres):
+   * world position of vertex i = `origin + positions[3i..3i+3]`. Returns
+   * [0,0,0] when positions are absolute (legacy / local frame off).
+   */
+  readonly origin: Float64Array;
   /**
    * Get indices as Uint32Array (copy to JS)
    */
@@ -727,6 +445,30 @@ export class MeshDataJs {
    * Get positions as Float32Array (copy to JS)
    */
   readonly positions: Float32Array;
+}
+
+export class MeshOutlineJs {
+  private constructor();
+  free(): void;
+  [Symbol.dispose](): void;
+  /**
+   * Ring `i` as a flat `[u0, v0, u1, v1, …]` array, or `undefined` if out of
+   * range. The ring is closed implicitly (connect the last point to the
+   * first).
+   */
+  contour(index: number): Float32Array | undefined;
+  /**
+   * Number of boundary rings (outer + holes).
+   */
+  readonly contourCount: number;
+  /**
+   * Element extent (max) along the cut axis, world units.
+   */
+  readonly axisMax: number;
+  /**
+   * Element extent (min) along the cut axis, world units.
+   */
+  readonly axisMin: number;
 }
 
 export class ProfileCollection {
@@ -786,30 +528,145 @@ export class ProfileEntryJs {
   readonly transform: Float32Array;
 }
 
-export class RtcOffsetJs {
-  private constructor();
+export class SpacePlateHandle {
   free(): void;
   [Symbol.dispose](): void;
   /**
-   * Check if offset is significant (>10km)
+   * Insert a new vertex at `(x, y)` on edge `edge`, subdividing it (no new
+   * face). Returns the new vertex id — use it as a `splitFace` endpoint to
+   * cut between points that weren't existing corners. Project `(x, y)` onto
+   * the edge to keep areas unchanged.
    */
-  isSignificant(): boolean;
+  splitEdge(edge: number, x: number, y: number): number;
   /**
-   * Convert local coordinates to world coordinates
+   * Subdivide a face with a partition between two of its vertices. `source`
+   * `-1` marks a brand-new partition (materialised as a fresh wall at bake).
+   * Returns the kept face and the new face.
    */
-  toWorld(x: number, y: number, z: number): Float64Array;
+  splitFace(face: number, va: number, vb: number, source: number): any;
   /**
-   * X offset (subtracted from positions)
+   * Move a vertex; returns the rooms it changed. A shared wall is one edge
+   * whose endpoints are shared vertices, so one drag updates both rooms.
    */
-  x: number;
+  dragVertex(v: number, x: number, y: number): any;
   /**
-   * Y offset
+   * Remove a shared wall, unioning the two rooms it separated. Returns the
+   * surviving room.
    */
-  y: number;
+  mergeFaces(edge: number): any;
   /**
-   * Z offset
+   * The face outline offset to a wall boundary, as flat `[x0, y0, …]`: each
+   * edge is moved by its own wall's half-thickness — inward when `inset`
+   * (the net / inner face), outward otherwise (the gross / outer face).
+   * Shared room↔room edges are pinned when pushing outward. Falls back to the
+   * centreline outline when no offset applies — so it's always a sane ring.
+   * (For a `center` boundary just use `faceOutline`.)
    */
-  z: number;
+  netOutline(face: number, inset: boolean): Float64Array;
+  /**
+   * Remove a wall edge, choosing the right semantics from its two faces:
+   * two real rooms → union them; a bridge / spur / outer-only wall → delete
+   * it and auto-clean the orphaned inner lines and nodes it leaves; a real
+   * enclosing wall (room ↔ exterior) → rejected (`BordersExterior`). This is
+   * the "remove this wall and tidy up" affordance for the orphan cruft the
+   * non-destructive wall arrangement leaves behind. Returns the rooms it
+   * changed (empty if the edge bounded no room).
+   */
+  removeEdge(edge: number): any;
+  /**
+   * Flat outline `[x0, y0, x1, y1, …]` of a face (no repeated closing vertex).
+   */
+  faceOutline(face: number): Float64Array;
+  /**
+   * Face-based gap-room boundary as flat `[x0, y0, …]`: each edge pushed
+   * OUTWARD (into the wall) by `factor × the source wall's half-thickness`.
+   * `0` → net (the gap / inner faces); `1` → centre axis (½ thickness, the
+   * editable node line on the wall mid); `2` → gross outer face.
+   */
+  gapBoundary(face: number, factor: number): Float64Array;
+  /**
+   * Dissolve a degree-2 vertex, welding its two edges into one straight
+   * edge between the neighbours — the inverse of `splitEdge`, and the
+   * "delete this corner / node" affordance. Returns the rooms it changed.
+   * Rejects a wall junction (degree ≥ 3) or a weld that would duplicate an
+   * edge.
+   */
+  dissolveVertex(v: number): any;
+  /**
+   * FACE-BASED build: rooms are the gaps between wall footprint rectangles.
+   * `rectCoords` is flat `[x0, y0, x1, y1, x2, y2, x3, y3, …]` — 8 f64 per wall
+   * (its 4 plan-rectangle corners, CCW). A bounded arrangement face is a room
+   * only if its centroid is outside every rectangle (a gap, not a wall
+   * interior). The room outline IS the net (inner-face) area; `gapBoundary`
+   * gives the centre axis (½ thickness) and the gross outer face.
+   */
+  static fromWallRects(rect_coords: Float64Array, snap_tolerance: number, min_area: number): SpacePlateHandle;
+  /**
+   * The room on the far side of a half-edge (its twin's face), or
+   * `undefined`. O(1) — the "who's across this wall" query.
+   */
+  neighborAcross(edge: number): number | undefined;
+  /**
+   * Set a face's floor / ceiling planes (the vertical dimension that turns a
+   * 2D face into a prismatic space at bake).
+   */
+  setFaceHeight(face: number, floor_z: number, ceiling_z: number, non_planar: boolean): void;
+  /**
+   * Nearest live vertex id to `(x, y)` within `tol`, or `undefined`.
+   */
+  findVertexNear(x: number, y: number, tol: number): number | undefined;
+  /**
+   * Bounding half-edges of a face paired with their source element —
+   * `[{ edge, source }, …]` — for `IfcRelSpaceBoundary` at bake.
+   */
+  boundingElements(face: number): any;
+  /**
+   * Build a plate from flat wall-axis segments.
+   *
+   * `segCoords`: `[ax, ay, bx, by, …]` (length a multiple of 4).
+   * `segSources`: one `i32` per segment, `-1` for none.
+   * `segHalfThickness`: one `f64` per segment — half the wall's thickness in
+   * metres, carried onto the derived edges for `netOutline`. Pass an empty
+   * array (or all zeros) when thickness is unknown (centreline only).
+   * `snapTolerance` / `minArea`: pass `<= 0` to take the defaults.
+   */
+  constructor(seg_coords: Float64Array, seg_sources: Int32Array, seg_half_thickness: Float64Array, snap_tolerance: number, min_area: number);
+  /**
+   * Sweep the whole plate clean: remove dangling spur walls, isolated nodes,
+   * and redundant collinear nodes — the "clean up orphans" / eraser action.
+   * Area-neutral and idempotent. Returns how many topology elements were
+   * pruned (0 = the plate was already clean); the caller re-renders via
+   * `snapshot` like any other edit.
+   */
+  prune(): number;
+  /**
+   * Author a new room from a flat ring `[x0, y0, x1, y1, …]` (no repeated
+   * closing vertex). `source` `-1` marks a user-drawn room. Winding is
+   * normalised to CCW; returns the new room patch. The room is its own
+   * connected component — it does not merge into existing topology.
+   */
+  addFace(coords: Float64Array, source: number): any;
+  /**
+   * Face ids of every live room.
+   */
+  roomIds(): Uint32Array;
+  /**
+   * All live rooms as `{ face, area, simple, outline }` patches.
+   */
+  snapshot(): any;
+  /**
+   * Deep-copy the plate for an undo/redo snapshot. The clone owns its own
+   * heap; the caller must `.free()` it like any handle.
+   */
+  duplicate(): SpacePlateHandle;
+  /**
+   * Absolute area (m²) of a face.
+   */
+  faceArea(face: number): number;
+  /**
+   * Number of live rooms.
+   */
+  readonly roomCount: number;
 }
 
 export class SymbolicCircle {
@@ -824,10 +681,43 @@ export class SymbolicCircle {
   readonly isFullCircle: boolean;
   readonly repIdentifier: string;
   readonly radius: number;
+  /**
+   * World-Y elevation captured from the placement chain.
+   */
+  readonly worldY: number;
   readonly centerX: number;
   readonly centerY: number;
   readonly ifcType: string;
   readonly endAngle: number;
+}
+
+export class SymbolicFillArea {
+  private constructor();
+  free(): void;
+  [Symbol.dispose](): void;
+  readonly expressId: number;
+  readonly holeCount: number;
+  readonly hatchAngle: number;
+  readonly pointCount: number;
+  readonly hasHatching: boolean;
+  readonly hatchSpacing: number;
+  /**
+   * Vertex indices marking the start of each hole. Empty = no holes.
+   */
+  readonly holesOffsets: Uint32Array;
+  readonly repIdentifier: string;
+  readonly hatchLineWidth: number;
+  readonly hatchAngleSecondary: number;
+  readonly fillA: number;
+  readonly fillB: number;
+  readonly fillG: number;
+  readonly fillR: number;
+  /**
+   * Flattened ring vertices.
+   */
+  readonly points: Float32Array;
+  readonly worldY: number;
+  readonly ifcType: string;
 }
 
 export class SymbolicPolyline {
@@ -850,6 +740,11 @@ export class SymbolicPolyline {
    * Get 2D points as Float32Array [x1, y1, x2, y2, ...]
    */
   readonly points: Float32Array;
+  /**
+   * World-Y elevation captured from the placement chain (or first 3D
+   * point's Z component). JS uses this as the canonical bucket key.
+   */
+  readonly worldY: number;
   /**
    * Get IFC type name (e.g., "IfcDoor", "IfcWindow")
    */
@@ -877,6 +772,22 @@ export class SymbolicRepresentationCollection {
    */
   getExpressIds(): Uint32Array;
   /**
+   * Get fill area at index.
+   */
+  getFill(index: number): SymbolicFillArea | undefined;
+  /**
+   * Get text annotation at index.
+   */
+  getText(index: number): SymbolicText | undefined;
+  /**
+   * Get number of fill areas
+   */
+  readonly fillCount: number;
+  /**
+   * Get number of text annotations
+   */
+  readonly textCount: number;
+  /**
    * Get total count of all symbolic items
    */
   readonly totalCount: number;
@@ -894,58 +805,26 @@ export class SymbolicRepresentationCollection {
   readonly isEmpty: boolean;
 }
 
-export class ZeroCopyMesh {
+export class SymbolicText {
+  private constructor();
   free(): void;
   [Symbol.dispose](): void;
-  /**
-   * Get bounding box maximum point
-   */
-  bounds_max(): Float32Array;
-  /**
-   * Get bounding box minimum point
-   */
-  bounds_min(): Float32Array;
-  /**
-   * Create a new zero-copy mesh from a Mesh
-   */
-  constructor();
-  /**
-   * Get length of indices array
-   */
-  readonly indices_len: number;
-  /**
-   * Get pointer to indices array
-   */
-  readonly indices_ptr: number;
-  /**
-   * Get length of normals array
-   */
-  readonly normals_len: number;
-  /**
-   * Get pointer to normals array
-   */
-  readonly normals_ptr: number;
-  /**
-   * Get vertex count
-   */
-  readonly vertex_count: number;
-  /**
-   * Get length of positions array (in f32 elements, not bytes)
-   */
-  readonly positions_len: number;
-  /**
-   * Get pointer to positions array
-   * JavaScript can create Float32Array view: new Float32Array(memory.buffer, ptr, length)
-   */
-  readonly positions_ptr: number;
-  /**
-   * Get triangle count
-   */
-  readonly triangle_count: number;
-  /**
-   * Check if mesh is empty
-   */
-  readonly is_empty: boolean;
+  readonly expressId: number;
+  readonly repIdentifier: string;
+  readonly x: number;
+  readonly y: number;
+  readonly dirX: number;
+  readonly dirY: number;
+  readonly height: number;
+  readonly colorA: number;
+  readonly colorB: number;
+  readonly colorG: number;
+  readonly colorR: number;
+  readonly content: string;
+  readonly worldY: number;
+  readonly ifcType: string;
+  readonly alignment: string;
+  readonly targetPx: number;
 }
 
 /**
@@ -960,6 +839,25 @@ export function get_memory(): any;
  * It sets up panic hooks for better error messages in the browser console.
  */
 export function init(): void;
+
+/**
+ * Compute the winding-robust 2D footprint outline of a triangle mesh.
+ *
+ * `positions` is flat XYZ; `indices` is flat triangle indices. `axis` is
+ * 0/1/2 = x/y/z (the cut axis, WebGL Y-up). Returns `undefined` when the mesh
+ * has no triangles or projects to nothing.
+ *
+ * ```javascript
+ * const outline = meshOutline2d(positions, indices, 1, false); // axis 1 = y
+ * if (outline) {
+ *   for (let i = 0; i < outline.contourCount; i++) {
+ *     const ring = outline.contour(i); // Float32Array of [u0, v0, u1, v1, ...]
+ *   }
+ *   outline.free();
+ * }
+ * ```
+ */
+export function meshOutline2d(positions: Float32Array, indices: Uint32Array, axis: number, flipped: boolean): MeshOutlineJs | undefined;
 
 /**
  * Get the version of IFC-Lite.
@@ -980,145 +878,95 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
   readonly memory: WebAssembly.Memory;
-  readonly __wbg_georeferencejs_free: (a: number, b: number) => void;
-  readonly __wbg_get_georeferencejs_eastings: (a: number) => number;
-  readonly __wbg_get_georeferencejs_northings: (a: number) => number;
-  readonly __wbg_get_georeferencejs_orthogonal_height: (a: number) => number;
-  readonly __wbg_get_georeferencejs_scale: (a: number) => number;
-  readonly __wbg_get_georeferencejs_x_axis_abscissa: (a: number) => number;
-  readonly __wbg_get_georeferencejs_x_axis_ordinate: (a: number) => number;
-  readonly __wbg_gpugeometry_free: (a: number, b: number) => void;
-  readonly __wbg_gpuinstancedgeometry_free: (a: number, b: number) => void;
-  readonly __wbg_gpuinstancedgeometrycollection_free: (a: number, b: number) => void;
-  readonly __wbg_gpumeshmetadata_free: (a: number, b: number) => void;
+  readonly __wbg_clashrunresult_free: (a: number, b: number) => void;
+  readonly __wbg_clashsession_free: (a: number, b: number) => void;
+  readonly __wbg_gridaxiscollection_free: (a: number, b: number) => void;
+  readonly __wbg_gridaxisjs_free: (a: number, b: number) => void;
   readonly __wbg_ifcapi_free: (a: number, b: number) => void;
-  readonly __wbg_instancedata_free: (a: number, b: number) => void;
-  readonly __wbg_instancedgeometry_free: (a: number, b: number) => void;
-  readonly __wbg_instancedmeshcollection_free: (a: number, b: number) => void;
   readonly __wbg_meshcollection_free: (a: number, b: number) => void;
-  readonly __wbg_meshcollectionwithrtc_free: (a: number, b: number) => void;
   readonly __wbg_meshdatajs_free: (a: number, b: number) => void;
+  readonly __wbg_meshoutlinejs_free: (a: number, b: number) => void;
   readonly __wbg_profilecollection_free: (a: number, b: number) => void;
   readonly __wbg_profileentryjs_free: (a: number, b: number) => void;
-  readonly __wbg_rtcoffsetjs_free: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_eastings: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_northings: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_orthogonal_height: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_scale: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_x_axis_abscissa: (a: number, b: number) => void;
-  readonly __wbg_set_georeferencejs_x_axis_ordinate: (a: number, b: number) => void;
+  readonly __wbg_spaceplatehandle_free: (a: number, b: number) => void;
   readonly __wbg_symboliccircle_free: (a: number, b: number) => void;
+  readonly __wbg_symbolicfillarea_free: (a: number, b: number) => void;
   readonly __wbg_symbolicpolyline_free: (a: number, b: number) => void;
   readonly __wbg_symbolicrepresentationcollection_free: (a: number, b: number) => void;
-  readonly __wbg_zerocopymesh_free: (a: number, b: number) => void;
-  readonly georeferencejs_crsName: (a: number, b: number) => void;
-  readonly georeferencejs_localToMap: (a: number, b: number, c: number, d: number, e: number) => void;
-  readonly georeferencejs_mapToLocal: (a: number, b: number, c: number, d: number, e: number) => void;
-  readonly georeferencejs_rotation: (a: number) => number;
-  readonly georeferencejs_toMatrix: (a: number, b: number) => void;
-  readonly gpugeometry_getIfcTypeName: (a: number, b: number, c: number) => void;
-  readonly gpugeometry_getMeshMetadata: (a: number, b: number) => number;
-  readonly gpugeometry_hasRtcOffset: (a: number) => number;
-  readonly gpugeometry_indicesByteLength: (a: number) => number;
-  readonly gpugeometry_indicesLen: (a: number) => number;
-  readonly gpugeometry_indicesPtr: (a: number) => number;
-  readonly gpugeometry_isEmpty: (a: number) => number;
-  readonly gpugeometry_meshCount: (a: number) => number;
-  readonly gpugeometry_new: () => number;
-  readonly gpugeometry_rtcOffsetX: (a: number) => number;
-  readonly gpugeometry_rtcOffsetY: (a: number) => number;
-  readonly gpugeometry_rtcOffsetZ: (a: number) => number;
-  readonly gpugeometry_set_rtc_offset: (a: number, b: number, c: number, d: number) => void;
-  readonly gpugeometry_totalTriangleCount: (a: number) => number;
-  readonly gpugeometry_totalVertexCount: (a: number) => number;
-  readonly gpugeometry_vertexDataByteLength: (a: number) => number;
-  readonly gpugeometry_vertexDataLen: (a: number) => number;
-  readonly gpugeometry_vertexDataPtr: (a: number) => number;
-  readonly gpuinstancedgeometry_geometryId: (a: number) => bigint;
-  readonly gpuinstancedgeometry_indicesByteLength: (a: number) => number;
-  readonly gpuinstancedgeometry_indicesLen: (a: number) => number;
-  readonly gpuinstancedgeometry_indicesPtr: (a: number) => number;
-  readonly gpuinstancedgeometry_instanceCount: (a: number) => number;
-  readonly gpuinstancedgeometry_instanceDataByteLength: (a: number) => number;
-  readonly gpuinstancedgeometry_instanceDataLen: (a: number) => number;
-  readonly gpuinstancedgeometry_instanceDataPtr: (a: number) => number;
-  readonly gpuinstancedgeometry_instanceExpressIdsPtr: (a: number) => number;
-  readonly gpuinstancedgeometry_new: (a: bigint) => number;
-  readonly gpuinstancedgeometry_triangleCount: (a: number) => number;
-  readonly gpuinstancedgeometry_vertexCount: (a: number) => number;
-  readonly gpuinstancedgeometry_vertexDataByteLength: (a: number) => number;
-  readonly gpuinstancedgeometry_vertexDataLen: (a: number) => number;
-  readonly gpuinstancedgeometry_vertexDataPtr: (a: number) => number;
-  readonly gpuinstancedgeometrycollection_get: (a: number, b: number) => number;
-  readonly gpuinstancedgeometrycollection_length: (a: number) => number;
-  readonly gpuinstancedgeometrycollection_new: () => number;
-  readonly gpumeshmetadata_color: (a: number, b: number) => void;
-  readonly gpumeshmetadata_expressId: (a: number) => number;
-  readonly gpumeshmetadata_ifcTypeIdx: (a: number) => number;
-  readonly gpumeshmetadata_indexCount: (a: number) => number;
-  readonly gpumeshmetadata_indexOffset: (a: number) => number;
-  readonly gpumeshmetadata_vertexCount: (a: number) => number;
-  readonly gpumeshmetadata_vertexOffset: (a: number) => number;
-  readonly ifcapi_buildPrePassFast: (a: number, b: number, c: number) => number;
+  readonly __wbg_symbolictext_free: (a: number, b: number) => void;
+  readonly clashrunresult_a: (a: number, b: number) => void;
+  readonly clashrunresult_b: (a: number, b: number) => void;
+  readonly clashrunresult_bounds: (a: number, b: number) => void;
+  readonly clashrunresult_distance: (a: number, b: number) => void;
+  readonly clashrunresult_points: (a: number, b: number) => void;
+  readonly clashrunresult_status: (a: number, b: number) => void;
+  readonly clashsession_ingest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
+  readonly clashsession_new: () => number;
+  readonly clashsession_runRule: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+  readonly gridaxiscollection_getAxis: (a: number, b: number) => number;
+  readonly gridaxiscollection_isEmpty: (a: number) => number;
+  readonly gridaxiscollection_length: (a: number) => number;
+  readonly gridaxisjs_axisId: (a: number) => number;
+  readonly gridaxisjs_end: (a: number) => number;
+  readonly gridaxisjs_gridId: (a: number) => number;
+  readonly gridaxisjs_start: (a: number) => number;
+  readonly gridaxisjs_tag: (a: number, b: number) => void;
   readonly ifcapi_buildPrePassOnce: (a: number, b: number, c: number) => number;
+  readonly ifcapi_buildPrePassStreaming: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
   readonly ifcapi_clearPrePassCache: (a: number) => void;
-  readonly ifcapi_debugProcessEntity953: (a: number, b: number, c: number, d: number) => void;
-  readonly ifcapi_debugProcessFirstWall: (a: number, b: number, c: number, d: number) => void;
   readonly ifcapi_extractProfiles: (a: number, b: number, c: number, d: number) => number;
-  readonly ifcapi_getGeoReference: (a: number, b: number, c: number) => number;
   readonly ifcapi_getMemory: (a: number) => number;
   readonly ifcapi_is_ready: (a: number) => number;
   readonly ifcapi_new: () => number;
-  readonly ifcapi_parse: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseMeshes: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseMeshesAsync: (a: number, b: number, c: number, d: number) => number;
-  readonly ifcapi_parseMeshesInstanced: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseMeshesInstancedAsync: (a: number, b: number, c: number, d: number) => number;
-  readonly ifcapi_parseMeshesSubset: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
-  readonly ifcapi_parseMeshesWithRtc: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseStreaming: (a: number, b: number, c: number, d: number) => number;
+  readonly ifcapi_parseAlignmentLines: (a: number, b: number, c: number) => number;
+  readonly ifcapi_parseGridAxes: (a: number, b: number, c: number) => number;
+  readonly ifcapi_parseGridLines: (a: number, b: number, c: number) => number;
   readonly ifcapi_parseSymbolicRepresentations: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseToGpuGeometry: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseToGpuGeometryAsync: (a: number, b: number, c: number, d: number) => number;
-  readonly ifcapi_parseToGpuInstancedGeometry: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseZeroCopy: (a: number, b: number, c: number) => number;
-  readonly ifcapi_processGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number) => number;
-  readonly ifcapi_processInstancedGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number) => number;
+  readonly ifcapi_processGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number) => number;
   readonly ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
-  readonly ifcapi_scanRelevantEntitiesFastBytes: (a: number, b: number, c: number) => number;
+  readonly ifcapi_setComputeGeometryHashes: (a: number, b: number, c: number) => void;
+  readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+  readonly ifcapi_setMergeLayers: (a: number, b: number) => void;
+  readonly ifcapi_setTessellationQuality: (a: number, b: number, c: number, d: number) => void;
   readonly ifcapi_version: (a: number, b: number) => void;
-  readonly instancedata_color: (a: number, b: number) => void;
-  readonly instancedata_expressId: (a: number) => number;
-  readonly instancedata_transform: (a: number) => number;
-  readonly instancedgeometry_get_instance: (a: number, b: number) => number;
-  readonly instancedgeometry_indices: (a: number) => number;
-  readonly instancedgeometry_instance_count: (a: number) => number;
-  readonly instancedgeometry_normals: (a: number) => number;
-  readonly instancedgeometry_positions: (a: number) => number;
-  readonly instancedmeshcollection_get: (a: number, b: number) => number;
-  readonly instancedmeshcollection_totalInstances: (a: number) => number;
+  readonly meshOutline2d: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
   readonly meshcollection_buildingRotation: (a: number, b: number) => void;
+  readonly meshcollection_geometryHashCount: (a: number) => number;
+  readonly meshcollection_geometryHashIds: (a: number) => number;
+  readonly meshcollection_geometryHashValues: (a: number) => number;
   readonly meshcollection_get: (a: number, b: number) => number;
   readonly meshcollection_hasRtcOffset: (a: number) => number;
   readonly meshcollection_length: (a: number) => number;
-  readonly meshcollection_localToWorld: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly meshcollection_rtcOffsetX: (a: number) => number;
   readonly meshcollection_rtcOffsetY: (a: number) => number;
   readonly meshcollection_rtcOffsetZ: (a: number) => number;
+  readonly meshcollection_takeMesh: (a: number, b: number) => number;
   readonly meshcollection_totalTriangles: (a: number) => number;
   readonly meshcollection_totalVertices: (a: number) => number;
-  readonly meshcollectionwithrtc_get: (a: number, b: number) => number;
-  readonly meshcollectionwithrtc_meshes: (a: number) => number;
-  readonly meshcollectionwithrtc_rtcOffset: (a: number) => number;
   readonly meshdatajs_color: (a: number, b: number) => void;
   readonly meshdatajs_expressId: (a: number) => number;
+  readonly meshdatajs_geometryClass: (a: number) => number;
+  readonly meshdatajs_hasTexture: (a: number) => number;
   readonly meshdatajs_ifcType: (a: number, b: number) => void;
   readonly meshdatajs_indices: (a: number) => number;
   readonly meshdatajs_normals: (a: number) => number;
+  readonly meshdatajs_origin: (a: number) => number;
   readonly meshdatajs_positions: (a: number) => number;
+  readonly meshdatajs_shadingColor: (a: number, b: number) => void;
+  readonly meshdatajs_textureHeight: (a: number) => number;
+  readonly meshdatajs_textureRepeatS: (a: number) => number;
+  readonly meshdatajs_textureRepeatT: (a: number) => number;
+  readonly meshdatajs_textureRgba: (a: number) => number;
+  readonly meshdatajs_textureWidth: (a: number) => number;
   readonly meshdatajs_triangleCount: (a: number) => number;
+  readonly meshdatajs_uvs: (a: number) => number;
   readonly meshdatajs_vertexCount: (a: number) => number;
+  readonly meshoutlinejs_axisMax: (a: number) => number;
+  readonly meshoutlinejs_axisMin: (a: number) => number;
+  readonly meshoutlinejs_contour: (a: number, b: number) => number;
+  readonly meshoutlinejs_contourCount: (a: number) => number;
   readonly profilecollection_get: (a: number, b: number) => number;
   readonly profilecollection_length: (a: number) => number;
   readonly profileentryjs_extrusionDepth: (a: number) => number;
@@ -1129,78 +977,97 @@ export interface InitOutput {
   readonly profileentryjs_modelIndex: (a: number) => number;
   readonly profileentryjs_outerPoints: (a: number) => number;
   readonly profileentryjs_transform: (a: number) => number;
-  readonly rtcoffsetjs_isSignificant: (a: number) => number;
-  readonly rtcoffsetjs_toWorld: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_addFace: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_boundingElements: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_dissolveVertex: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_dragVertex: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_duplicate: (a: number) => number;
+  readonly spaceplatehandle_faceArea: (a: number, b: number) => number;
+  readonly spaceplatehandle_faceOutline: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_findVertexNear: (a: number, b: number, c: number, d: number) => number;
+  readonly spaceplatehandle_fromWallRects: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_gapBoundary: (a: number, b: number, c: number, d: number) => void;
+  readonly spaceplatehandle_mergeFaces: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_neighborAcross: (a: number, b: number) => number;
+  readonly spaceplatehandle_netOutline: (a: number, b: number, c: number, d: number) => void;
+  readonly spaceplatehandle_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
+  readonly spaceplatehandle_prune: (a: number) => number;
+  readonly spaceplatehandle_removeEdge: (a: number, b: number, c: number) => void;
+  readonly spaceplatehandle_roomCount: (a: number) => number;
+  readonly spaceplatehandle_roomIds: (a: number, b: number) => void;
+  readonly spaceplatehandle_setFaceHeight: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_snapshot: (a: number, b: number) => void;
+  readonly spaceplatehandle_splitEdge: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly spaceplatehandle_splitFace: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly symboliccircle_centerX: (a: number) => number;
   readonly symboliccircle_centerY: (a: number) => number;
   readonly symboliccircle_endAngle: (a: number) => number;
+  readonly symboliccircle_expressId: (a: number) => number;
   readonly symboliccircle_ifcType: (a: number, b: number) => void;
   readonly symboliccircle_isFullCircle: (a: number) => number;
   readonly symboliccircle_radius: (a: number) => number;
   readonly symboliccircle_repIdentifier: (a: number, b: number) => void;
   readonly symboliccircle_startAngle: (a: number) => number;
+  readonly symboliccircle_worldY: (a: number) => number;
+  readonly symbolicfillarea_fillA: (a: number) => number;
+  readonly symbolicfillarea_fillB: (a: number) => number;
+  readonly symbolicfillarea_fillG: (a: number) => number;
+  readonly symbolicfillarea_fillR: (a: number) => number;
+  readonly symbolicfillarea_hasHatching: (a: number) => number;
+  readonly symbolicfillarea_hatchAngle: (a: number) => number;
+  readonly symbolicfillarea_hatchAngleSecondary: (a: number) => number;
+  readonly symbolicfillarea_hatchLineWidth: (a: number) => number;
+  readonly symbolicfillarea_hatchSpacing: (a: number) => number;
+  readonly symbolicfillarea_holeCount: (a: number) => number;
+  readonly symbolicfillarea_holesOffsets: (a: number) => number;
+  readonly symbolicfillarea_ifcType: (a: number, b: number) => void;
+  readonly symbolicfillarea_pointCount: (a: number) => number;
+  readonly symbolicfillarea_points: (a: number) => number;
+  readonly symbolicfillarea_repIdentifier: (a: number, b: number) => void;
+  readonly symbolicfillarea_worldY: (a: number) => number;
   readonly symbolicpolyline_expressId: (a: number) => number;
   readonly symbolicpolyline_ifcType: (a: number, b: number) => void;
   readonly symbolicpolyline_isClosed: (a: number) => number;
-  readonly symbolicpolyline_pointCount: (a: number) => number;
   readonly symbolicpolyline_points: (a: number) => number;
   readonly symbolicpolyline_repIdentifier: (a: number, b: number) => void;
   readonly symbolicrepresentationcollection_circleCount: (a: number) => number;
+  readonly symbolicrepresentationcollection_fillCount: (a: number) => number;
   readonly symbolicrepresentationcollection_getCircle: (a: number, b: number) => number;
   readonly symbolicrepresentationcollection_getExpressIds: (a: number, b: number) => void;
+  readonly symbolicrepresentationcollection_getFill: (a: number, b: number) => number;
   readonly symbolicrepresentationcollection_getPolyline: (a: number, b: number) => number;
+  readonly symbolicrepresentationcollection_getText: (a: number, b: number) => number;
   readonly symbolicrepresentationcollection_isEmpty: (a: number) => number;
   readonly symbolicrepresentationcollection_polylineCount: (a: number) => number;
+  readonly symbolicrepresentationcollection_textCount: (a: number) => number;
   readonly symbolicrepresentationcollection_totalCount: (a: number) => number;
+  readonly symbolictext_alignment: (a: number, b: number) => void;
+  readonly symbolictext_colorA: (a: number) => number;
+  readonly symbolictext_content: (a: number, b: number) => void;
+  readonly symbolictext_ifcType: (a: number, b: number) => void;
+  readonly symbolictext_repIdentifier: (a: number, b: number) => void;
+  readonly symbolictext_targetPx: (a: number) => number;
   readonly version: (a: number) => void;
-  readonly zerocopymesh_bounds_max: (a: number, b: number) => void;
-  readonly zerocopymesh_bounds_min: (a: number, b: number) => void;
-  readonly zerocopymesh_is_empty: (a: number) => number;
-  readonly zerocopymesh_new: () => number;
-  readonly zerocopymesh_normals_len: (a: number) => number;
-  readonly zerocopymesh_positions_len: (a: number) => number;
-  readonly zerocopymesh_positions_ptr: (a: number) => number;
-  readonly zerocopymesh_vertex_count: (a: number) => number;
   readonly init: () => void;
-  readonly gpuinstancedgeometryref_indicesLen: (a: number) => number;
-  readonly gpuinstancedgeometryref_instanceCount: (a: number) => number;
-  readonly gpuinstancedgeometryref_instanceDataLen: (a: number) => number;
-  readonly gpuinstancedgeometryref_vertexDataLen: (a: number) => number;
-  readonly instancedmeshcollection_length: (a: number) => number;
-  readonly instancedmeshcollection_totalGeometries: (a: number) => number;
-  readonly meshcollectionwithrtc_length: (a: number) => number;
-  readonly zerocopymesh_indices_len: (a: number) => number;
-  readonly __wbg_set_rtcoffsetjs_x: (a: number, b: number) => void;
-  readonly __wbg_set_rtcoffsetjs_y: (a: number, b: number) => void;
-  readonly __wbg_set_rtcoffsetjs_z: (a: number, b: number) => void;
-  readonly zerocopymesh_triangle_count: (a: number) => number;
+  readonly symbolicpolyline_pointCount: (a: number) => number;
   readonly get_memory: () => number;
-  readonly gpuinstancedgeometryref_indicesPtr: (a: number) => number;
-  readonly gpuinstancedgeometryref_instanceDataPtr: (a: number) => number;
-  readonly gpuinstancedgeometryref_instanceExpressIdsPtr: (a: number) => number;
-  readonly gpuinstancedgeometryref_vertexDataPtr: (a: number) => number;
-  readonly zerocopymesh_indices_ptr: (a: number) => number;
-  readonly zerocopymesh_normals_ptr: (a: number) => number;
-  readonly gpuinstancedgeometrycollection_getRef: (a: number, b: number) => number;
-  readonly __wbg_get_rtcoffsetjs_x: (a: number) => number;
-  readonly __wbg_get_rtcoffsetjs_y: (a: number) => number;
-  readonly __wbg_get_rtcoffsetjs_z: (a: number) => number;
-  readonly gpuinstancedgeometryref_indicesByteLength: (a: number) => number;
-  readonly gpuinstancedgeometryref_instanceDataByteLength: (a: number) => number;
-  readonly gpuinstancedgeometryref_vertexDataByteLength: (a: number) => number;
-  readonly gpuinstancedgeometryref_geometryId: (a: number) => bigint;
-  readonly instancedgeometry_geometryId: (a: number) => bigint;
-  readonly meshcollection_rtcOffsetX: (a: number) => number;
   readonly profileentryjs_expressId: (a: number) => number;
-  readonly symboliccircle_expressId: (a: number) => number;
-  readonly __wbg_gpuinstancedgeometryref_free: (a: number, b: number) => void;
-  readonly __wasm_bindgen_func_elem_1149: (a: number, b: number, c: number) => void;
-  readonly __wasm_bindgen_func_elem_1148: (a: number, b: number) => void;
-  readonly __wasm_bindgen_func_elem_1188: (a: number, b: number, c: number, d: number) => void;
-  readonly __wbindgen_export: (a: number) => void;
-  readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
-  readonly __wbindgen_export3: (a: number, b: number) => number;
-  readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
+  readonly symbolicfillarea_expressId: (a: number) => number;
+  readonly symbolicpolyline_worldY: (a: number) => number;
+  readonly symbolictext_colorB: (a: number) => number;
+  readonly symbolictext_colorG: (a: number) => number;
+  readonly symbolictext_colorR: (a: number) => number;
+  readonly symbolictext_dirX: (a: number) => number;
+  readonly symbolictext_dirY: (a: number) => number;
+  readonly symbolictext_expressId: (a: number) => number;
+  readonly symbolictext_height: (a: number) => number;
+  readonly symbolictext_worldY: (a: number) => number;
+  readonly symbolictext_x: (a: number) => number;
+  readonly symbolictext_y: (a: number) => number;
+  readonly __wbindgen_export: (a: number, b: number) => number;
+  readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+  readonly __wbindgen_export3: (a: number) => void;
+  readonly __wbindgen_export4: (a: number, b: number, c: number) => void;
   readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
   readonly __wbindgen_start: () => void;
 }

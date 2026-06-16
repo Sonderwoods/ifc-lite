@@ -4,12 +4,18 @@
 
 import { IfcTypeEnum, IfcTypeEnumFromString, IfcTypeEnumToString } from './types.js';
 
+export interface SpatialIndex {
+  queryAABB(bounds: { min: [number, number, number]; max: [number, number, number] }): number[];
+  raycast(origin: [number, number, number], direction: [number, number, number]): number[];
+}
+
 export const SPATIAL_STRUCTURE_TYPE_ENUMS = [
   IfcTypeEnum.IfcProject,
   IfcTypeEnum.IfcSite,
   IfcTypeEnum.IfcBuilding,
   IfcTypeEnum.IfcBuildingStorey,
   IfcTypeEnum.IfcSpace,
+  IfcTypeEnum.IfcSpatialZone,
   IfcTypeEnum.IfcFacility,
   IfcTypeEnum.IfcFacilityPart,
   IfcTypeEnum.IfcBridge,
@@ -36,6 +42,7 @@ export const STOREY_LIKE_SPATIAL_TYPE_ENUMS = [
 
 export const SPACE_LIKE_SPATIAL_TYPE_ENUMS = [
   IfcTypeEnum.IfcSpace,
+  IfcTypeEnum.IfcSpatialZone,
 ] as const;
 
 const SPATIAL_STRUCTURE_TYPE_SET = new Set<IfcTypeEnum>(SPATIAL_STRUCTURE_TYPE_ENUMS);
@@ -44,9 +51,6 @@ const STOREY_LIKE_SPATIAL_TYPE_SET = new Set<IfcTypeEnum>(STOREY_LIKE_SPATIAL_TY
 const SPACE_LIKE_SPATIAL_TYPE_SET = new Set<IfcTypeEnum>(SPACE_LIKE_SPATIAL_TYPE_ENUMS);
 const SPATIAL_STRUCTURE_TYPE_NAME_SET = new Set<string>(
   SPATIAL_STRUCTURE_TYPE_ENUMS.map((type) => IfcTypeEnumToString(type)),
-);
-const BUILDING_LIKE_SPATIAL_TYPE_NAME_SET = new Set<string>(
-  BUILDING_LIKE_SPATIAL_TYPE_ENUMS.map((type) => IfcTypeEnumToString(type)),
 );
 
 export function isSpatialStructureType(typeEnum: IfcTypeEnum): boolean {
@@ -60,11 +64,6 @@ export function isSpatialStructureTypeName(typeName: string | null | undefined):
 
 export function isBuildingLikeSpatialType(typeEnum: IfcTypeEnum): boolean {
   return BUILDING_LIKE_SPATIAL_TYPE_SET.has(typeEnum);
-}
-
-export function isBuildingLikeSpatialTypeName(typeName: string | null | undefined): boolean {
-  if (!typeName) return false;
-  return BUILDING_LIKE_SPATIAL_TYPE_NAME_SET.has(typeName);
 }
 
 export function isStoreyLikeSpatialType(typeEnum: IfcTypeEnum): boolean {

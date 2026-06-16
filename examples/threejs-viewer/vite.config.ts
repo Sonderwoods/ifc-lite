@@ -6,6 +6,12 @@ import { defineConfig } from 'vite';
 import { resolve } from 'node:path';
 
 export default defineConfig({
+  // The @ifc-lite geometry worker pool ships ES-module workers. Rollup's
+  // default worker format is IIFE, which it refuses to emit for a
+  // code-splitting build (multiple entries) — force ESM workers instead.
+  worker: {
+    format: 'es',
+  },
   build: {
     rollupOptions: {
       input: {
@@ -19,7 +25,9 @@ export default defineConfig({
   },
   server: {
     headers: {
-      // Required for SharedArrayBuffer (WASM threading)
+      // Cross-origin isolation enables SharedArrayBuffer, which the geometry
+      // worker pool uses to share the IFC file bytes across workers (each
+      // worker runs its own single-threaded WASM instance — not in-WASM threads).
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     },

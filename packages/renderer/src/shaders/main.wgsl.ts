@@ -19,6 +19,25 @@ export const mainShaderSource = `
         }
         @binding(0) @group(0) var<uniform> uniforms: Uniforms;
 
+        // Global lighting environment — one buffer shared by every mesh in
+        // the pass (bound once per frame at group(1)). Field packing must
+        // match packEnvironmentUniforms() in environment.ts.
+        struct Environment {
+          sunDirection: vec3<f32>,      // unit vector TOWARD the sun
+          sunIntensity: f32,
+          sunColor: vec3<f32>,
+          ambientIntensity: f32,
+          skyColor: vec3<f32>,          // hemisphere-ambient sky tint
+          exposure: f32,
+          groundColor: vec3<f32>,       // hemisphere-ambient ground tint
+          fillIntensity: f32,
+          rimIntensity: f32,
+          _pad0: f32,
+          _pad1: f32,
+          _pad2: f32,
+        }
+        @binding(0) @group(1) var<uniform> env: Environment;
+
         struct VertexInput {
           @location(0) position: vec3<f32>,
           @location(1) normal: vec3<f32>,
@@ -95,54 +114,110 @@ export const mainShaderSource = `
 
         @fragment
         fn fs_main(input: VertexOutput) -> FragmentOutput {
-          // Section plane clipping - discard fragments ABOVE the plane
-          // For Down axis (normal +Y), keeps everything below cut height (look down into building)
-          if (uniforms.flags.y == 1u) {
+          // Section plane clipping - discard fragments ABOVE the plane.
+          // flags.y packs two bits: bit 0 = enabled, bit 1 = flipped.
+          let sectionEnabled = (uniforms.flags.y & 1u) == 1u;
+          if (sectionEnabled) {
             let planeNormal = uniforms.sectionPlane.xyz;
             let planeDistance = uniforms.sectionPlane.w;
-            let distToPlane = dot(input.worldPos, planeNormal) - planeDistance;
+            let flipped = (uniforms.flags.y & 2u) == 2u;
+            let side = select(1.0, -1.0, flipped);
+            let distToPlane = (dot(input.worldPos, planeNormal) - planeDistance) * side;
             if (distToPlane > 0.0) {
               discard;
             }
           }
 
-          // Compute normal — with fallback for zero normals
-          // dpdx/dpdy must be called outside non-uniform control flow (WGSL spec),
-          // so we compute the flat normal unconditionally and select below.
+          // Compute normal via derivative-based flat shading.
+          //
+          // Industry-standard solution for BIM/CAD viewers — what
+          // Three.js (material.flatShading = true), Autodesk Forge,
+          // Speckle, and xeokit all do for opaque surfaces. Rationale:
+          //
+          //   * BIM geometry is overwhelmingly flat surfaces (walls,
+          //     slabs, roofs, beams), and CSG operations (opening
+          //     subtraction, layer slicing) emit those surfaces as
+          //     dense strips of coplanar triangles. Per-vertex normal
+          //     averaging gives a SLIGHTLY-different normal at each
+          //     vertex due to f32 noise from boolean output; the
+          //     boundary between strips then reads as a visible darker/
+          //     brighter scar line — the horizontal striations on
+          //     walls, stripes on roofs, visible triangulation reports
+          //     across every CSG kernel we have tried (legacy BSP,
+          //     Manifold).
+          //   * cross(dpdx, dpdy) of world position evaluates to the
+          //     EXACT face normal in the fragment shader. Every
+          //     fragment on a flat face — across an arbitrarily-fine
+          //     triangulation — gets the IDENTICAL normal, so coplanar
+          //     splits become invisible by construction. No CPU-side
+          //     welding, smooth-grouping, or coplanar-face merging
+          //     fixes the symptom as cleanly.
+          //
+          // Trade-off: genuinely curved surfaces (cylinder tessellations,
+          // BSpline approximations) shade with visible facets. For BIM
+          // that's acceptable — curved surfaces are < 5 % of typical
+          // model triangle count and the faceting matches CAD-tool
+          // (Revit, ArchiCAD) on-screen behaviour at default quality.
+          //
+          // We still fall back to the vertex normal when derivatives
+          // are unavailable (extreme polygon degeneracy where dpdx /
+          // dpdy collapse to zero — practically never on real geometry).
           let faceN = cross(dpdx(input.worldPos), dpdy(input.worldPos));
-          var N = input.normal;
-          let nLen2 = dot(N, N);
-          if (nLen2 < 0.0001) {
-            // Fallback: use flat normal from screen-space derivatives
-            let fLen2 = dot(faceN, faceN);
-            N = select(vec3<f32>(0.0, 1.0, 0.0), faceN * inverseSqrt(fLen2), fLen2 > 1e-10);
+          let fLen2 = dot(faceN, faceN);
+          var N: vec3<f32>;
+          if (fLen2 > 1e-10) {
+            N = faceN * inverseSqrt(fLen2);
           } else {
-            N = N * inverseSqrt(nLen2);
+            // Degenerate derivative — fall back to the vertex normal
+            // if it's populated, else +Y.
+            N = input.normal;
+            let nLen2 = dot(N, N);
+            if (nLen2 > 1e-6) {
+              N = N * inverseSqrt(nLen2);
+            } else {
+              N = vec3<f32>(0.0, 1.0, 0.0);
+            }
           }
 
-          // Enhanced lighting with multiple sources
-          let sunLight = normalize(vec3<f32>(0.5, 1.0, 0.3));  // Main directional light
+          // Stabilize the SIGN of the derivative face normal with the vertex
+          // normal. The screen-space cross product gives the exact face
+          // normal DIRECTION for coplanar strips (the scar-line fix), but at
+          // grazing angles its SIGN becomes numerically unstable per quad —
+          // hemisphere/rim lighting then band-flips across large regions of
+          // flat walls/slabs (diagonal lighter/darker bands). The interpolated
+          // vertex normal is quad-noise-free, so use it only to orient N.
+          // Guard: skip when the vertex normal is missing or nearly
+          // perpendicular to the face normal (unreliable witness).
+          let vN = input.normal;
+          let alignDot = dot(N, vN);
+          if (alignDot * alignDot > 0.03 * dot(vN, vN)) {
+            N = N * sign(alignDot);
+          }
+
+          // Lighting environment — sun/hemisphere/exposure come from the
+          // global env uniform (defaults reproduce the historic hardcoded
+          // values); fill + rim directions stay fixed in view-agnostic
+          // world space as stylistic shaping lights.
+          let sunLight = env.sunDirection;
           let fillLight = normalize(vec3<f32>(-0.5, 0.3, -0.3));  // Fill light
           let rimLight = normalize(vec3<f32>(0.0, 0.2, -1.0));  // Rim light for edge definition
 
-          // Hemisphere ambient - reduced for less washed-out look
-          let skyColor = vec3<f32>(0.3, 0.35, 0.4);  // Darker sky
-          let groundColor = vec3<f32>(0.15, 0.1, 0.08);  // Darker ground
+          // Hemisphere ambient
           let hemisphereFactor = N.y * 0.5 + 0.5;
-          let ambient = mix(groundColor, skyColor, hemisphereFactor) * 0.25;
+          let ambient = mix(env.groundColor, env.skyColor, hemisphereFactor) * env.ambientIntensity;
 
           // Two-sided sun light so inner faces (I-beam channels) stay visible
           let NdotL = abs(dot(N, sunLight));
           let wrap = 0.3;
-          let diffuseSun = max((NdotL + wrap) / (1.0 + wrap), 0.0) * 0.55;
+          let diffuseSun = max((NdotL + wrap) / (1.0 + wrap), 0.0) * env.sunIntensity;
 
           // Fill light - two-sided
           let NdotFill = abs(dot(N, fillLight));
-          let diffuseFill = NdotFill * 0.15;
+          let diffuseFill = NdotFill * env.fillIntensity;
 
           // Rim light for edge definition
           let NdotRim = max(dot(N, rimLight), 0.0);
-          let rim = pow(NdotRim, 4.0) * 0.15;
+          let rim = pow(NdotRim, 4.0) * env.rimIntensity;
 
           var baseColor = uniforms.baseColor.rgb;
 
@@ -155,15 +230,31 @@ export const mainShaderSource = `
           baseColor = mix(baseColor, baseColor * 0.7, isWhiteish * 0.4);
 
           // Combine all lighting
-          var color = baseColor * (ambient + diffuseSun + diffuseFill + rim);
+          var color = baseColor * (ambient + env.sunColor * diffuseSun + vec3<f32>(diffuseFill + rim));
 
-          // Selection highlight - add glow/fresnel effect
-          if (uniforms.flags.x == 1u) {
-            let V = normalize(-input.worldPos);
-            let NdotV = max(dot(N, V), 0.0);
-            let fresnel = pow(1.0 - NdotV, 2.0);
-            let highlightColor = vec3<f32>(0.3, 0.6, 1.0);
-            color = mix(color, highlightColor, fresnel * 0.5 + 0.2);
+          // flags.x is a bitfield:
+          //   bit 0 (value 1) = isSelected  → selection-highlight + force opaque
+          //   bit 1 (value 2) = isOverlay   → color-override pass; preserve
+          //                                    baseColor.a (overlay pipeline has
+          //                                    src-alpha blending) AND skip the
+          //                                    glass-fresnel branch so low-alpha
+          //                                    ghost tints don't pick up the
+          //                                    near-white reflection tint meant
+          //                                    for real glass materials.
+          let isSelected = (uniforms.flags.x & 1u) == 1u;
+          let isOverlay = (uniforms.flags.x & 2u) == 2u;
+
+          // Selection highlight — a single FLAT selection colour.
+          //
+          // No lighting-dependent (luminance) or view-dependent (fresnel)
+          // term: the selected object must read as one uniform colour, not
+          // a shaded/gradient surface. The previous fresnel-glow mix left
+          // 80 % of the lit object colour visible at face centres (the
+          // green-site / red-roof bleed-through). A constant colour here
+          // also stays flat through the downstream tone-mapping, since
+          // those are per-pixel functions of a now-constant input.
+          if (isSelected) {
+            color = vec3<f32>(0.3, 0.6, 1.0);
           }
 
           // Beautiful fresnel effect for transparent materials (glass)
@@ -171,8 +262,8 @@ export const mainShaderSource = `
           // blue highlight, making it appear white instead of blue.
           // Also force alpha to 1.0 for selected objects so the highlight is
           // fully opaque (the selection pipeline has no alpha blending).
-          var finalAlpha = select(uniforms.baseColor.a, 1.0, uniforms.flags.x == 1u);
-          if (finalAlpha < 0.99 && uniforms.flags.x != 1u) {
+          var finalAlpha = select(uniforms.baseColor.a, 1.0, isSelected);
+          if (finalAlpha < 0.99 && !isSelected && !isOverlay) {
             // Calculate view direction for fresnel
             let V = normalize(-input.worldPos);
             let NdotV = max(dot(N, V), 0.0);
@@ -202,8 +293,8 @@ export const mainShaderSource = `
             finalAlpha = finalAlpha * 0.7;
           }
 
-          // Exposure adjustment - darken overall
-          color *= 0.85;
+          // Exposure adjustment (historic default 0.85 darkens overall)
+          color *= env.exposure;
 
           // Contrast enhancement
           color = (color - 0.5) * 1.15 + 0.5;
@@ -222,14 +313,25 @@ export const mainShaderSource = `
           let e = 0.14;
           color = clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 
-          // Subtle edge enhancement using screen-space derivatives
+          // Subtle edge enhancement using screen-space derivatives.
+          //
+          // Use the SHADED normal (face normal from dpdx/dpdy above)
+          // for the normal-gradient term, not the interpolated vertex
+          // normal — otherwise we get spurious dark stripes on flat
+          // surfaces whose vertex normals carry numerical noise from
+          // CSG output (the visible scar-line symptom would just
+          // resurface here even after the lit-normal fix). With the
+          // face normal, coplanar adjacent triangles agree exactly →
+          // zero normal gradient → no false edge; only the genuine
+          // creases between perpendicular faces produce a real
+          // gradient and get the intended outline.
           let depthGradient = length(vec2<f32>(
             dpdx(input.viewPos.z),
             dpdy(input.viewPos.z)
           ));
           let normalGradient = length(vec2<f32>(
-            length(dpdx(input.normal)),
-            length(dpdy(input.normal))
+            length(dpdx(N)),
+            length(dpdy(N))
           ));
 
           if (uniforms.flags.z == 1u) {

@@ -22,6 +22,7 @@
 //! | Type | Status | Description |
 //! |------|--------|-------------|
 //! | `IfcExtrudedAreaSolid` | Full | Most common - extruded profiles |
+//! | `IfcExtrudedAreaSolidTapered` | Full | Lofted extrusion between two profiles |
 //! | `IfcFacetedBrep` | Full | Boundary representation meshes |
 //! | `IfcTriangulatedFaceSet` | Full | Pre-triangulated (IFC4) |
 //! | `IfcBooleanClippingResult` | Full | CSG operations (difference, union, intersection) |
@@ -67,16 +68,33 @@
 //! - **Complex Breps**: ~200 entities/sec
 //! - **Boolean operations**: ~20 entities/sec
 
+pub mod alignment;
 pub mod bool2d;
+/// Deterministic Constrained Delaunay Triangulation + bounded Ruppert
+/// min-angle refinement. Backs the quality triangulators in `triangulation`.
+mod cdt;
 pub mod csg;
+/// Deterministic near-coplanar facet weld for faceted-BREP host meshes.
+/// Corrects f32 import jitter (~0.09°) so authored-coplanar roof slope facets
+/// are EXACTLY coplanar before the exact-kernel opening cut (issue #1007).
+pub mod facet_weld;
+pub mod diagnostics;
 pub mod error;
+pub mod geom_hash;
 pub mod extrusion;
+/// Pure-Rust exact mesh-arrangement CSG kernel — the only CSG kernel, on
+/// every target (see docs/architecture/geometry-pipeline.md).
+pub mod kernel;
+pub mod material_layer_index;
 pub mod mesh;
 pub mod processors;
 pub mod profile;
 pub mod profile_extractor;
 pub mod profiles;
+pub mod projection_outline;
 pub mod router;
+pub mod tessellation;
+pub mod space_dcel;
 pub mod transform;
 pub mod triangulation;
 pub mod void_analysis;
@@ -90,26 +108,39 @@ pub use bool2d::{
     subtract_multiple_2d, union_contours,
 };
 pub use csg::{calculate_normals, ClippingProcessor, Plane, Triangle};
+pub use diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
 pub use error::{Error, Result};
-pub use extrusion::{extrude_profile, extrude_profile_with_voids};
+pub use geom_hash::{hash_mesh_world, GeometryHasher, DEFAULT_GEOM_HASH_TOLERANCE};
+pub use extrusion::{extrude_profile, extrude_profile_lofted, extrude_profile_with_voids};
+pub use material_layer_index::{LayerAxis, LayerBuildup, LayerInfo, MaterialLayerIndex};
 pub use mesh::{CoordinateShift, Mesh, SubMesh, SubMeshCollection};
 pub use processors::{
     AdvancedBrepProcessor, BooleanClippingProcessor, ExtrudedAreaSolidProcessor,
-    FaceBasedSurfaceModelProcessor, FacetedBrepProcessor, MappedItemProcessor,
-    PolygonalFaceSetProcessor, RevolvedAreaSolidProcessor, SurfaceOfLinearExtrusionProcessor,
+    ExtrudedAreaSolidTaperedProcessor, FaceBasedSurfaceModelProcessor, FacetedBrepProcessor,
+    build_texture_index, MappedItemProcessor, MeshTexture, PolygonalFaceSetProcessor,
+    ResolvedTextureMap, RevolvedAreaSolidProcessor, SurfaceOfLinearExtrusionProcessor,
     SweptDiskSolidProcessor, TriangulatedFaceSetProcessor,
 };
+pub use alignment::{AlignmentCurve, AlignmentFrame};
 pub use profile::{Profile2D, Profile2DWithVoids, ProfileType, VoidInfo};
 pub use profile_extractor::{extract_profiles, ExtractedProfile};
 pub use profiles::ProfileProcessor;
-pub use router::{GeometryProcessor, GeometryRouter};
+pub use router::{
+    ClassificationStats, GeometryProcessor, GeometryRouter, HostOpeningDiagnostic, ItemDedupCache,
+    OpeningDiagnostic, OpeningKindDiag,
+};
+pub use tessellation::{scale_segments, TessellationQuality};
 pub use transform::{
     apply_rtc_offset, parse_axis2_placement_3d, parse_axis2_placement_3d_from_id,
     parse_cartesian_point, parse_cartesian_point_from_id, parse_direction, parse_direction_from_id,
+    rotation_angle_about_z,
 };
 pub use triangulation::triangulate_polygon;
 pub use void_analysis::{
     classify_voids_batch, extract_coplanar_voids, extract_nonplanar_voids, VoidAnalyzer,
     VoidClassification,
 };
-pub use void_index::{propagate_voids_to_parts, VoidIndex, VoidStatistics};
+pub use void_index::{
+    build_aggregate_children_index, compute_parts_to_skip, propagate_voids_to_parts,
+    propagate_voids_via_aggregates, VoidIndex, VoidStatistics,
+};

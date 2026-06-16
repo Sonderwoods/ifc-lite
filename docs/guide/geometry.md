@@ -46,26 +46,62 @@ flowchart TB
     style Output fill:#a855f7,stroke:#581c87,color:#fff
 ```
 
-## Geometry Quality Modes
+## Tessellation Quality
 
-| Mode | Curve Segments | Use Case |
-|------|---------------|----------|
-| `FAST` | 8 | Quick preview, mobile devices |
-| `BALANCED` | 16 | Default, good quality/performance |
-| `HIGH` | 32 | Maximum quality, detailed models |
+Curved geometry (swept pipes, cylinders, fillets, NURBS patches) is
+approximated with straight segments. The detail level is selectable per
+`GeometryProcessor` — no WASM rebuild needed:
+
+| Level | Curved-surface segment density | Profile circles (opening cutters / caps) | Use case |
+|-------|-------------------------------|------------------------------------------|----------|
+| `'lowest'` | ×0.25 | max 8 segments | Maximum throughput, previews |
+| `'low'` | ×0.5 | max 16 segments | Mobile, large federated models |
+| `'medium'` (default) | ×1 — historical densities | 36 segments | General use |
+| `'high'` | ×2 | 36 (never finer) | Smooth pipes / cylinders |
+| `'highest'` | ×4 | 36 (never finer) | Close-up curved detail |
 
 ```typescript
 import { GeometryProcessor } from '@ifc-lite/geometry';
 
-const geometry = new GeometryProcessor();
+// At construction…
+const geometry = new GeometryProcessor({ tessellationQuality: 'high' });
 await geometry.init();
 
-// Process with default quality
-const result = await geometry.process(new Uint8Array(buffer));
+// …or at runtime, BEFORE processing (already-emitted meshes are not
+// regenerated — reload the model to apply a new level):
+geometry.setTessellationQuality('low');
 
-// Note: Quality settings are configured in the WASM module
-// For custom quality, rebuild with different curve subdivision settings
+const result = await geometry.process(new Uint8Array(buffer));
 ```
+
+The same knob exists on the raw WASM API for consumers driving
+`processGeometryBatch` directly:
+
+```typescript
+import { IfcAPI } from '@ifc-lite/wasm';
+
+const api = new IfcAPI();
+api.setTessellationQuality('highest'); // applies to subsequent batches
+```
+
+**Performance trade-off.** Triangle count and processing time on
+curved-heavy models scale roughly with the density multiplier: `'highest'`
+can quadruple the triangles of a pipe-rack model, `'lowest'` quarters them.
+Boxy architectural models (extrusions, breps) are barely affected — only
+curved tessellation scales.
+
+**Guarantees:**
+
+- Leaving the level unset (or passing `'medium'` / `null`) produces output
+  **byte-for-byte identical** to previous releases — upgrading is safe.
+- Segment counts rise monotonically with the level (never fewer triangles
+  at a higher level).
+- Profile-plane outlines (extruded caps and opening cutters) never get
+  *finer* than `'medium'` — denser opening circles only multiply earcut
+  cap-bridge slivers on plates with bolt holes. They do coarsen below
+  `'medium'` for preview levels.
+- WASM paths only (main-thread, streaming and worker pool); the native
+  Tauri pipeline does not consume the level yet.
 
 ## Mesh Data Structure
 
@@ -333,25 +369,22 @@ class CustomProfileProcessor extends GeometryProcessor {
 ProcessorRegistry.register(new CustomProfileProcessor());
 ```
 
-## Instancing
+## Batching
 
-IFC often uses mapped representations for repeated elements. The renderer handles instancing automatically:
+The renderer automatically groups geometry by colour into a small number of
+batched draw calls (one `BatchedMesh` per colour group), so a model with many
+repeated elements still renders in a handful of draws — no manual step:
 
 ```typescript
 import { GeometryProcessor } from '@ifc-lite/geometry';
-import { Renderer } from '@ifc-lite/renderer';
 
 const geometry = new GeometryProcessor();
 await geometry.init();
 
 const result = await geometry.process(new Uint8Array(buffer));
 
-// Load geometry - renderer automatically batches by color
-// and can use instancing for repeated elements
+// The renderer batches by colour when you load the meshes.
 renderer.loadGeometry(result);
-
-// For advanced instancing control:
-renderer.convertToInstanced(result.meshes);
 ```
 
 ## Performance Optimization

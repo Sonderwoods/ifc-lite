@@ -12,6 +12,7 @@ import {
   type SpatialNode,
 } from '@ifc-lite/data';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import { buildMaterialUsageIndex } from '@ifc-lite/parser';
 import { useViewerStore, type FederatedModel } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import type { TreeNode, NodeType, StoreyData, UnifiedStorey } from './types';
@@ -38,6 +39,7 @@ export function getNodeType(ifcType: IfcTypeEnum): NodeType {
     case IfcTypeEnum.IfcRoadPart: return 'IfcRoadPart';
     case IfcTypeEnum.IfcRailwayPart: return 'IfcRailwayPart';
     case IfcTypeEnum.IfcSpace: return 'IfcSpace';
+    case IfcTypeEnum.IfcSpatialZone: return 'IfcSpatialZone';
     default: return 'element';
   }
 }
@@ -65,7 +67,9 @@ function collectDescendantSpaceElements(
   const elementIds = new Set<number>();
 
   for (const child of spatialNode.children || []) {
-    if (getNodeType(child.type) === 'IfcSpace') {
+    // IfcSpace and IfcSpatialZone both roll up their bySpace elements so the
+    // storey doesn't also list them as direct contained elements (#1075).
+    if (isSpaceLikeSpatialType(child.type)) {
       for (const elementId of hierarchy?.bySpace.get(child.expressId) ?? []) {
         elementIds.add(elementId);
       }
@@ -458,15 +462,28 @@ export function buildTreeData(
   return nodes;
 }
 
+/** An authored (overlay) product to fold into the class/type trees — it lives in
+ *  the mutation overlay, not the columnar parse those builders scan. */
+export interface AuthoredProduct {
+  modelId: string;
+  expressId: number;
+  globalId: number;
+  name: string;
+  ifcType: string;
+}
+
 /** Build tree data grouped by IFC class instead of spatial hierarchy.
  *  Only includes entities that have geometry (visible in the 3D viewer).
- *  @param geometricIds Pre-computed set of global IDs with geometry (memoized by caller). */
+ *  @param geometricIds Pre-computed set of global IDs with geometry (memoized by caller).
+ *  @param authoredProducts Overlay-authored products (e.g. a baked IfcSpace) that
+ *    aren't in the columnar table but have geometry — folded into their class. */
 export function buildTypeTree(
   models: Map<string, FederatedModel>,
   ifcDataStore: IfcDataStore | null | undefined,
   expandedNodes: Set<string>,
   isMultiModel: boolean,
   geometricIds?: Set<number>,
+  authoredProducts?: AuthoredProduct[],
 ): TreeNode[] {
   // Collect entities grouped by IFC class across all models
   const typeGroups = new Map<string, Array<{ expressId: number; globalId: number; name: string; modelId: string }>>();
@@ -498,6 +515,17 @@ export function buildTypeTree(
     }
   } else if (ifcDataStore) {
     processDataStore(ifcDataStore, 'legacy');
+  }
+
+  // Fold in authored (overlay) products — a baked IfcSpace, an added slab, … —
+  // which the columnar scan above can't see, so they'd otherwise be absent from
+  // the "By Class" tree even though they render in 3D.
+  for (const p of authoredProducts ?? []) {
+    let list = typeGroups.get(p.ifcType);
+    if (!list) { list = []; typeGroups.set(p.ifcType, list); }
+    if (!list.some((e) => e.globalId === p.globalId)) {
+      list.push({ expressId: p.expressId, globalId: p.globalId, name: p.name, modelId: p.modelId });
+    }
   }
 
   // Sort types alphabetically
@@ -707,6 +735,92 @@ export function buildIfcTypeTree(
         }
       }
     }
+  }
+
+  return nodes;
+}
+
+/**
+ * Build a flat "By Material" tree: one row per base material (IfcMaterial),
+ * grouped by name so the same-named material across federated models merges.
+ * Each row carries the using elements' global ids for click-to-isolate and the
+ * representative material express id for the properties panel. Mirrors
+ * {@link buildIfcTypeTree} but keyed on the parser's material usage index.
+ */
+export function buildMaterialTree(
+  models: Map<string, FederatedModel>,
+  ifcDataStore: IfcDataStore | null | undefined,
+  _expandedNodes: Set<string>,
+  _isMultiModel: boolean,
+  geometricIds?: Set<number>,
+): TreeNode[] {
+  interface MatEntry {
+    name: string;
+    ifcClass: string;
+    materialId: number;          // representative material express id
+    modelIds: Set<string>;       // contributing models (insertion order)
+    elements: Map<number, number>; // globalId -> expressId (deduped)
+  }
+
+  const byName = new Map<string, MatEntry>();
+  const applyGeomFilter = !!geometricIds && geometricIds.size > 0;
+
+  const processDataStore = (dataStore: IfcDataStore, modelId: string) => {
+    const usage = buildMaterialUsageIndex(dataStore);
+    for (const u of usage.values()) {
+      let entry = byName.get(u.name);
+      if (!entry) {
+        // Invariant: the representative `materialId` and the first entry in
+        // `modelIds` come from the SAME (first-contributing) model, so the click
+        // handler's `node.modelIds[0]` + `node.entityExpressId` always resolve a
+        // valid (model, material) pair. Sets preserve insertion order.
+        entry = {
+          name: u.name,
+          ifcClass: u.ifcClass,
+          materialId: u.id,
+          modelIds: new Set([modelId]),
+          elements: new Map(),
+        };
+        byName.set(u.name, entry);
+      } else {
+        entry.modelIds.add(modelId);
+      }
+      for (const { entityId } of u.entries) {
+        const globalId = resolveTreeGlobalId(modelId, entityId, models);
+        if (applyGeomFilter && !geometricIds!.has(globalId)) continue;
+        entry.elements.set(globalId, entityId);
+      }
+    }
+  };
+
+  if (models.size > 0) {
+    for (const [modelId, model] of models) {
+      if (model.ifcDataStore) processDataStore(model.ifcDataStore, modelId);
+    }
+  } else if (ifcDataStore) {
+    processDataStore(ifcDataStore, 'legacy');
+  }
+
+  const nodes: TreeNode[] = [];
+  const names = Array.from(byName.keys()).sort((a, b) => a.localeCompare(b));
+  for (const name of names) {
+    const entry = byName.get(name)!;
+    if (entry.elements.size === 0) continue; // skip materials with no visible elements (dead clicks)
+    nodes.push({
+      id: `material-${name}`,
+      expressIds: Array.from(entry.elements.values()),
+      globalIds: Array.from(entry.elements.keys()),
+      entityExpressId: entry.materialId,
+      modelIds: Array.from(entry.modelIds),
+      name,
+      type: 'material-group',
+      ifcType: entry.ifcClass,
+      depth: 0,
+      hasChildren: false,
+      isExpanded: false,
+      isVisible: true,
+      elementCount: entry.elements.size,
+    });
   }
 
   return nodes;

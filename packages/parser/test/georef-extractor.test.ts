@@ -7,8 +7,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { extractGeoreferencing, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth } from '../src/georef-extractor';
-import type { IfcEntity } from '../src/entity-extractor';
+import { extractGeoreferencing, transformToWorld, transformToLocal, getCoordinateSystemDescription, computeAngleToGridNorth } from '../src/georef-extractor.js';
+import type { IfcEntity } from '../src/entity-extractor.js';
+import { getAttributeNames } from '../src/ifc-schema.js';
 
 describe('Georeferencing Extractor', () => {
   it('should extract IfcMapConversion', () => {
@@ -250,5 +251,102 @@ describe('Georeferencing Extractor', () => {
 
     const description = getCoordinateSystemDescription(georef);
     expect(description).toBe('Local Engineering Coordinates');
+  });
+
+  it('extracts legacy IFC2X3 IfcSite geolocation', () => {
+    const entities = new Map<number, IfcEntity>();
+    const siteAttrNames = getAttributeNames('IfcSite');
+    const attributes = new Array(siteAttrNames.length).fill(null);
+    attributes[siteAttrNames.indexOf('RefLatitude')] = [50, 2, 20];
+    attributes[siteAttrNames.indexOf('RefLongitude')] = [14, 28, 0];
+    attributes[siteAttrNames.indexOf('RefElevation')] = 245;
+
+    entities.set(300, {
+      expressId: 300,
+      type: 'IfcSite',
+      attributes,
+    });
+
+    const entitiesByType = new Map<string, number[]>();
+    entitiesByType.set('IfcSite', [300]);
+
+    const georef = extractGeoreferencing(entities, entitiesByType);
+
+    expect(georef.hasGeoreference).toBe(true);
+    expect(georef.source).toBe('siteLocation');
+    expect(georef.projectedCRS?.name).toBe('EPSG:4326');
+    expect(georef.projectedCRS?.description).toBe('Legacy IfcSite geolocation');
+    expect(georef.mapConversion?.eastings).toBeCloseTo(14.4666667, 6);
+    expect(georef.mapConversion?.northings).toBeCloseTo(50.0388889, 6);
+    expect(georef.mapConversion?.orthogonalHeight).toBe(245);
+    expect(georef.transformMatrix).toBeUndefined();
+    expect(getCoordinateSystemDescription(georef)).toContain('Site:');
+  });
+
+  // Helper for the IFC2x3 ePSet_MapConversion fixtures. Values mirror the
+  // Rust parity fixtures in rust/processing/src/georeferencing.rs so the
+  // two extractors are pinned to identical outputs.
+  function epsetEntities(name: string) {
+    const entities = new Map<number, IfcEntity>();
+    entities.set(1, {
+      expressId: 1,
+      type: 'IfcPropertySingleValue',
+      attributes: ['Eastings', null, 1000.5, null],
+    });
+    entities.set(2, {
+      expressId: 2,
+      type: 'IfcPropertySingleValue',
+      attributes: ['Northings', null, 2000.25, null],
+    });
+    entities.set(3, {
+      expressId: 3,
+      type: 'IfcPropertySingleValue',
+      attributes: ['OrthogonalHeight', null, 42, null],
+    });
+    entities.set(4, {
+      expressId: 4,
+      type: 'IfcPropertySet',
+      attributes: ['0PSet00000000000000001', null, name, null, ['#1', '#2', '#3']],
+    });
+    const entitiesByType = new Map<string, number[]>();
+    entitiesByType.set('IfcPropertySingleValue', [1, 2, 3]);
+    entitiesByType.set('IfcPropertySet', [4]);
+    return { entities, entitiesByType };
+  }
+
+  it('extracts IFC2X3 ePSet_MapConversion fallback (Rust parity)', () => {
+    for (const name of ['ePSet_MapConversion', 'EPset_MapConversion']) {
+      const { entities, entitiesByType } = epsetEntities(name);
+      const georef = extractGeoreferencing(entities, entitiesByType);
+
+      expect(georef.hasGeoreference).toBe(true);
+      expect(georef.source).toBe('ePSetMapConversion');
+      expect(georef.mapConversion?.eastings).toBeCloseTo(1000.5, 9);
+      expect(georef.mapConversion?.northings).toBeCloseTo(2000.25, 9);
+      expect(georef.mapConversion?.orthogonalHeight).toBeCloseTo(42, 9);
+      expect(georef.transformMatrix?.[12]).toBeCloseTo(1000.5, 9);
+    }
+  });
+
+  it('prefers ePSet_MapConversion over the legacy site fallback (Rust precedence)', () => {
+    const { entities, entitiesByType } = epsetEntities('ePSet_MapConversion');
+
+    const siteAttrNames = getAttributeNames('IfcSite');
+    const attributes = new Array(siteAttrNames.length).fill(null);
+    attributes[siteAttrNames.indexOf('RefLatitude')] = [50, 2, 20];
+    attributes[siteAttrNames.indexOf('RefLongitude')] = [14, 28, 0];
+    entities.set(300, { expressId: 300, type: 'IfcSite', attributes });
+    entitiesByType.set('IfcSite', [300]);
+
+    const georef = extractGeoreferencing(entities, entitiesByType);
+    expect(georef.source).toBe('ePSetMapConversion');
+    expect(georef.mapConversion?.eastings).toBeCloseTo(1000.5, 9);
+  });
+
+  it('ignores property sets that are not the map-conversion ePSet', () => {
+    const { entities, entitiesByType } = epsetEntities('Pset_SomethingElse');
+    const georef = extractGeoreferencing(entities, entitiesByType);
+    expect(georef.hasGeoreference).toBe(false);
+    expect(georef.source).toBeUndefined();
   });
 });

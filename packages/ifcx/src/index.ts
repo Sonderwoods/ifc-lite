@@ -14,12 +14,14 @@ import { composeIfcx, findRoots } from './composition.js';
 import { extractEntities } from './entity-extractor.js';
 import { extractProperties, isQuantityProperty } from './property-extractor.js';
 import { extractGeometry, type MeshData } from './geometry-extractor.js';
+import { extractPointClouds, type PointCloudExtraction } from './pointcloud-extractor.js';
 import { buildHierarchy } from './hierarchy-builder.js';
 import {
   StringTable,
   RelationshipGraphBuilder,
   RelationshipType,
   QuantityTableBuilder,
+  safeUtf8Decode,
 } from '@ifc-lite/data';
 import type { SpatialHierarchy, EntityTable, PropertyTable, QuantityTable, RelationshipGraph } from '@ifc-lite/data';
 
@@ -39,6 +41,10 @@ export { composeIfcx, findRoots, getDescendants } from './composition.js';
 export { extractEntities } from './entity-extractor.js';
 export { extractProperties, isQuantityProperty } from './property-extractor.js';
 export { extractGeometry, type MeshData } from './geometry-extractor.js';
+export {
+  extractPointClouds,
+  type PointCloudExtraction,
+} from './pointcloud-extractor.js';
 export { buildHierarchy } from './hierarchy-builder.js';
 export {
   findTraversalRoots,
@@ -100,6 +106,8 @@ export interface IfcxParseResult {
   strings: StringTable;
   /** Pre-tessellated geometry meshes */
   meshes: MeshData[];
+  /** Decoded point clouds (pcd::base64, points::array, points::base64) */
+  pointClouds: PointCloudExtraction[];
   /** Mapping from IFCX path to express ID */
   pathToId: Map<string, number>;
   /** Mapping from express ID to IFCX path */
@@ -128,9 +136,10 @@ export async function parseIfcx(
 ): Promise<IfcxParseResult> {
   const startTime = performance.now();
 
-  // Phase 1: Parse JSON
+  // Phase 1: Parse JSON. SAB-safe in case the upload entry path streamed
+  // the file directly into a SharedArrayBuffer.
   options.onProgress?.({ phase: 'parse', percent: 0 });
-  const text = new TextDecoder().decode(buffer);
+  const text = safeUtf8Decode(new Uint8Array(buffer));
   let file: IfcxFile;
 
   try {
@@ -165,6 +174,7 @@ export async function parseIfcx(
   // Phase 5: Extract geometry
   options.onProgress?.({ phase: 'geometry', percent: 0 });
   const meshes = extractGeometry(composed, pathToId);
+  const pointClouds = extractPointClouds(composed, pathToId);
   options.onProgress?.({ phase: 'geometry', percent: 100 });
 
   // Phase 6: Build hierarchy
@@ -190,6 +200,7 @@ export async function parseIfcx(
     spatialHierarchy,
     strings,
     meshes,
+    pointClouds,
     pathToId,
     idToPath,
     schemaVersion: 'IFC5',
@@ -323,7 +334,10 @@ export function detectFormat(buffer: ArrayBuffer): 'ifcx' | 'ifc' | 'glb' | 'unk
   }
 
   const bytes = new Uint8Array(buffer, 0, Math.min(100, buffer.byteLength));
-  const start = new TextDecoder().decode(bytes).trim();
+  // SAB-safe: the upload entry path streams the file directly into a
+  // SharedArrayBuffer for files ≥ STREAM_SAB_THRESHOLD, and both Firefox
+  // and Chromium reject TextDecoder.decode() on SAB-backed views.
+  const start = safeUtf8Decode(bytes).trim();
 
   // IFCX is JSON starting with {
   if (start.startsWith('{')) {
@@ -419,7 +433,7 @@ export async function parseFederatedIfcx(
     const { buffer, name } = files[i];
     totalSize += buffer.byteLength;
 
-    const text = new TextDecoder().decode(buffer);
+    const text = safeUtf8Decode(new Uint8Array(buffer));
     let file: IfcxFile;
 
     try {
@@ -459,6 +473,29 @@ export async function parseFederatedIfcx(
 
   options.onProgress?.({ phase: 'compose', percent: 100 });
 
+  return finalizeFederatedResult(
+    layerStack,
+    compositionResult,
+    totalSize,
+    startTime,
+    options
+  );
+}
+
+/**
+ * Run the post-composition extraction phases and assemble the final result.
+ *
+ * Shared by parseFederatedIfcx (initial parse) and addIfcxOverlay (incremental
+ * overlay add) so that adding an overlay only pays for composing the existing
+ * layer stack plus extraction, instead of re-parsing every layer buffer.
+ */
+function finalizeFederatedResult(
+  layerStack: LayerStack,
+  compositionResult: FederatedCompositionResult,
+  totalSize: number,
+  startTime: number,
+  options: FederatedParseOptions
+): FederatedIfcxParseResult {
   // Convert composed nodes to standard ComposedNode format for extractors
   const composed = new Map<string, ComposedNode>();
   for (const [path, node] of compositionResult.composed) {
@@ -479,6 +516,7 @@ export async function parseFederatedIfcx(
   // Phase 5: Extract geometry
   options.onProgress?.({ phase: 'geometry', percent: 0 });
   const meshes = extractGeometry(composed, pathToId);
+  const pointClouds = extractPointClouds(composed, pathToId);
   options.onProgress?.({ phase: 'geometry', percent: 100 });
 
   // Phase 6: Build hierarchy
@@ -510,6 +548,7 @@ export async function parseFederatedIfcx(
     spatialHierarchy,
     strings,
     meshes,
+    pointClouds,
     pathToId,
     idToPath,
     schemaVersion: 'IFC5',
@@ -538,8 +577,8 @@ export async function addIfcxOverlay(
   overlayName: string,
   options: FederatedParseOptions = {}
 ): Promise<FederatedIfcxParseResult> {
-  // Parse overlay file
-  const text = new TextDecoder().decode(overlayBuffer);
+  // Parse overlay file (SAB-safe).
+  const text = safeUtf8Decode(new Uint8Array(overlayBuffer));
   let file: IfcxFile;
 
   try {
@@ -554,21 +593,38 @@ export async function addIfcxOverlay(
   }
 
   // Add to layer stack (at top = strongest)
-  baseResult.layerStack.addLayer(file, overlayBuffer, overlayName, {
+  const layerStack = baseResult.layerStack;
+  layerStack.addLayer(file, overlayBuffer, overlayName, {
     type: 'file',
     filename: overlayName,
     size: overlayBuffer.byteLength,
   });
 
-  // Re-compose with new layer
-  // Collect all files from the layer stack
-  const files: FederatedFileInput[] = baseResult.layerStack
-    .getLayers()
-    .map((layer) => ({
-      buffer: layer.buffer,
-      name: layer.name,
-    }))
-    .reverse(); // Reverse because layers are stored strongest-first
+  // Re-compose with the new layer directly from the already-parsed stack.
+  // Avoid round-tripping every layer buffer back through parseFederatedIfcx
+  // (re-JSON.parsing all prior layers), which would make the k-th overlay
+  // cost O(total bytes of all layers).
+  const startTime = performance.now();
+  options.onProgress?.({ phase: 'compose', percent: 0 });
+  const compositionResult = composeFederated(layerStack, {
+    onProgress: (phase, percent) => {
+      options.onProgress?.({ phase: `compose-${phase}`, percent });
+    },
+    maxInheritDepth: options.maxInheritDepth,
+  });
+  options.onProgress?.({ phase: 'compose', percent: 100 });
 
-  return parseFederatedIfcx(files, options);
+  // fileSize reflects the total bytes of every layer (matching parseFederatedIfcx).
+  let totalSize = 0;
+  for (const layer of layerStack.getLayers()) {
+    totalSize += layer.buffer.byteLength;
+  }
+
+  return finalizeFederatedResult(
+    layerStack,
+    compositionResult,
+    totalSize,
+    startTime,
+    options
+  );
 }

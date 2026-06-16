@@ -13,7 +13,6 @@ import { describe, it, beforeEach, expect } from 'vitest';
 
 import { BufferBuilder } from './buffer-builder.js';
 import { CoordinateHandler } from './coordinate-handler.js';
-import { deduplicateMeshes, getDeduplicationStats } from './geometry-deduplicator.js';
 import type { MeshData } from './types.js';
 
 // Helper to create test mesh data
@@ -304,80 +303,49 @@ describe('CoordinateHandler', () => {
       expect(info.originalBounds.max.z).toBe(310);
     });
   });
-});
 
-describe('GeometryDeduplicator', () => {
-  describe('deduplicateMeshes', () => {
-    it('should group identical meshes', () => {
-      // Two meshes with identical geometry
-      const mesh1 = createTestMesh({ expressId: 1, color: [1, 0, 0, 1] });
-      const mesh2 = createTestMesh({ expressId: 2, color: [0, 1, 0, 1] });
+  describe('wasm metadata (#945)', () => {
+    it('surfaces lengthUnitScale and the applied wasmRtcOffset', () => {
+      handler.setWasmMetadata(0.001, { x: -10215.88, y: 2007.82, z: 164.95 });
+      handler.processMeshesIncremental([
+        createTestMesh({
+          expressId: 1,
+          positions: new Float32Array([0, 0, 0, 10, 10, 10]),
+        }),
+      ]);
 
-      const result = deduplicateMeshes([mesh1, mesh2]);
-
-      // Should produce 1 unique geometry with 2 instances
-      expect(result.length).toBe(1);
-      expect(result[0].instances.length).toBe(2);
-      expect(result[0].instances[0].expressId).toBe(1);
-      expect(result[0].instances[1].expressId).toBe(2);
+      const info = handler.getFinalCoordinateInfo();
+      expect(info.lengthUnitScale).toBe(0.001);
+      expect(info.wasmRtcOffset).toEqual({ x: -10215.88, y: 2007.82, z: 164.95 });
     });
 
-    it('should keep different geometries separate', () => {
-      const mesh1 = createTestMesh({
-        expressId: 1,
-        positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
-      });
-      const mesh2 = createTestMesh({
-        expressId: 2,
-        positions: new Float32Array([0, 0, 0, 2, 0, 0, 0, 2, 0]), // Different size
-      });
+    it('omits wasmRtcOffset when no shift was applied but keeps lengthUnitScale', () => {
+      handler.setWasmMetadata(1, null);
+      handler.processMeshesIncremental([
+        createTestMesh({
+          expressId: 1,
+          positions: new Float32Array([0, 0, 0, 1, 1, 1]),
+        }),
+      ]);
 
-      const result = deduplicateMeshes([mesh1, mesh2]);
-
-      // Should produce 2 unique geometries
-      expect(result.length).toBe(2);
-      expect(result[0].instances.length).toBe(1);
-      expect(result[1].instances.length).toBe(1);
+      const info = handler.getFinalCoordinateInfo();
+      expect(info.lengthUnitScale).toBe(1);
+      expect(info.wasmRtcOffset).toBeUndefined();
     });
 
-    it('should preserve geometry data in result', () => {
-      const mesh = createTestMesh({
-        expressId: 1,
-        positions: new Float32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]),
-        normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
-        indices: new Uint32Array([0, 1, 2]),
-      });
+    it('clears metadata on reset', () => {
+      handler.setWasmMetadata(0.001, { x: 1, y: 2, z: 3 });
+      handler.reset();
+      handler.processMeshesIncremental([
+        createTestMesh({
+          expressId: 1,
+          positions: new Float32Array([0, 0, 0, 1, 1, 1]),
+        }),
+      ]);
 
-      const result = deduplicateMeshes([mesh]);
-
-      expect(Array.from(result[0].positions)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
-      expect(Array.from(result[0].normals)).toEqual([0, 0, 1, 0, 0, 1, 0, 0, 1]);
-      expect(Array.from(result[0].indices)).toEqual([0, 1, 2]);
-    });
-
-    it('should handle empty input', () => {
-      const result = deduplicateMeshes([]);
-      expect(result.length).toBe(0);
-    });
-  });
-
-  describe('getDeduplicationStats', () => {
-    it('should calculate correct statistics', () => {
-      const mesh1 = createTestMesh({ expressId: 1 });
-      const mesh2 = createTestMesh({ expressId: 2 }); // Same geometry
-      const mesh3 = createTestMesh({
-        expressId: 3,
-        positions: new Float32Array([0, 0, 0, 5, 5, 5, 2, 2, 2]), // Different
-      });
-
-      const instanced = deduplicateMeshes([mesh1, mesh2, mesh3]);
-      const stats = getDeduplicationStats(instanced);
-
-      expect(stats.inputMeshes).toBe(3);
-      expect(stats.uniqueGeometries).toBe(2);
-      expect(stats.totalInstances).toBe(3);
-      expect(stats.maxInstancesPerGeometry).toBe(2); // mesh1 and mesh2
-      expect(stats.deduplicationRatio).toBe(1.5); // 3/2
+      const info = handler.getFinalCoordinateInfo();
+      expect(info.lengthUnitScale).toBeUndefined();
+      expect(info.wasmRtcOffset).toBeUndefined();
     });
   });
 });

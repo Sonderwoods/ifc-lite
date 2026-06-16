@@ -62,6 +62,43 @@ describe('matchesCriteria — ifcType', () => {
   });
 });
 
+describe('matchesCriteria — group (#1075)', () => {
+  // Spaces 1 & 2 belong to zone "Apt-01"; space 3 belongs to "Apt-02"; entity 4
+  // belongs to no group.
+  const groupsById = new Map<number, Array<{ id: number; name?: string; type: string }>>([
+    [1, [{ id: 90, name: 'Apt-01', type: 'IfcZone' }]],
+    [2, [{ id: 90, name: 'Apt-01', type: 'IfcZone' }]],
+    [3, [{ id: 91, name: 'Apt-02', type: 'IfcZone' }]],
+  ]);
+  const provider: LensDataProvider = {
+    getEntityCount: () => 4,
+    forEachEntity: (cb) => { for (const id of [1, 2, 3, 4]) cb(id, 'model-1'); },
+    getEntityType: () => 'IfcSpace',
+    getPropertyValue: () => undefined,
+    getPropertySets: () => [],
+    getEntityGroups: (id) => groupsById.get(id) ?? [],
+  };
+
+  it('matches entities in a named zone (case-insensitive substring)', () => {
+    const c: LensCriteria = { type: 'group', groupName: 'apt-01' };
+    expect(matchesCriteria(c, 1, provider)).toBe(true);
+    expect(matchesCriteria(c, 2, provider)).toBe(true);
+    expect(matchesCriteria(c, 3, provider)).toBe(false);
+  });
+
+  it('matches any grouped entity when groupName is blank', () => {
+    const c: LensCriteria = { type: 'group' };
+    expect(matchesCriteria(c, 3, provider)).toBe(true);
+    expect(matchesCriteria(c, 4, provider)).toBe(false); // no group
+  });
+
+  it('returns false when the provider cannot resolve groups', () => {
+    const noGroups: LensDataProvider = { ...provider, getEntityGroups: undefined };
+    const c: LensCriteria = { type: 'group', groupName: 'Apt-01' };
+    expect(matchesCriteria(c, 1, noGroups)).toBe(false);
+  });
+});
+
 describe('matchesCriteria — property', () => {
   const provider = createMockProvider([
     {
@@ -339,5 +376,50 @@ describe('matchesCriteria — material', () => {
 
   it('should return false when materialName is missing', () => {
     expect(matchesCriteria({ type: 'material' }, 1, provider)).toBe(false);
+  });
+});
+
+describe('matchesCriteria — model', () => {
+  const entities = [
+    { id: 1, type: 'IfcWall', modelId: 'model-a' },
+    { id: 2, type: 'IfcSlab', modelId: 'model-a' },
+    { id: 3, type: 'IfcColumn', modelId: 'model-b' },
+  ];
+
+  function createModelProvider(includeGetModelId = true): LensDataProvider {
+    const entityMap = new Map(entities.map(e => [e.id, e]));
+    const provider: LensDataProvider = {
+      getEntityCount: () => entities.length,
+      forEachEntity: (cb) => {
+        for (const e of entities) cb(e.id, e.modelId);
+      },
+      getEntityType: (id) => entityMap.get(id)?.type,
+      getPropertyValue: () => undefined,
+      getPropertySets: () => [],
+    };
+    if (includeGetModelId) {
+      provider.getModelId = (id) => entityMap.get(id)?.modelId;
+    }
+    return provider;
+  }
+
+  it('should match entities from the specified model', () => {
+    const c: LensCriteria = { type: 'model', modelId: 'model-a' };
+    expect(matchesCriteria(c, 1, createModelProvider())).toBe(true);
+    expect(matchesCriteria(c, 2, createModelProvider())).toBe(true);
+  });
+
+  it('should not match entities from a different model', () => {
+    const c: LensCriteria = { type: 'model', modelId: 'model-a' };
+    expect(matchesCriteria(c, 3, createModelProvider())).toBe(false);
+  });
+
+  it('should return false when modelId is missing in criteria', () => {
+    expect(matchesCriteria({ type: 'model' }, 1, createModelProvider())).toBe(false);
+  });
+
+  it('should return false when provider omits getModelId', () => {
+    const c: LensCriteria = { type: 'model', modelId: 'model-a' };
+    expect(matchesCriteria(c, 1, createModelProvider(false))).toBe(false);
   });
 });

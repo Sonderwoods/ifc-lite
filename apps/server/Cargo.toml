@@ -15,16 +15,20 @@ categories = ["web-programming", "parsing"]
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["multipart", "tokio"] }
+axum = { version = "0.8", features = ["multipart", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "compression-gzip", "decompression-gzip"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit", "compression-gzip", "decompression-gzip", "catch-panic"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
 # IFC processing (workspace crates)
 ifc-lite-core = { path = "../../rust/core" }
-ifc-lite-geometry = { path = "../../rust/geometry" }
+# CSG runs on the pure-Rust exact kernel inside ifc-lite-geometry — same
+# kernel as the viewer's wasm build, no C++ cross-toolchain needed for any
+# triple (Manifold/BSP removed at M9; see
+# docs/architecture/pure-rust-csg-kernel.md).
+ifc-lite-geometry = { path = "../../rust/geometry", default-features = false }
 ifc-lite-processing = { path = "../../rust/processing" }
 
 # Parallelism
@@ -43,7 +47,7 @@ async-stream = "0.3"
 cacache = "13"
 
 # Hashing
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 # Logging
@@ -55,14 +59,14 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Fast hashing (for style index) - must match ifc-lite-geometry version
-rustc-hash = "1.1"
+rustc-hash = "2.1"
 
 # CPU count
 num_cpus = "1.16"
 
 # Parquet/Arrow for efficient binary serialization
-arrow = { version = "53", default-features = false, features = ["ipc"] }
-parquet = { version = "53", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 bytes = "1.5"
 
 # Compression/decompression
@@ -72,7 +76,9 @@ flate2 = "1.0"
 base64 = "0.22"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+# `util` feature pulls in `ServiceExt::oneshot` for in-process route tests.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "serialization"

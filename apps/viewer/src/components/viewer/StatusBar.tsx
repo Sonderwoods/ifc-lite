@@ -9,16 +9,29 @@ import { formatNumber, formatBytes } from '@/lib/utils';
 import { useViewerStore } from '@/store';
 import { useIfc } from '@/hooks/useIfc';
 import { useWebGPU } from '@/hooks/useWebGPU';
+import { FlavorIndicator } from '@/components/extensions/FlavorIndicator';
+import { FlavorDialog } from '@/components/extensions/FlavorDialog';
 
 export function StatusBar() {
   const { loading, geometryResult, ifcDataStore } = useIfc();
   const progress = useViewerStore((s) => s.progress);
   const error = useViewerStore((s) => s.error);
   const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
+  const activeStreamCanceller = useViewerStore((s) => s.activeStreamCanceller);
   const webgpu = useWebGPU();
 
   const [fps, setFps] = useState(60);
   const [memory, setMemory] = useState(0);
+  const [flavorDialogOpen, setFlavorDialogOpen] = useState(false);
+  /** Deep-link from Command Palette → "Manage flavors…". */
+  const flavorDialogRequested = useViewerStore((s) => s.flavorDialogRequested);
+  const setFlavorDialogRequested = useViewerStore((s) => s.setFlavorDialogRequested);
+  useEffect(() => {
+    if (flavorDialogRequested) {
+      setFlavorDialogOpen(true);
+      setFlavorDialogRequested(false);
+    }
+  }, [flavorDialogRequested, setFlavorDialogRequested]);
 
   // FPS counter (simplified)
   useEffect(() => {
@@ -108,6 +121,19 @@ export function StatusBar() {
         ) : (
           <span>Ready</span>
         )}
+        {/* Cancel button — only visible while a long-running stream
+            (LAS/LAZ/PLY/PCD/E57) is in flight. The loader hooks
+            register/clear the canceller around `await ingest.done`. */}
+        {activeStreamCanceller && (
+          <button
+            type="button"
+            onClick={() => activeStreamCanceller()}
+            className="px-2 py-0.5 rounded border border-destructive/40 text-destructive text-[10px] uppercase tracking-wider hover:bg-destructive hover:text-destructive-foreground transition-colors"
+            title="Cancel the active point cloud stream"
+          >
+            Cancel
+          </button>
+        )}
       </div>
 
       {/* Center: Model Stats */}
@@ -161,8 +187,26 @@ export function StatusBar() {
 
         <Separator orientation="vertical" className="h-3.5" />
 
+        <FlavorIndicator onClick={() => setFlavorDialogOpen(true)} />
+
+        <Separator orientation="vertical" className="h-3.5" />
+
         <span className="opacity-60">v{__APP_VERSION__}</span>
+
+        <Separator orientation="vertical" className="h-3.5" />
+
+        <a
+          href="https://ifclite.dev"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="opacity-60 hover:opacity-100 hover:text-primary transition-opacity"
+          aria-label="Visit ifclite.dev — about, docs, and packages"
+        >
+          ifclite.dev →
+        </a>
       </div>
+
+      <FlavorDialog open={flavorDialogOpen} onClose={() => setFlavorDialogOpen(false)} />
     </div>
   );
 }

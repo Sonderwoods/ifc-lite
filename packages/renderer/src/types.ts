@@ -50,25 +50,6 @@ export interface Mesh {
 }
 
 /**
- * Instanced geometry for GPU instancing
- * Groups identical geometries with different transforms
- */
-export interface InstancedMesh {
-  geometryId: number;
-  vertexBuffer: GPUBuffer;
-  indexBuffer: GPUBuffer;
-  indexCount: number;
-  instanceBuffer: GPUBuffer; // Storage buffer with instance data
-  instanceCount: number;
-  // Map expressId to instance index for picking
-  expressIdToInstanceIndex: Map<number, number>;
-  // Cached bind group for instanced rendering (avoids per-frame allocation)
-  bindGroup?: GPUBindGroup;
-  // Bounding box for frustum culling (optional)
-  bounds?: { min: [number, number, number]; max: [number, number, number] };
-}
-
-/**
  * Batched mesh - groups multiple meshes with same color into single draw call
  * Reduces draw calls from N meshes to ~100-500 batches
  *
@@ -87,13 +68,46 @@ export interface BatchedMesh {
   expressIds: number[];  // For picking - all expressIds in this batch
   bindGroup?: GPUBindGroup;
   uniformBuffer?: GPUBuffer;
-  // Bounding box for frustum culling (optional)
+  // Bounding box for frustum culling (optional) — WORLD space.
   bounds?: { min: [number, number, number]; max: [number, number, number] };
+  /** Per-batch local-frame origin: stored vertex positions are RELATIVE to it,
+   *  so this batch must be drawn with model = translate(origin) to land in world
+   *  space (world = origin + position). Keeps f32 vertex coords element-small at
+   *  building/georef scale (no fan collapse). [0,0,0] = absolute (legacy). */
+  origin?: [number, number, number];
 }
 
 // Section plane for clipping
 // Semantic axis names: down (Y), front (Z), side (X) for intuitive user experience
 export type SectionPlaneAxis = 'down' | 'front' | 'side';
+
+export type SectionCapHatchId =
+  | 'solid'
+  | 'diagonal'
+  | 'crossHatch'
+  | 'horizontal'
+  | 'vertical'
+  | 'concrete'
+  | 'brick'
+  | 'insulation';
+
+export interface SectionCapStyleOptions {
+  /** Fill colour behind the hatch. RGBA 0-1. */
+  fillColor?: [number, number, number, number];
+  /** Hatch stroke colour. RGBA 0-1. */
+  strokeColor?: [number, number, number, number];
+  /** Hatch pattern id. */
+  pattern?: SectionCapHatchId;
+  /** Spacing between hatch lines, in screen pixels. */
+  spacingPx?: number;
+  /** Primary angle in radians. */
+  angleRad?: number;
+  /** Line width in pixels. */
+  widthPx?: number;
+  /** Secondary angle (cross-hatch). */
+  secondaryAngleRad?: number;
+}
+
 export interface SectionPlane {
   axis: SectionPlaneAxis;
   position: number; // 0-100 percentage of model bounds
@@ -101,6 +115,24 @@ export interface SectionPlane {
   flipped?: boolean; // If true, show the opposite side of the cut
   min?: number;      // Optional override for min range value
   max?: number;      // Optional override for max range value
+  /** If true (default), render filled cap surfaces with a screen-space hatch. */
+  showCap?: boolean;
+  /**
+   * If true (default), draw polygon outlines on the cut surfaces. Users
+   * can turn surfaces and outlines on/off independently from the UI.
+   */
+  showOutlines?: boolean;
+  /** Override the default cap appearance. */
+  capStyle?: SectionCapStyleOptions;
+  /**
+   * Optional world-space plane normal (unit vector). When provided
+   * together with `distance`, the shader clip uses them verbatim and
+   * ignores `axis`, `position`, `min`, `max`, and any `buildingRotation`.
+   * Used for face-pick / arbitrary slice planes (issue #243).
+   */
+  normal?: [number, number, number];
+  /** Plane offset in world units: `dot(pointOnPlane, normal)`. */
+  distance?: number;
 }
 
 export type ContactShadingQuality = 'off' | 'low' | 'high';
@@ -127,6 +159,12 @@ export interface VisualEnhancementOptions {
 
 export interface RenderOptions {
   clearColor?: [number, number, number, number];
+  /**
+   * Global lighting environment (sun direction/colour, hemisphere ambient,
+   * exposure, procedural sky). Omitted/empty reproduces the legacy hardcoded
+   * look exactly. See {@link import('./environment.js').LightingEnvironment}.
+   */
+  environment?: import('./environment.js').LightingEnvironment;
   enableDepthTest?: boolean;
   enableFrustumCulling?: boolean;
   spatialIndex?: import('@ifc-lite/spatial').SpatialIndex;
@@ -135,6 +173,26 @@ export interface RenderOptions {
   isolatedIds?: Set<number> | null; // Only show these meshes (null = show all)
   selectedId?: number | null;     // Currently selected mesh (for highlighting)
   selectedIds?: Set<number>;      // Multi-selection support
+  /**
+   * Per-frame alpha overrides — primary use case is X-Ray mode.
+   *
+   * Map<expressId, alpha 0..1>. Non-selected meshes/batches whose expressId
+   * appears in this map render at the override alpha through the transparent
+   * pipeline. Selected meshes (`selectedId` / `selectedIds`) are exempt at
+   * every site, so highlights always paint with their own alpha.
+   *
+   * Mixed batches (some entries overridden, some not) take the minimum
+   * override alpha across non-selected ids; selected meshes in the batch
+   * are then redrawn on top by the highlight pass.
+   *
+   * The renderer snapshots this map at frame start, so callers may freely
+   * mutate or recycle their copy after `render()` returns.
+   *
+   * Note: alphas `>= 0.99` are treated as opaque (the cutoff for switching to
+   * the transparent pipeline). Entries at or above that threshold are no-ops
+   * — keep them out of the map to avoid unnecessary work.
+   */
+  transparencyOverrides?: Map<number, number> | null;
   // Building rotation in radians (from IfcSite placement) - used to orient section planes
   buildingRotation?: number;
   selectedModelIndex?: number;    // Model index for multi-model selection (must match mesh.modelIndex)
@@ -147,10 +205,19 @@ export interface RenderOptions {
   visualEnhancement?: VisualEnhancementOptions;
   // Streaming state
   isStreaming?: boolean;          // If true, skip expensive operations like picker
-  // When true, skips the post-processing pass (contact shading / separation lines)
-  // for faster frame times during rapid camera movement (zoom, orbit, pan).
-  // The post-processing is restored automatically on the next non-interacting frame.
+  // True during rapid camera movement (zoom, orbit, pan, animations).
+  // Post effects (contact shading / separation lines) KEEP RUNNING during
+  // interaction as long as the measured frame cadence holds; on GPUs that
+  // miss frames the renderer adaptively degrades to skipping the post pass
+  // for the rest of the gesture (see InteractionEffectsGovernor). Full
+  // quality is always restored on the next non-interacting frame.
   isInteracting?: boolean;
+  // The app's own intentional cap on continuous render cadence in ms
+  // (e.g. the large-model interaction throttle). When set, the effects
+  // governor judges missed frames against this slower schedule instead of
+  // the display refresh — a deliberately throttled 33ms cadence is not a
+  // GPU miss.
+  interactionFrameIntervalMs?: number;
 }
 
 /**
@@ -172,4 +239,11 @@ export interface PickOptions {
 export interface PickResult {
   expressId: number;
   modelIndex?: number;  // Index of the model this entity belongs to
+  /**
+   * World-space XYZ of the picked surface point. Optional because the
+   * pick path can skip depth readback for callers that only need the
+   * entityId (e.g. selection state). Recovered by sampling the pick
+   * pass's depth texture at the click position and unprojecting.
+   */
+  worldXYZ?: { x: number; y: number; z: number };
 }

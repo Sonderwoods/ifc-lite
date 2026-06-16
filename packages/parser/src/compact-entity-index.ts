@@ -14,6 +14,7 @@
  */
 
 import type { EntityRef } from './types.js';
+import { yieldToEventLoop } from './yield-to-event-loop.js';
 
 /**
  * Compact read-only entity index backed by sorted typed arrays.
@@ -236,20 +237,6 @@ export class CompactEntityIndex {
   }
 }
 
-function yieldToEventLoop(): Promise<void> {
-  const maybeScheduler = (globalThis as typeof globalThis & {
-    scheduler?: { yield?: () => Promise<void> };
-  }).scheduler;
-  if (typeof maybeScheduler?.yield === 'function') {
-    return maybeScheduler.yield();
-  }
-  return new Promise<void>((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => resolve();
-    channel.port2.postMessage(null);
-  });
-}
-
 /**
  * Incrementally build a CompactEntityIndex without a temporary array of objects.
  *
@@ -426,7 +413,16 @@ export async function buildCompactEntityIndexAsync(
   entityRefs: EntityRef[],
   lruMaxSize?: number,
   chunkSize: number = 8192,
-  budgetMs: number = 8,
+  // Phase 3c: 8ms was the previous default but caused the parser tail
+  // to balloon under stream-time contention. Each yield under load
+  // costs 10-50ms wall-clock (event-loop backlogged with geometry
+  // batches), and 1700 yields × 4ms avg = 6.5s of pure overhead
+  // (measured: compact entity index 196ms uncontended → 6700ms
+  // contended). 50ms budget cuts yields to ~270 → ~1s overhead, saving
+  // ~5s on the parser path. Trade-off: parser worker briefly
+  // unresponsive between yields, but it's a worker thread so this only
+  // affects message processing back to main, which is buffered anyway.
+  budgetMs: number = 50,
 ): Promise<CompactEntityIndex> {
   const count = entityRefs.length;
   let chunkStart = performance.now();

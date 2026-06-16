@@ -22,6 +22,12 @@ export enum IfcTypeEnum {
   IfcRailway = 65,
   IfcRailwayPart = 66,
   IfcMarineFacility = 67,
+  // IfcSpatialZone is a spatial structure element (modelled GFA volumes);
+  // IfcZone is a grouping (IfcSystem) of spaces/zones. Ids are above the
+  // current max to avoid colliding with platform-variant func_elem indices
+  // stripped by the wasm-free typecheck lane (#1002) — added for #1075.
+  IfcSpatialZone = 317,
+  IfcZone = 318,
 
   // Building elements
   IfcWall = 10,
@@ -84,6 +90,31 @@ export enum IfcTypeEnum {
   IfcTransportElement = 56,
   IfcCivilElement = 57,
   IfcGeographicElement = 58,
+
+  // IFC4x3 infrastructure leaves (issue with AB22.ifc, the railway fixture,
+  // and any other infrastructure model — pre-fix every IfcCourse / IfcPavement
+  // / IfcSignal / IfcReferent showed up as "Unknown" in the properties panel
+  // even though the Rust geometry pipeline correctly identified the type).
+  IfcCourse = 70,
+  IfcPavement = 71,
+  IfcKerb = 72,
+  IfcMooringDevice = 73,
+  IfcNavigationElement = 74,
+  IfcTrackElement = 75,
+  IfcVehicle = 76,
+  IfcEarthworksElement = 77,
+  IfcEarthworksFill = 78,
+  IfcEarthworksCut = 79,
+  IfcReferent = 80,
+  IfcSign = 81,
+  IfcSignal = 82,
+  IfcGeotechnicalStratum = 83,
+  IfcGeotechnicalAssembly = 84,
+  IfcSolidStratum = 85,
+  IfcVoidStratum = 86,
+  IfcWaterStratum = 87,
+  IfcPositioningElement = 88,
+  IfcAlignment = 89,
 
   // Relationships
   IfcRelContainedInSpatialStructure = 100,
@@ -217,6 +248,8 @@ const TYPE_STRING_TO_ENUM = new Map<string, IfcTypeEnum>([
   ['IFCBUILDING', IfcTypeEnum.IfcBuilding],
   ['IFCBUILDINGSTOREY', IfcTypeEnum.IfcBuildingStorey],
   ['IFCSPACE', IfcTypeEnum.IfcSpace],
+  ['IFCSPATIALZONE', IfcTypeEnum.IfcSpatialZone],
+  ['IFCZONE', IfcTypeEnum.IfcZone],
   ['IFCFACILITY', IfcTypeEnum.IfcFacility],
   ['IFCFACILITYPART', IfcTypeEnum.IfcFacilityPart],
   ['IFCBRIDGE', IfcTypeEnum.IfcBridge],
@@ -294,6 +327,27 @@ const TYPE_STRING_TO_ENUM = new Map<string, IfcTypeEnum>([
   ['IFCTRANSPORTELEMENT', IfcTypeEnum.IfcTransportElement],
   ['IFCCIVILELEMENT', IfcTypeEnum.IfcCivilElement],
   ['IFCGEOGRAPHICELEMENT', IfcTypeEnum.IfcGeographicElement],
+  // IFC4x3 infrastructure leaves
+  ['IFCCOURSE', IfcTypeEnum.IfcCourse],
+  ['IFCPAVEMENT', IfcTypeEnum.IfcPavement],
+  ['IFCKERB', IfcTypeEnum.IfcKerb],
+  ['IFCMOORINGDEVICE', IfcTypeEnum.IfcMooringDevice],
+  ['IFCNAVIGATIONELEMENT', IfcTypeEnum.IfcNavigationElement],
+  ['IFCTRACKELEMENT', IfcTypeEnum.IfcTrackElement],
+  ['IFCVEHICLE', IfcTypeEnum.IfcVehicle],
+  ['IFCEARTHWORKSELEMENT', IfcTypeEnum.IfcEarthworksElement],
+  ['IFCEARTHWORKSFILL', IfcTypeEnum.IfcEarthworksFill],
+  ['IFCEARTHWORKSCUT', IfcTypeEnum.IfcEarthworksCut],
+  ['IFCREFERENT', IfcTypeEnum.IfcReferent],
+  ['IFCSIGN', IfcTypeEnum.IfcSign],
+  ['IFCSIGNAL', IfcTypeEnum.IfcSignal],
+  ['IFCGEOTECHNICALSTRATUM', IfcTypeEnum.IfcGeotechnicalStratum],
+  ['IFCGEOTECHNICALASSEMBLY', IfcTypeEnum.IfcGeotechnicalAssembly],
+  ['IFCSOLIDSTRATUM', IfcTypeEnum.IfcSolidStratum],
+  ['IFCVOIDSTRATUM', IfcTypeEnum.IfcVoidStratum],
+  ['IFCWATERSTRATUM', IfcTypeEnum.IfcWaterStratum],
+  ['IFCPOSITIONINGELEMENT', IfcTypeEnum.IfcPositioningElement],
+  ['IFCALIGNMENT', IfcTypeEnum.IfcAlignment],
   // Relationships
   ['IFCRELCONTAINEDINSPATIALSTRUCTURE', IfcTypeEnum.IfcRelContainedInSpatialStructure],
   ['IFCRELAGGREGATES', IfcTypeEnum.IfcRelAggregates],
@@ -344,6 +398,8 @@ const TYPE_ENUM_TO_STRING = new Map<IfcTypeEnum, string>([
   [IfcTypeEnum.IfcBuilding, 'IfcBuilding'],
   [IfcTypeEnum.IfcBuildingStorey, 'IfcBuildingStorey'],
   [IfcTypeEnum.IfcSpace, 'IfcSpace'],
+  [IfcTypeEnum.IfcSpatialZone, 'IfcSpatialZone'],
+  [IfcTypeEnum.IfcZone, 'IfcZone'],
   [IfcTypeEnum.IfcFacility, 'IfcFacility'],
   [IfcTypeEnum.IfcFacilityPart, 'IfcFacilityPart'],
   [IfcTypeEnum.IfcBridge, 'IfcBridge'],
@@ -408,6 +464,27 @@ const TYPE_ENUM_TO_STRING = new Map<IfcTypeEnum, string>([
   [IfcTypeEnum.IfcTransportElement, 'IfcTransportElement'],
   [IfcTypeEnum.IfcCivilElement, 'IfcCivilElement'],
   [IfcTypeEnum.IfcGeographicElement, 'IfcGeographicElement'],
+  // IFC4x3 infrastructure leaves
+  [IfcTypeEnum.IfcCourse, 'IfcCourse'],
+  [IfcTypeEnum.IfcPavement, 'IfcPavement'],
+  [IfcTypeEnum.IfcKerb, 'IfcKerb'],
+  [IfcTypeEnum.IfcMooringDevice, 'IfcMooringDevice'],
+  [IfcTypeEnum.IfcNavigationElement, 'IfcNavigationElement'],
+  [IfcTypeEnum.IfcTrackElement, 'IfcTrackElement'],
+  [IfcTypeEnum.IfcVehicle, 'IfcVehicle'],
+  [IfcTypeEnum.IfcEarthworksElement, 'IfcEarthworksElement'],
+  [IfcTypeEnum.IfcEarthworksFill, 'IfcEarthworksFill'],
+  [IfcTypeEnum.IfcEarthworksCut, 'IfcEarthworksCut'],
+  [IfcTypeEnum.IfcReferent, 'IfcReferent'],
+  [IfcTypeEnum.IfcSign, 'IfcSign'],
+  [IfcTypeEnum.IfcSignal, 'IfcSignal'],
+  [IfcTypeEnum.IfcGeotechnicalStratum, 'IfcGeotechnicalStratum'],
+  [IfcTypeEnum.IfcGeotechnicalAssembly, 'IfcGeotechnicalAssembly'],
+  [IfcTypeEnum.IfcSolidStratum, 'IfcSolidStratum'],
+  [IfcTypeEnum.IfcVoidStratum, 'IfcVoidStratum'],
+  [IfcTypeEnum.IfcWaterStratum, 'IfcWaterStratum'],
+  [IfcTypeEnum.IfcPositioningElement, 'IfcPositioningElement'],
+  [IfcTypeEnum.IfcAlignment, 'IfcAlignment'],
   // Relationships
   [IfcTypeEnum.IfcRelContainedInSpatialStructure, 'IfcRelContainedInSpatialStructure'],
   [IfcTypeEnum.IfcRelAggregates, 'IfcRelAggregates'],
@@ -457,4 +534,17 @@ export function IfcTypeEnumFromString(str: string): IfcTypeEnum {
 
 export function IfcTypeEnumToString(type: IfcTypeEnum): string {
   return TYPE_ENUM_TO_STRING.get(type) ?? 'Unknown';
+}
+
+export type IfcAttributeValue =
+  | string
+  | number
+  | boolean
+  | null
+  | IfcAttributeValue[];
+
+export interface IfcEntity {
+  expressId: number;
+  type: string;
+  attributes: IfcAttributeValue[];
 }

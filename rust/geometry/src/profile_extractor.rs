@@ -18,12 +18,28 @@
 //! Lengths are in metres (unit scale applied).
 
 use crate::profiles::ProfileProcessor;
-use crate::{Error, Point3, Result, Vector3};
+use crate::{Error, Point3, Result, TessellationQuality, Vector3};
 use ifc_lite_core::{
     build_entity_index, AttributeValue, DecodedEntity, EntityDecoder, EntityScanner, IfcSchema,
     IfcType,
 };
 use nalgebra::Matrix4;
+
+/// Whether `t` should be picked up by the constant-profile 2D drawing
+/// extractor.
+///
+/// `IfcExtrudedAreaSolidTapered` is intentionally **not** included here even
+/// though it is a subtype of `IfcExtrudedAreaSolid`: this extractor stores a
+/// single outer polygon, and a tapered solid has two distinct cross sections
+/// (`SweptArea` and `EndSweptArea`). Treating it as constant would draw the
+/// start profile only and silently under-report the element footprint. Until
+/// `ExtractedProfile` can carry both profiles (or their union/hull), tapered
+/// solids skip this path; their 3D mesh is still rendered by
+/// `ExtrudedAreaSolidTaperedProcessor`. Tracked as a follow-up to #628.
+#[inline]
+fn is_extruded_area_solid(t: IfcType) -> bool {
+    matches!(t, IfcType::IfcExtrudedAreaSolid)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PUBLIC TYPES
@@ -66,7 +82,11 @@ pub struct ExtractedProfile {
 /// Extracts `IfcExtrudedAreaSolid` representations, including those nested
 /// inside `IfcMappedItem` chains (up to 3 levels deep).
 /// Returns an empty `Vec` for models with no such elements.
-pub fn extract_profiles(content: &str, model_index: u32) -> Vec<ExtractedProfile> {
+pub fn extract_profiles<T>(content: &T, model_index: u32) -> Vec<ExtractedProfile>
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    let content = content.as_ref();
     let entity_index = build_entity_index(content);
     let mut decoder = EntityDecoder::with_index(content, entity_index);
 
@@ -88,6 +108,17 @@ pub fn extract_profiles(content: &str, model_index: u32) -> Vec<ExtractedProfile
             Ok(e) => e,
             Err(_) => continue,
         };
+
+        // Issue #979: feature elements (IfcOpeningElement and the rest of the
+        // void/feature family) are boolean subtraction/addition operands, not
+        // building structure — they must never emit a construction-projection
+        // profile. `is_subtype_of` walks the supertype chain, so this single
+        // check covers Opening / Voiding / Earthworks / Projection / Surface
+        // features without touching IfcDoor/IfcWindow (which descend from
+        // IfcBuiltElement, not IfcFeatureElement).
+        if entity.ifc_type.is_subtype_of(IfcType::IfcFeatureElement) {
+            continue;
+        }
 
         // ObjectPlacement (attr 5) → element world transform (IFC Z-up, native units)
         let element_transform = get_placement_transform(entity.get(5), &mut decoder);
@@ -139,7 +170,7 @@ pub fn extract_profiles(content: &str, model_index: u32) -> Vec<ExtractedProfile
             };
 
             for item in &items {
-                if item.ifc_type == IfcType::IfcExtrudedAreaSolid {
+                if is_extruded_area_solid(item.ifc_type) {
                     match extract_extruded_solid(
                         id,
                         &ifc_type_name,
@@ -253,7 +284,7 @@ fn extract_mapped_item_profiles(
     };
 
     for sub_item in &items {
-        if sub_item.ifc_type == IfcType::IfcExtrudedAreaSolid {
+        if is_extruded_area_solid(sub_item.ifc_type) {
             match extract_extruded_solid(
                 element_id,
                 ifc_type,
@@ -358,7 +389,10 @@ fn extract_extruded_solid(
     let profile_entity = decoder
         .resolve_ref(profile_attr)?
         .ok_or_else(|| Error::geometry("Failed to resolve SweptArea"))?;
-    let profile = profile_processor.process(&profile_entity, decoder)?;
+    // Profile extraction feeds 2D drawing projection, not the tessellation-quality
+    // render path; sample at the historical default.
+    let profile =
+        profile_processor.process(&profile_entity, decoder, TessellationQuality::Medium)?;
 
     if profile.outer.is_empty() {
         return Err(Error::geometry("empty profile"));
@@ -685,7 +719,7 @@ fn convert_ifc_to_webgl(m: &Matrix4<f64>) -> [f32; 16] {
 }
 
 /// Detect the IFC length unit scale factor from IFCPROJECT.
-fn detect_unit_scale(content: &str, decoder: &mut EntityDecoder) -> f64 {
+fn detect_unit_scale(content: &[u8], decoder: &mut EntityDecoder) -> f64 {
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, _, _)) = scanner.next_entity() {
         if type_name == "IFCPROJECT" {

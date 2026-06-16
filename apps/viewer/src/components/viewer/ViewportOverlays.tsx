@@ -8,24 +8,18 @@ import {
   ZoomIn,
   ZoomOut,
   Layers,
-  Globe2,
-  Mountain,
-  Building2,
-  Satellite,
-  X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store';
-import type { CesiumDataSource } from '@/store/slices/cesiumSlice';
 import { goHomeFromStore } from '@/store/homeView';
 import { useIfc } from '@/hooks/useIfc';
 import { cn } from '@/lib/utils';
-import { isTauri } from '@/lib/platform';
-
-const isDesktop = isTauri();
 import { ViewCube, type ViewCubeRef } from './ViewCube';
 import { AxisHelper, type AxisHelperRef } from './AxisHelper';
+import { BasepointOverlay } from './BasepointOverlay';
+import { PointCloudPanel } from './PointCloudPanel';
+import { Crosshair } from 'lucide-react';
 
 export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: boolean } = {}) {
   const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
@@ -33,17 +27,13 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
   const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
   const basketPresentationVisible = useViewerStore((s) => s.basketPresentationVisible);
   const cameraCallbacks = useViewerStore((s) => s.cameraCallbacks);
+  const isMobile = useViewerStore((s) => s.isMobile);
   const setOnCameraRotationChange = useViewerStore((s) => s.setOnCameraRotationChange);
   const setOnScaleChange = useViewerStore((s) => s.setOnScaleChange);
   const { ifcDataStore, geometryResult } = useIfc();
 
   // Cesium state
   const cesiumEnabled = useViewerStore((s) => s.cesiumEnabled);
-  const cesiumDataSource = useViewerStore((s) => s.cesiumDataSource);
-  const setCesiumDataSource = useViewerStore((s) => s.setCesiumDataSource);
-  const cesiumTerrainEnabled = useViewerStore((s) => s.cesiumTerrainEnabled);
-  const setCesiumTerrainEnabled = useViewerStore((s) => s.setCesiumTerrainEnabled);
-  const toggleCesium = useViewerStore((s) => s.toggleCesium);
 
   // Use refs for rotation to avoid re-renders - ViewCube updates itself directly
   const cameraRotationRef = useRef({ azimuth: 45, elevation: 25 });
@@ -149,21 +139,22 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
 
   return (
     <>
-      {/* Bottom-right: Cesium settings overlay OR Navigation controls (Cesium is web-only) */}
-      {cesiumEnabled && !isDesktop ? (
-        <CesiumSettingsOverlay
-          dataSource={cesiumDataSource}
-          onDataSourceChange={setCesiumDataSource}
-          terrainEnabled={cesiumTerrainEnabled}
-          onTerrainChange={setCesiumTerrainEnabled}
-          onClose={toggleCesium}
-        />
-      ) : (
-        <div className="absolute bottom-4 right-4 flex flex-col gap-1 bg-background/80 backdrop-blur-sm rounded-lg border shadow-sm p-1">
+      <PointCloudPanelMount />
+      {/* Bottom-right: Navigation controls (hidden when Cesium active — Cesium is web-only) */}
+      {!cesiumEnabled && (
+        <div
+          className={cn(
+            'absolute flex flex-col gap-1 bg-background/90 backdrop-blur-sm border p-1',
+            // Mobile: bottom-left at ~15% up from lower edge — thumb-reachable on
+            // portrait phones and well clear of the URL bar. Tight radii + flat
+            // background match the codebase's brutalist panel-chrome vocabulary.
+            isMobile ? 'left-4 bottom-[15%] rounded-md' : 'bottom-4 right-4 rounded-lg shadow-sm',
+          )}
+        >
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" onClick={handleHome}>
-                <Home className="h-4 w-4" />
+              <Button variant="ghost" size="icon-sm" className={cn(isMobile && 'min-h-[44px] min-w-[44px]')} onClick={handleHome}>
+                <Home className={cn(isMobile ? 'h-5 w-5' : 'h-4 w-4')} />
               </Button>
             </TooltipTrigger>
             <TooltipContent side="left">Home (H)</TooltipContent>
@@ -171,8 +162,8 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
 
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" onClick={handleZoomIn}>
-                <ZoomIn className="h-4 w-4" />
+              <Button variant="ghost" size="icon-sm" className={cn(isMobile && 'min-h-[44px] min-w-[44px]')} onClick={handleZoomIn}>
+                <ZoomIn className={cn(isMobile ? 'h-5 w-5' : 'h-4 w-4')} />
               </Button>
             </TooltipTrigger>
             <TooltipContent side="left">Zoom In (+)</TooltipContent>
@@ -180,8 +171,8 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
 
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" onClick={handleZoomOut}>
-                <ZoomOut className="h-4 w-4" />
+              <Button variant="ghost" size="icon-sm" className={cn(isMobile && 'min-h-[44px] min-w-[44px]')} onClick={handleZoomOut}>
+                <ZoomOut className={cn(isMobile ? 'h-5 w-5' : 'h-4 w-4')} />
               </Button>
             </TooltipTrigger>
             <TooltipContent side="left">Zoom Out (-)</TooltipContent>
@@ -189,17 +180,17 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
         </div>
       )}
 
-      {/* Context Info (bottom-center) - Storey names */}
+      {/* Context Info — Storey names. Top-center on mobile (URL bar steals the bottom). */}
       {storeyNames && storeyNames.length > 0 && (
         <div className={cn(
           'absolute left-1/2 -translate-x-1/2 px-4 py-2 bg-background/80 backdrop-blur-sm rounded-full border shadow-sm',
-          basketPresentationVisible ? 'bottom-28' : 'bottom-4',
+          isMobile ? 'top-4' : basketPresentationVisible ? 'bottom-28' : 'bottom-4',
         )}>
           <div className="flex items-center gap-2 text-sm">
             <Layers className="h-4 w-4 text-primary" />
             <span className="font-medium">
-              {storeyNames.length === 1 
-                ? storeyNames[0] 
+              {storeyNames.length === 1
+                ? storeyNames[0]
                 : `${storeyNames.length} storeys`}
             </span>
           </div>
@@ -219,98 +210,73 @@ export function ViewportOverlays({ hideViewCube = false }: { hideViewCube?: bool
         </div>
       )}
 
-      {/* Axis Helper (bottom-left, above scale bar) - IFC Z-up convention */}
-      <div className="absolute bottom-16 left-4">
-        <AxisHelper
-          ref={axisHelperRef}
-          rotationX={initialRotationX}
-          rotationY={initialRotationY}
-        />
-      </div>
+      {/* Basepoint toggle + Axis Helper + Scale Bar — desktop only; mobile keeps the viewport unobstructed */}
+      {!isMobile && (
+        <div className="absolute bottom-4 left-4 flex flex-col-reverse items-start gap-3">
+          <div className="flex flex-col items-start gap-1">
+            <div className="h-1 w-24 bg-foreground/80 rounded-full" />
+            <span className="text-xs text-foreground/80">{formatScale(scale)}</span>
+          </div>
+          <AxisHelper
+            ref={axisHelperRef}
+            rotationX={initialRotationX}
+            rotationY={initialRotationY}
+          />
+          <BasepointToggleButton />
+        </div>
+      )}
 
-      {/* Scale Bar (bottom-left) */}
-      <div className="absolute bottom-4 left-4 flex flex-col items-start gap-1">
-        <div className="h-1 w-24 bg-foreground/80 rounded-full" />
-        <span className="text-xs text-foreground/80">{formatScale(scale)}</span>
-      </div>
+      {/* Per-model IFC (0,0,0) markers — toggled via BasepointToggleButton.
+          Hidden by default; component returns null when the toggle is off. */}
+      <BasepointOverlay />
     </>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/*  Cesium Settings Overlay — replaces nav controls when Cesium is on  */
-/* ------------------------------------------------------------------ */
-
-const DATA_SOURCES: { value: CesiumDataSource; label: string; icon: typeof Globe2 }[] = [
-  { value: 'google-photorealistic', label: 'Google 3D', icon: Globe2 },
-  { value: 'osm-buildings', label: 'OSM', icon: Building2 },
-  { value: 'bing-aerial', label: 'Aerial', icon: Satellite },
-];
-
-function CesiumSettingsOverlay({
-  dataSource,
-  onDataSourceChange,
-  terrainEnabled,
-  onTerrainChange,
-  onClose,
-}: {
-  dataSource: CesiumDataSource;
-  onDataSourceChange: (ds: CesiumDataSource) => void;
-  terrainEnabled: boolean;
-  onTerrainChange: (enabled: boolean) => void;
-  onClose: () => void;
-}) {
+/**
+ * Toggle for the per-model IFC-origin overlay. Sits next to the AxisHelper so
+ * it's discoverable in the same "scene reference" cluster.
+ */
+function BasepointToggleButton() {
+  const showModelBasepoints = useViewerStore((s) => s.showModelBasepoints);
+  const toggleShowModelBasepoints = useViewerStore((s) => s.toggleShowModelBasepoints);
+  const modelCount = useViewerStore((s) => s.models.size);
+  if (modelCount === 0) return null;
   return (
-    <div className="absolute bottom-4 right-4 z-10 pointer-events-auto bg-background/90 backdrop-blur-sm rounded-lg border shadow-lg p-2 flex flex-col gap-2 min-w-[160px]">
-      {/* Header */}
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          3D World
-        </span>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon-sm" className="h-5 w-5" onClick={onClose}>
-              <X className="h-3 w-3" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="left">Disable Cesium overlay</TooltipContent>
-        </Tooltip>
-      </div>
-
-      {/* Data Source Buttons */}
-      <div className="flex flex-col gap-0.5">
-        {DATA_SOURCES.map((ds) => {
-          const Icon = ds.icon;
-          const active = dataSource === ds.value;
-          return (
-            <button
-              key={ds.value}
-              onClick={() => onDataSourceChange(ds.value)}
-              className={cn(
-                'flex items-center gap-2 px-2 py-1.5 rounded text-xs transition-colors text-left',
-                active
-                  ? 'bg-teal-600 text-white'
-                  : 'hover:bg-muted text-foreground/80',
-              )}
-            >
-              <Icon className="h-3.5 w-3.5 shrink-0" />
-              {ds.label}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Terrain Toggle */}
-      <label className="flex items-center gap-2 px-2 py-1 cursor-pointer border-t border-border pt-2">
-        <Mountain className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-        <span className="text-xs text-foreground/80">Terrain</span>
-        <input
-          type="checkbox"
-          checked={terrainEnabled}
-          onChange={(e) => onTerrainChange(e.target.checked)}
-          className="ml-auto accent-teal-500"
-        />
-      </label>
-    </div>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          onClick={toggleShowModelBasepoints}
+          aria-label={showModelBasepoints ? 'Hide model basepoints' : 'Show model basepoints'}
+          className={cn(
+            'h-6 w-6 inline-flex items-center justify-center border transition-colors',
+            showModelBasepoints
+              ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+              : 'border-zinc-300 dark:border-zinc-700 bg-white/80 dark:bg-zinc-900/80 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800',
+          )}
+          aria-pressed={showModelBasepoints}
+        >
+          <Crosshair className="h-3 w-3" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" className="text-xs">
+        {showModelBasepoints ? 'Hide model basepoints' : 'Show model basepoints (IFC 0,0,0)'}
+      </TooltipContent>
+    </Tooltip>
   );
+}
+
+
+/**
+ * Tiny indirection so the panel can subscribe to its own slice without
+ * pulling extra state into the parent overlay component.
+ */
+function PointCloudPanelMount() {
+  const count = useViewerStore((s) => s.pointCloudAssetCount);
+  // Triangle total comes from the merged geometry result. The panel
+  // gates the BIM↔scan deviation compute button on triangleCount > 0
+  // so the user can't trigger an empty-BVH compute pass.
+  const triangleCount = useViewerStore((s) => s.geometryResult?.totalTriangles ?? 0);
+  return <PointCloudPanel assetCount={count} triangleCount={triangleCount} />;
 }

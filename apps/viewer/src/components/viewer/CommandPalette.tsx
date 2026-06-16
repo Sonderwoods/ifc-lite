@@ -24,6 +24,7 @@ import {
   Home,
   Maximize2,
   Crosshair,
+  GitCompareArrows,
   ArrowUp,
   ArrowDown,
   ArrowLeft,
@@ -44,6 +45,7 @@ import {
   ClipboardCheck,
   FileSpreadsheet,
   Palette,
+  Puzzle,
   Camera,
   Download,
   FileJson,
@@ -53,9 +55,21 @@ import {
   FolderOpen,
   Clock,
   Save,
+  CalendarClock,
+  CalendarPlus,
+  Sparkles,
+  Eraser,
+  MapPin,
+  Pencil,
+  PenLine,
+  Slice,
+  Layers3,
+  SquareStack,
+  ChevronsUpDown,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useViewerStore } from '@/store';
+import { applyLevelDisplayMode } from '@/store/levelDisplay';
 import { goHomeFromStore, resetVisibilityForHomeFromStore } from '@/store/homeView';
 import {
   executeBasketSet,
@@ -66,11 +80,17 @@ import {
   executeBasketClear,
 } from '@/store/basket/basketCommands';
 import { useSandbox } from '@/hooks/useSandbox';
+import { useSlotContributions } from '@/hooks/useSlotContributions';
+import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
+import { resolveExtensionIcon } from '@/components/extensions/icon-registry';
+import type { CommandContribution } from '@ifc-lite/extensions';
+import { toast as paletteToast } from '@/components/ui/toast';
 import { SCRIPT_TEMPLATES } from '@/lib/scripts/templates';
 import { GLTFExporter, CSVExporter } from '@ifc-lite/export';
 import { getRecentFiles, formatFileSize, getCachedFile } from '@/lib/recent-files';
 import type { RecentFileEntry } from '@/lib/recent-files';
 import { closeActiveAnalysisExtension } from '@/services/analysis-extensions';
+import { describeRunCommandError } from '@/services/extensions/runtime-errors';
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -83,7 +103,8 @@ type Category =
   | 'Panels'
   | 'Export'
   | 'Automation'
-  | 'Preferences';
+  | 'Preferences'
+  | 'Extensions';
 
 interface Command {
   id: string;
@@ -180,50 +201,58 @@ function downloadBlob(data: BlobPart, name: string, mime: string) {
   URL.revokeObjectURL(url);
 }
 
-/** Exclusively activate a right-panel content panel (BCF / IDS / Lens).
+/** Exclusively activate a right-panel content panel (BCF / IDS / Lens / Extensions).
  *  Closes all others first so the if-else chain in ViewerLayout renders it.
  *  If the target is already active, closes it (back to Properties). */
-function activateRightPanel(panel: 'bcf' | 'ids' | 'lens') {
+
+function activateRightPanel(panel: 'bcf' | 'ids' | 'lens' | 'clash' | 'compare' | 'extensions') {
   const s = useViewerStore.getState();
   const isActive =
     panel === 'bcf' ? s.bcfPanelVisible :
     panel === 'ids' ? s.idsPanelVisible :
+    panel === 'clash' ? s.clashPanelVisible :
+    panel === 'compare' ? s.comparePanelVisible :
+    panel === 'extensions' ? s.extensionsPanelVisible :
     s.lensPanelVisible;
 
   closeActiveAnalysisExtension();
 
-  // Close all content panels
-  s.setBcfPanelVisible(false);
-  s.setIdsPanelVisible(false);
-  s.setLensPanelVisible(false);
-
-  if (!isActive) {
-    // Open the target, expand right panel
-    s.setRightPanelCollapsed(false);
-    if (panel === 'bcf') s.setBcfPanelVisible(true);
-    else if (panel === 'ids') s.setIdsPanelVisible(true);
-    else s.setLensPanelVisible(true);
+  if (isActive) {
+    // Toggle off → close it (and the rest of the group) → falls back to Properties.
+    s.setBcfPanelVisible(false);
+    s.setIdsPanelVisible(false);
+    s.setLensPanelVisible(false);
+    s.setClashPanelVisible(false);
+    s.setComparePanelVisible(false);
+    s.setExtensionsPanelVisible(false);
+  } else {
+    // Open exclusively (closes every sibling, including clash) and un-collapse.
+    s.openWorkspacePanel(panel);
   }
-  // If was active → all closed → falls back to Properties
 }
 
-/** Exclusively activate a bottom panel (Script / List).
+/** Exclusively activate a bottom panel (Script / List / Gantt).
  *  Closes the other first so the if-else chain in ViewerLayout renders it.
  *  If the target is already active, closes it. */
-function activateBottomPanel(panel: 'script' | 'list') {
+function activateBottomPanel(panel: 'script' | 'list' | 'gantt') {
   const s = useViewerStore.getState();
-  const isActive = panel === 'script' ? s.scriptPanelVisible : s.listPanelVisible;
+  const isActive =
+    panel === 'script' ? s.scriptPanelVisible
+    : panel === 'list' ? s.listPanelVisible
+    : s.ganttPanelVisible;
 
   closeActiveAnalysisExtension();
 
-  // Close all bottom panels
+  // Close all bottom panels — only one slots into the bottom strip at a time.
   s.setScriptPanelVisible(false);
   s.setListPanelVisible(false);
+  s.setGanttPanelVisible(false);
 
   if (!isActive) {
     s.setRightPanelCollapsed(false);
     if (panel === 'script') s.setScriptPanelVisible(true);
-    else s.setListPanelVisible(true);
+    else if (panel === 'list') s.setListPanelVisible(true);
+    else s.setGanttPanelVisible(true);
   }
 }
 
@@ -244,6 +273,8 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const navigatedByKeyboard = useRef(false);
 
   const { execute } = useSandbox();
+  const extensionCommands = useSlotContributions<CommandContribution>('commandPalette');
+  const extensionHost = useOptionalExtensionHost();
 
   useEffect(() => {
     if (open) {
@@ -296,6 +327,12 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         action: () => { useViewerStore.getState().cameraCallbacks.fitAll?.(); } },
       { id: 'view:frame', label: 'Frame Selection', keywords: 'zoom focus selected', category: 'View', icon: Crosshair, shortcut: 'F',
         action: () => { useViewerStore.getState().cameraCallbacks.frameSelection?.(); } },
+      { id: 'view:stacked', label: 'Level — Stacked', keywords: 'level display mode stacked default storey storeys', category: 'View', icon: Layers3,
+        action: () => { applyLevelDisplayMode('stacked'); } },
+      { id: 'view:exploded', label: 'Level — Exploded', keywords: 'level display mode exploded explode lift storey storeys gap', category: 'View', icon: ChevronsUpDown,
+        action: () => { applyLevelDisplayMode('exploded'); } },
+      { id: 'view:solo', label: 'Level — Solo', keywords: 'level display mode solo isolate storey single only top', category: 'View', icon: SquareStack,
+        action: () => { applyLevelDisplayMode('solo'); } },
       { id: 'view:projection', label: 'Projection', keywords: 'perspective orthographic ortho toggle switch', category: 'View', icon: Orbit,
         action: () => { useViewerStore.getState().toggleProjectionMode(); } },
       { id: 'view:top', label: 'Top View', keywords: 'camera plan', category: 'View', icon: ArrowUp, shortcut: '1',
@@ -322,6 +359,24 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         action: () => { useViewerStore.getState().setActiveTool('measure'); } },
       { id: 'tool:section', label: 'Section', keywords: 'clip cut plane', category: 'Tools', icon: Scissors, shortcut: 'X',
         action: () => { useViewerStore.getState().setActiveTool('section'); } },
+      { id: 'tool:annotate', label: 'Annotate', keywords: 'pin note comment marker', category: 'Tools', icon: MapPin, shortcut: 'P',
+        action: () => { useViewerStore.getState().setActiveTool('annotate'); } },
+      { id: 'tool:add-element', label: 'Add Element', keywords: 'wall slab beam column place drop new add element generic', category: 'Tools', icon: Box,
+        action: () => { useViewerStore.getState().setActiveTool('addElement'); } },
+      { id: 'tool:edit-mode', label: 'Toggle Edit Mode', keywords: 'edit mode pen unlock readonly properties geometry author modify', category: 'Tools', icon: PenLine, shortcut: 'E',
+        action: () => { useViewerStore.getState().toggleEditEnabled(); } },
+      { id: 'tool:split', label: 'Split selected entity', keywords: 'split cut knife slice divide segment break wall beam column slab selected', category: 'Tools', icon: Slice, shortcut: 'K',
+        action: () => {
+          const s = useViewerStore.getState();
+          const sel = s.selectedEntity;
+          if (!sel) return;
+          s.setSplitTarget(sel.modelId, sel.expressId);
+          s.setActiveTool('split');
+        } },
+      // Add-element gestures live entirely in the AddElementPanel
+      // (opened via `setActiveTool('addElement')` — see the
+      // dedicated "Add Element" command below). Per-type shortcuts
+      // duplicated that panel's UI and have been dropped.
     );
 
     // ── Visibility ──
@@ -352,17 +407,25 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         action: () => executeBasketClear() },
       { id: 'vis:spaces', label: 'Spaces', keywords: 'IfcSpace rooms show hide', category: 'Visibility', icon: Box,
         action: () => { useViewerStore.getState().toggleTypeVisibility('spaces'); } },
+      { id: 'vis:spatialZones', label: 'Spatial Zones', keywords: 'IfcSpatialZone gross area GFA show hide', category: 'Visibility', icon: Box,
+        action: () => { useViewerStore.getState().toggleTypeVisibility('spatialZones'); } },
       { id: 'vis:openings', label: 'Openings', keywords: 'IfcOpeningElement show hide', category: 'Visibility', icon: SquareX,
         action: () => { useViewerStore.getState().toggleTypeVisibility('openings'); } },
       { id: 'vis:site', label: 'Site', keywords: 'IfcSite terrain show hide', category: 'Visibility', icon: Building2,
         action: () => { useViewerStore.getState().toggleTypeVisibility('site'); } },
+      { id: 'vis:ifcAnnotations', label: 'Annotations', keywords: 'IfcAnnotation 2d drawing symbols text dimension leader label show hide', category: 'Visibility', icon: Pencil,
+        action: () => { useViewerStore.getState().toggleTypeVisibility('ifcAnnotations'); } },
+      // Issue #862: IfcGrid split off from IfcAnnotation so dense-grid
+      // models can hide axes/bubbles without losing dimensions.
+      { id: 'vis:ifcGrid', label: 'Grids', keywords: 'IfcGrid IfcGridAxis grid axis bubble tag show hide section clip', category: 'Visibility', icon: Pencil,
+        action: () => { useViewerStore.getState().toggleTypeVisibility('ifcGrid'); } },
       { id: 'vis:reset-colors', label: 'Reset Colors', keywords: 'clear color override', category: 'Visibility', icon: Palette,
         action: () => { execute('bim.viewer.resetColors()\nconsole.log("Colors reset")'); } },
     );
 
     // ── Panels ──
     c.push(
-      { id: 'panel:properties', label: 'Properties', keywords: 'attributes panel right', category: 'Panels', icon: Layout,
+      { id: 'panel:properties', label: 'Inspector', keywords: 'properties attributes material classification schedule task panel right', category: 'Panels', icon: Layout,
         action: () => { const s = useViewerStore.getState(); s.setRightPanelCollapsed(!s.rightPanelCollapsed); } },
       { id: 'panel:tree', label: 'Spatial Tree', keywords: 'hierarchy left panel', category: 'Panels', icon: TreeDeciduous,
         action: () => { const s = useViewerStore.getState(); s.setLeftPanelCollapsed(!s.leftPanelCollapsed); } },
@@ -372,10 +435,70 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         action: () => { activateRightPanel('bcf'); } },
       { id: 'panel:ids', label: 'IDS Validation', keywords: 'information delivery specification check', category: 'Panels', icon: ClipboardCheck,
         action: () => { activateRightPanel('ids'); } },
-      { id: 'panel:lists', label: 'Entity Lists', keywords: 'table spreadsheet schedule', category: 'Panels', icon: FileSpreadsheet,
+      { id: 'panel:clash', label: 'Clash Detection', keywords: 'collision interference clearance coordination clash matrix mep', category: 'Panels', icon: Crosshair,
+        action: () => { activateRightPanel('clash'); } },
+      { id: 'panel:compare', label: 'Compare Models', keywords: 'diff revision version change added deleted modified geometry data', category: 'Panels', icon: GitCompareArrows,
+        action: () => { activateRightPanel('compare'); } },
+      { id: 'panel:lists', label: 'Entity Lists', keywords: 'table spreadsheet', category: 'Panels', icon: FileSpreadsheet,
         action: () => { activateBottomPanel('list'); } },
+      { id: 'panel:gantt', label: 'Construction Schedule (Gantt)', keywords: '4d timeline tasks ifctask sequence playback animation', category: 'Panels', icon: CalendarClock,
+        action: () => { activateBottomPanel('gantt'); } },
       { id: 'panel:lens', label: 'Lens Rules', keywords: 'color filter highlight', category: 'Panels', icon: Palette,
         action: () => { activateRightPanel('lens'); } },
+      { id: 'panel:extensions', label: 'Extensions', keywords: 'extension plugin install manage iflx', category: 'Panels', icon: Puzzle,
+        action: () => { activateRightPanel('extensions'); } },
+      // ── Customization entry points — first-class discoverability
+      // for new users who don't know extensions/flavors exist. Each
+      // routes to the right surface and pre-seeds context where
+      // helpful (e.g. open Ideas tab with the empty-plan flow).
+      { id: 'extensions:author', label: 'Author an extension…',
+        keywords: 'create new build plan chat ai extension generate',
+        category: 'Tools', icon: Sparkles,
+        action: () => {
+          const s = useViewerStore.getState();
+          activateRightPanel('extensions');
+          s.setExtensionsRequestedView('ideas');
+          s.setIdeasOpenEmptyPlan(true);
+        } },
+      { id: 'extensions:flavors', label: 'Manage flavors…',
+        keywords: 'flavor profile switch export import merge customization',
+        category: 'Panels', icon: Palette,
+        action: () => {
+          useViewerStore.getState().setFlavorDialogRequested(true);
+        } },
+    );
+
+    // ── Schedule / 4D (Tools) ─────────────────────────────
+    c.push(
+      { id: 'schedule:generate', label: 'Generate Schedule from Storeys…',
+        keywords: '4d ifctask construction sequence storey building create gantt',
+        category: 'Tools', icon: CalendarPlus,
+        action: () => {
+          // Make sure the Gantt panel is mounted so the dialog has a host
+          // before flipping the dialog flag. Order matters — closing other
+          // panels first prevents the bottom strip from rendering them.
+          const s = useViewerStore.getState();
+          if (!s.ganttPanelVisible) activateBottomPanel('gantt');
+          // Same tick is fine — the dialog is portalled via Radix and doesn't
+          // depend on GanttPanel finishing its first render.
+          useViewerStore.getState().setGenerateScheduleDialogOpen(true);
+        } },
+      { id: 'schedule:toggle-animation', label: 'Toggle 4D Construction Animation',
+        keywords: 'play pause schedule task gantt simulation',
+        category: 'Visibility', icon: Sparkles,
+        action: () => {
+          const s = useViewerStore.getState();
+          s.setAnimationEnabled(!s.animationEnabled);
+        } },
+      { id: 'schedule:reset', label: 'Reset Schedule (Clear 4D Data)',
+        keywords: 'remove gantt tasks ifctask delete clear',
+        category: 'Tools', icon: Eraser,
+        action: () => {
+          const s = useViewerStore.getState();
+          s.setScheduleData(null);
+          s.setAnimationEnabled(false);
+          s.pauseSchedule();
+        } },
     );
 
     // ── Export ──
@@ -429,8 +552,40 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
         action: () => { useViewerStore.getState().toggleHoverTooltips(); } },
     );
 
+    // ── Extension contributions ──
+    // Surfaced under the "Extensions" category. Clicking dispatches
+    // through the activation event so the runtime executes the
+    // bundle's command handler (or surfaces the failure clearly).
+    for (const contribution of extensionCommands) {
+      const payload = contribution.payload;
+      if (!payload?.id || !payload.title) continue;
+      c.push({
+        id: `ext:${payload.id}`,
+        label: payload.title,
+        keywords: `${payload.id} ${payload.paletteCategory ?? ''} extension`,
+        category: 'Extensions',
+        // `resolveExtensionIcon` is the shared icon registry the
+        // picker writes against, so the icon the user chose is the
+        // icon shown in the palette.
+        icon: resolveExtensionIcon(payload.icon),
+        detail: payload.paletteCategory,
+        action: () => {
+          if (!extensionHost) return;
+          // Fire the activation event first so onCommand:<id>-subscribed
+          // extensions wake up, then invoke the command handler. The
+          // runtime dedupes activations.
+          void extensionHost.dispatcher
+            .fire(`onCommand:${payload.id}` as `onCommand:${string}`)
+            .then(() => extensionHost.runCommand(payload.id))
+            .catch((err) => {
+              paletteToast.error(describeRunCommandError(payload.id, err));
+            });
+        },
+      });
+    }
+
     return c;
-  }, [execute, recentFiles]);
+  }, [execute, recentFiles, extensionCommands, extensionHost]);
 
   // ── Search: score, filter, sort ──
   // When searching, results are FLAT sorted by relevance — no category grouping.

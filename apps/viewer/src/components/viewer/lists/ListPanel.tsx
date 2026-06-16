@@ -34,12 +34,14 @@ import { useViewerStore } from '@/store';
 import { useIfc } from '@/hooks/useIfc';
 import {
   executeList,
+  summariseListRows,
   LIST_PRESETS,
   importListDefinition,
   exportListDefinition,
   createListDataProvider,
 } from '@/lib/lists';
-import type { ListDefinition, ListResult, ListDataProvider } from '@/lib/lists';
+import type { ListDefinition, ListResult, ListDataProvider, ListGrouping } from '@/lib/lists';
+import type { IfcDataStore } from '@ifc-lite/parser';
 import { ListBuilder } from './ListBuilder';
 import { ListResultsTable } from './ListResultsTable';
 
@@ -64,37 +66,42 @@ export function ListPanel({ onClose }: ListPanelProps) {
   const setActiveListId = useViewerStore((s) => s.setActiveListId);
   const setListResult = useViewerStore((s) => s.setListResult);
   const setListExecuting = useViewerStore((s) => s.setListExecuting);
+  const pendingListDraft = useViewerStore((s) => s.pendingListDraft);
+  const setPendingListDraft = useViewerStore((s) => s.setPendingListDraft);
+
+  // A draft handed off from "Create list" (search filter) opens straight into
+  // the builder for column configuration, then is cleared so it fires once.
+  React.useEffect(() => {
+    if (!pendingListDraft) return;
+    setEditingList(pendingListDraft);
+    setView('builder');
+    setPendingListDraft(null);
+  }, [pendingListDraft, setPendingListDraft]);
 
   const importInputRef = React.useRef<HTMLInputElement>(null);
 
-  // Collect all available data providers for multi-model support
-  const allProviders = useMemo(() => {
-    const providers: ListDataProvider[] = [];
+  // Build the {modelId, provider} pairs in a single pass so the two
+  // arrays can never drift out of alignment (skipping a model without
+  // an ifcDataStore must not shift every later model's provider index).
+  const modelProviderPairs = useMemo(() => {
+    const pairs: Array<{ modelId: string; provider: ListDataProvider; store: IfcDataStore }> = [];
     if (models.size > 0) {
-      for (const [, model] of models) {
-        providers.push(createListDataProvider(model.ifcDataStore));
+      for (const [modelId, model] of models) {
+        // Skip native-metadata models — they don't have a parsed
+        // IfcDataStore, so the list provider can't query them.
+        if (!model.ifcDataStore) continue;
+        pairs.push({ modelId, provider: createListDataProvider(model.ifcDataStore), store: model.ifcDataStore });
       }
     } else if (ifcDataStore) {
-      providers.push(createListDataProvider(ifcDataStore));
-    }
-    return providers;
-  }, [models, ifcDataStore]);
-
-  const hasData = allProviders.length > 0;
-
-  // Build a stable map of modelId → provider index for execution
-  const modelProviderPairs = useMemo(() => {
-    const pairs: Array<{ modelId: string; provider: ListDataProvider }> = [];
-    if (models.size > 0) {
-      let i = 0;
-      for (const [modelId] of models) {
-        pairs.push({ modelId, provider: allProviders[i++] });
-      }
-    } else if (allProviders.length > 0) {
-      pairs.push({ modelId: 'default', provider: allProviders[0] });
+      pairs.push({ modelId: 'default', provider: createListDataProvider(ifcDataStore), store: ifcDataStore });
     }
     return pairs;
-  }, [models, allProviders]);
+  }, [models, ifcDataStore]);
+
+  const allProviders = useMemo(() => modelProviderPairs.map((p) => p.provider), [modelProviderPairs]);
+  const allStores = useMemo(() => modelProviderPairs.map((p) => p.store), [modelProviderPairs]);
+
+  const hasData = allProviders.length > 0;
 
   const handleExecuteList = useCallback((definition: ListDefinition) => {
     if (!hasData) return;
@@ -114,11 +121,17 @@ export function ListPanel({ onClose }: ListPanelProps) {
         const allRows = resultParts.flatMap(r => r.rows);
         const totalTime = resultParts.reduce((sum, r) => sum + r.executionTime, 0);
 
+        // Re-derive groups/summary over the merged rows so grouping works
+        // across federated models (and isn't dropped on the merge).
+        const { groups, summary } = summariseListRows(definition, allRows);
+
         setListResult({
           columns: definition.columns,
           rows: allRows,
           totalCount: allRows.length,
           executionTime: totalTime,
+          groups,
+          summary,
         });
         setView('results');
       } catch (err) {
@@ -170,6 +183,24 @@ export function ListPanel({ onClose }: ListPanelProps) {
       setView('builder');
     }
   }, [editingList]);
+
+  // Grouping/summing changed directly from the results table: update the
+  // executed definition (so Settings reflects it), persist if it's saved, and
+  // re-derive groups/summary over the current rows for a consistent result.
+  const handleGroupingFromTable = useCallback((grouping: ListGrouping | undefined) => {
+    const def = editingList;
+    if (!def) return;
+    const next: ListDefinition = { ...def, grouping };
+    setEditingList(next);
+    if (listDefinitions.some((d) => d.id === def.id)) {
+      updateListDefinition(def.id, { grouping });
+    }
+    const current = useViewerStore.getState().listResult;
+    if (current) {
+      const summ = summariseListRows(next, current.rows);
+      setListResult({ ...current, groups: summ.groups, summary: summ.summary });
+    }
+  }, [editingList, listDefinitions, updateListDefinition, setListResult]);
 
   const handleImport = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -258,6 +289,7 @@ export function ListPanel({ onClose }: ListPanelProps) {
       {view === 'builder' && hasData && (
         <ListBuilder
           providers={allProviders}
+          stores={allStores}
           initial={editingList}
           onSave={handleSaveList}
           onCancel={() => setView('library')}
@@ -266,7 +298,12 @@ export function ListPanel({ onClose }: ListPanelProps) {
       )}
 
       {view === 'results' && listResult && (
-        <ListResultsTable result={listResult} />
+        <ListResultsTable
+          result={listResult}
+          listName={editingList?.name}
+          grouping={editingList?.grouping}
+          onGroupingChange={handleGroupingFromTable}
+        />
       )}
 
       {/* Hidden import input */}

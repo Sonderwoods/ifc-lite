@@ -61,6 +61,12 @@ interface GPUAdapterInfo {
   readonly description: string;
 }
 
+interface GPUUncapturedErrorEvent extends Event {
+  readonly error: { readonly message: string };
+}
+
+type GPUErrorFilter = 'validation' | 'out-of-memory' | 'internal';
+
 interface GPUDevice extends EventTarget {
   readonly queue: GPUQueue;
   createShaderModule(descriptor: GPUShaderModuleDescriptor): GPUShaderModule;
@@ -72,6 +78,9 @@ interface GPUDevice extends EventTarget {
   createTexture(descriptor: GPUTextureDescriptor): GPUTexture;
   createBindGroup(descriptor: GPUBindGroupDescriptor): GPUBindGroup;
   createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor): GPUBindGroupLayout;
+  pushErrorScope(filter: GPUErrorFilter): void;
+  popErrorScope(): Promise<{ readonly message: string } | null>;
+  onuncapturederror: ((this: GPUDevice, event: GPUUncapturedErrorEvent) => void) | null;
 }
 
 interface GPUTextureDescriptor {
@@ -132,6 +141,7 @@ interface GPURenderPassEncoder {
   setVertexBuffer(slot: number, buffer: GPUBuffer | null, offset?: number, size?: number): void;
   setIndexBuffer(buffer: GPUBuffer, format: GPUIndexFormat, offset?: number, size?: number): void;
   setBindGroup(index: number, bindGroup: GPUBindGroup | null, dynamicOffsets?: number[]): void;
+  setStencilReference(reference: number): void;
   draw(vertexCount: number, instanceCount?: number, firstVertex?: number, firstInstance?: number): void;
   drawIndexed(indexCount: number, instanceCount?: number, firstIndex?: number, baseVertex?: number, firstInstance?: number): void;
   end(): void;
@@ -283,6 +293,12 @@ interface GPUBufferDescriptor {
   size: number;
   usage: number;
   label?: string;
+  /**
+   * If true, the buffer is created in a mapped state — the caller can
+   * write to it via `getMappedRange()` without a `writeBuffer` IPC
+   * round-trip. Used in the streaming geometry uploader.
+   */
+  mappedAtCreation?: boolean;
 }
 
 interface GPUBindGroupDescriptor {
@@ -511,6 +527,14 @@ declare const GPUShaderStage: {
   readonly VERTEX: number;
   readonly FRAGMENT: number;
   readonly COMPUTE: number;
+};
+
+declare const GPUColorWrite: {
+  readonly RED: number;
+  readonly GREEN: number;
+  readonly BLUE: number;
+  readonly ALPHA: number;
+  readonly ALL: number;
 };
 
 interface GPUBindGroup {

@@ -9,7 +9,6 @@ use crate::{Error, Mesh, Result, SubMeshCollection};
 use ifc_lite_core::{
     has_geometry_by_name, DecodedEntity, EntityDecoder, GeometryCategory, IfcType,
 };
-use nalgebra::Matrix4;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
@@ -167,7 +166,9 @@ impl GeometryRouter {
 
                     // ── Tessellated path ──
                     // attr 0 = Coordinates (IfcCartesianPointList3D)
-                    IfcType::IfcTriangulatedFaceSet | IfcType::IfcPolygonalFaceSet => {
+                    IfcType::IfcTriangulatedFaceSet
+                    | IfcType::IfcTriangulatedIrregularNetwork
+                    | IfcType::IfcPolygonalFaceSet => {
                         if let Some(pt) = self.tessellated_first_vertex(&item, decoder) {
                             return Some(pt);
                         }
@@ -259,13 +260,61 @@ impl GeometryRouter {
         Some((x, y, z))
     }
 
+    fn raw_coordinate_is_large(&self, point: (f64, f64, f64)) -> bool {
+        const LARGE_COORD_THRESHOLD_METERS: f64 = 10000.0;
+        let max_abs = point.0.abs().max(point.1.abs()).max(point.2.abs());
+        max_abs * self.unit_scale > LARGE_COORD_THRESHOLD_METERS
+    }
+
+    fn representation_item_uses_raw_large_coordinates(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> bool {
+        let first_vertex = match item.ifc_type {
+            IfcType::IfcFacetedBrep | IfcType::IfcFacetedBrepWithVoids => {
+                self.brep_first_vertex(item, decoder)
+            }
+            IfcType::IfcTriangulatedFaceSet
+            | IfcType::IfcTriangulatedIrregularNetwork
+            | IfcType::IfcPolygonalFaceSet => self.tessellated_first_vertex(item, decoder),
+            IfcType::IfcFaceBasedSurfaceModel | IfcType::IfcShellBasedSurfaceModel => {
+                let Some(shells_attr) = item.get(0) else {
+                    return false;
+                };
+                let Some(shells) = shells_attr.as_list() else {
+                    return false;
+                };
+                let Some(shell_ref) = shells.first() else {
+                    return false;
+                };
+                let Some(shell_id) = shell_ref.as_entity_ref() else {
+                    return false;
+                };
+                match decoder.decode_by_id(shell_id) {
+                    Ok(shell) => self.shell_first_vertex(&shell, decoder),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+
+        first_vertex
+            .map(|point| self.raw_coordinate_is_large(point))
+            .unwrap_or(false)
+    }
+
     /// Detect RTC offset by scanning the file for building elements.
     /// Used by synchronous parse paths.
-    pub fn detect_rtc_offset_from_first_element(
+    pub fn detect_rtc_offset_from_first_element<T>(
         &self,
-        content: &str,
+        content: &T,
         decoder: &mut EntityDecoder,
-    ) -> (f64, f64, f64) {
+    ) -> (f64, f64, f64)
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let content = content.as_ref();
         use ifc_lite_core::EntityScanner;
 
         let mut scanner = EntityScanner::new(content);
@@ -316,6 +365,27 @@ impl GeometryRouter {
         Some(Self::rtc_offset_from_translations(&translations))
     }
 
+    /// Detect the RTC offset from sampled jobs, falling back to a full-file
+    /// placement-bounds scan when no usable translation samples were found.
+    ///
+    /// Single shared entry point for the server processing path and the wasm
+    /// prepasses so both sides make the identical needs-shift decision: a
+    /// model whose sampled placements fail to decode while raw geometry
+    /// carries >10 km coordinates must be re-based identically everywhere
+    /// (previously the wasm prepasses silently fell back to (0,0,0) and the
+    /// browser rendered f32 vertex jitter that the server never saw).
+    pub fn detect_rtc_offset_with_fallback(
+        &self,
+        jobs: &[(u32, usize, usize, IfcType)],
+        decoder: &mut EntityDecoder,
+        content: &[u8],
+    ) -> (f64, f64, f64) {
+        match self.detect_rtc_offset_from_jobs(jobs, decoder) {
+            Some(offset) => offset,
+            None => ifc_lite_core::scan_placement_bounds(content).rtc_offset(),
+        }
+    }
+
     /// Process building element (IfcWall, IfcBeam, etc.) into mesh
     /// Follows the representation chain:
     /// Element → Representation → ShapeRepresentation → Items
@@ -325,6 +395,17 @@ impl GeometryRouter {
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<Mesh> {
+        // IfcAlignment carries its directrix curve in a dedicated `Axis`
+        // attribute (IFC4X1) instead of (or in addition to) a normal
+        // IfcShapeRepresentation. Route those through the alignment
+        // processor before the standard representation walk, since the
+        // Representation is often `$` in practice.
+        if element.ifc_type == IfcType::IfcAlignment {
+            if let Some(mesh) = self.try_alignment_mesh(element, decoder)? {
+                return Ok(mesh);
+            }
+        }
+
         // Get representation (attribute 6 for most building elements)
         // IfcProduct: GlobalId, OwnerHistory, Name, Description, ObjectType, ObjectPlacement, Representation, Tag
         let representation_attr = element.get(6).ok_or_else(|| {
@@ -377,6 +458,7 @@ impl GeometryRouter {
                             | "CSG"
                             | "Clipping"
                             | "SurfaceModel"
+                            | "Surface3D"
                             | "Tessellation"
                             | "AdvancedSweptSolid"
                             | "AdvancedBrep"
@@ -414,6 +496,7 @@ impl GeometryRouter {
                             | "CSG"
                             | "Clipping"
                             | "SurfaceModel"
+                            | "Surface3D"
                             | "Tessellation"
                             | "MappedRepresentation"
                             | "AdvancedSweptSolid"
@@ -438,6 +521,14 @@ impl GeometryRouter {
             }
         }
 
+        // Mesh hygiene before placement (rigid transform preserves geometry, so
+        // welding/dropping in local coords is identical and uses smaller f32
+        // magnitudes). Single chokepoint downstream of every per-item branch,
+        // incl. CSG output — restores the cleanup #1024 lost with Manifold:
+        // redundant/coincident source vertices that otherwise triangulate into
+        // visible needle spikes and jagged silhouettes. See clean_degenerate.
+        combined_mesh.clean_degenerate();
+
         // Apply placement transformation
         self.apply_placement(element, decoder, &mut combined_mesh)?;
 
@@ -454,6 +545,15 @@ impl GeometryRouter {
         element: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<SubMeshCollection> {
+        // If a material-layer buildup is attached, try slicing single-solid
+        // elements (walls / slabs with IfcMaterialLayerSetUsage) first so each
+        // layer gets its own sub-mesh keyed by IfcMaterial id. An empty void
+        // index is passed — the caller's has_openings branch takes the
+        // voids-aware path below.
+        if let Some(layered) = self.try_layered_sub_meshes(element, decoder, None) {
+            return Ok(layered);
+        }
+
         // Get representation (attribute 6 for most building elements)
         let representation_attr = element.get(6).ok_or_else(|| {
             Error::geometry(format!(
@@ -502,6 +602,7 @@ impl GeometryRouter {
                             | "CSG"
                             | "Clipping"
                             | "SurfaceModel"
+                            | "Surface3D"
                             | "Tessellation"
                             | "AdvancedSweptSolid"
                             | "AdvancedBrep"
@@ -536,6 +637,7 @@ impl GeometryRouter {
                             | "CSG"
                             | "Clipping"
                             | "SurfaceModel"
+                            | "Surface3D"
                             | "Tessellation"
                             | "MappedRepresentation"
                             | "AdvancedSweptSolid"
@@ -559,22 +661,42 @@ impl GeometryRouter {
             }
         }
 
-        // Apply placement transformation to all sub-meshes
-        // ObjectPlacement translation is in file units (e.g., mm) but geometry is scaled to meters,
-        // so we MUST scale the transform to match. Same as apply_placement does.
+        // Mesh hygiene before placement — same chokepoint as process_element,
+        // applied per sub-mesh for the multi-item (per-style) channel. Rigid
+        // placement preserves geometry, so order is immaterial. (The layered
+        // and textured channels are cleaned at their own sites:
+        // try_layered_sub_meshes and process_representation_map_with_texture.)
+        for sub in &mut sub_meshes.sub_meshes {
+            sub.mesh.clean_degenerate();
+        }
+
+        self.apply_submesh_placement(&mut sub_meshes, element, decoder)?;
+        Ok(sub_meshes)
+    }
+
+    /// Apply the element's `ObjectPlacement` (scaled to metres) to every sub-mesh.
+    /// Placement is a rigid per-instance transform, kept OUT of the dedup cache so
+    /// instances of one shared geometry land at their own positions.
+    fn apply_submesh_placement(
+        &self,
+        sub_meshes: &mut SubMeshCollection,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<()> {
+        // ObjectPlacement translation is in file units (e.g. mm) but geometry is
+        // scaled to metres, so the transform MUST be scaled to match.
         if let Some(placement_attr) = element.get(5) {
             if !placement_attr.is_null() {
                 if let Some(placement) = decoder.resolve_ref(placement_attr)? {
                     let mut transform = self.get_placement_transform(&placement, decoder)?;
                     self.scale_transform(&mut transform);
                     for sub in &mut sub_meshes.sub_meshes {
-                        self.transform_mesh(&mut sub.mesh, &transform);
+                        self.transform_mesh_world(&mut sub.mesh, &transform);
                     }
                 }
             }
         }
-
-        Ok(sub_meshes)
+        Ok(())
     }
 
     /// Collect sub-meshes from a representation item, following MappedItem references.
@@ -670,7 +792,7 @@ impl GeometryRouter {
                     if let Some(mut transform) = mapping_transform.clone() {
                         self.scale_transform(&mut transform);
                         for sub in &mut sub_meshes.sub_meshes[count_before..] {
-                            self.transform_mesh(&mut sub.mesh, &transform);
+                            self.transform_mesh_local(&mut sub.mesh, &transform);
                         }
                     }
                 }
@@ -699,157 +821,95 @@ impl GeometryRouter {
         Ok(())
     }
 
-    /// Process building element and return geometry + transform separately
-    /// Used for instanced rendering - geometry is returned untransformed, transform is separate
-    #[inline]
-    pub fn process_element_with_transform(
-        &self,
-        element: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-    ) -> Result<(Mesh, Matrix4<f64>)> {
-        // Get representation (attribute 6 for most building elements)
-        let representation_attr = element.get(6).ok_or_else(|| {
-            Error::geometry(format!(
-                "Element #{} has no representation attribute",
-                element.id
-            ))
-        })?;
-
-        if representation_attr.is_null() {
-            return Ok((Mesh::new(), Matrix4::identity())); // No geometry
-        }
-
-        let representation = decoder
-            .resolve_ref(representation_attr)?
-            .ok_or_else(|| Error::geometry("Failed to resolve representation".to_string()))?;
-
-        if representation.ifc_type != IfcType::IfcProductDefinitionShape {
-            return Err(Error::geometry(format!(
-                "Expected IfcProductDefinitionShape, got {}",
-                representation.ifc_type
-            )));
-        }
-
-        // Get representations list (attribute 2)
-        let representations_attr = representation.get(2).ok_or_else(|| {
-            Error::geometry("IfcProductDefinitionShape missing Representations".to_string())
-        })?;
-
-        let representations = decoder.resolve_ref_list(representations_attr)?;
-
-        // Process all representations and merge meshes
-        let mut combined_mesh = Mesh::new();
-
-        // Check for direct geometry
-        let has_direct_geometry = representations.iter().any(|rep| {
-            if rep.ifc_type != IfcType::IfcShapeRepresentation {
-                return false;
-            }
-            if let Some(rep_type_attr) = rep.get(2) {
-                if let Some(rep_type) = rep_type_attr.as_string() {
-                    matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Tessellation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    )
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        });
-
-        for shape_rep in representations {
-            if shape_rep.ifc_type != IfcType::IfcShapeRepresentation {
-                continue;
-            }
-
-            if let Some(rep_type_attr) = shape_rep.get(2) {
-                if let Some(rep_type) = rep_type_attr.as_string() {
-                    if rep_type == "MappedRepresentation" && has_direct_geometry {
-                        continue;
-                    }
-
-                    if !matches!(
-                        rep_type,
-                        "Body"
-                            | "SweptSolid"
-                            | "SolidModel"
-                            | "Brep"
-                            | "CSG"
-                            | "Clipping"
-                            | "SurfaceModel"
-                            | "Tessellation"
-                            | "MappedRepresentation"
-                            | "AdvancedSweptSolid"
-                            | "AdvancedBrep"
-                    ) {
-                        continue;
-                    }
-                }
-            }
-
-            let items_attr = shape_rep.get(3).ok_or_else(|| {
-                Error::geometry("IfcShapeRepresentation missing Items".to_string())
-            })?;
-
-            let items = decoder.resolve_ref_list(items_attr)?;
-
-            for item in items {
-                let mesh = self.process_representation_item(&item, decoder)?;
-                combined_mesh.merge(&mesh);
-            }
-        }
-
-        // Get placement transform WITHOUT applying it
-        let transform = self.get_placement_transform_from_element(element, decoder)?;
-
-        Ok((combined_mesh, transform))
-    }
-
-    /// Process a single representation item (IfcExtrudedAreaSolid, etc.)
-    /// Uses hash-based caching for geometry deduplication across repeated floors
+    /// Process a single representation item (IfcExtrudedAreaSolid, etc.), with
+    /// content-dedup: a 128-bit structural hash of the item subtree skips the
+    /// meshing + CSG for geometry byte-identical to an item meshed earlier (e.g.
+    /// the thousands of Tekla connection plates/bolts an exporter failed to share
+    /// via `IfcMappedItem`). The cached mesh is colour-free and pre-placement; the
+    /// caller keeps this item's own `geometry_id` (so colour/palette/texture stay
+    /// per-instance) and applies voids + placement afterwards, so a cache hit is
+    /// indistinguishable from a fresh build.
     #[inline]
     pub fn process_representation_item(
         &self,
         item: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> Result<Mesh> {
-        // Special handling for MappedItem with caching
+        // MappedItem has its own instancing cache (the source representation is
+        // already shared), so it never enters the structural-hash path.
         if item.ifc_type == IfcType::IfcMappedItem {
             return self.process_mapped_item_cached(item, decoder);
         }
 
-        // Check FacetedBrep cache first (from batch preprocessing)
-        if item.ifc_type == IfcType::IfcFacetedBrep {
-            if let Some(mut mesh) = self.take_cached_faceted_brep(item.id) {
-                self.scale_mesh(&mut mesh);
-                let cached = self.get_or_cache_by_hash(mesh);
-                return Ok((*cached).clone());
+        // `None` ⇒ dedup disabled (no hash overhead). On a hit, return a clone of
+        // the cached item mesh; meshing is skipped entirely.
+        let dedup_key = self.item_dedup_key(item, decoder);
+        if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
+            let hit = cache.lock().expect("dedup cache poisoned").get(&key).cloned();
+            if let Some(mesh) = hit {
+                return Ok((*mesh).clone());
             }
         }
 
-        // For FacetedBrep with RTC: use precision-preserving path that subtracts
-        // RTC from f64 coordinates BEFORE f32 conversion (prevents 0.5m jitter
-        // at Y ≈ 6.2M). Vertices are already RTC-shifted, so transform_mesh
-        // should NOT re-apply RTC for these meshes.
-        if item.ifc_type == IfcType::IfcFacetedBrep && self.has_rtc_offset() {
+        let mesh = self.process_representation_item_uncached(item, decoder)?;
+
+        // Cache the freshly-meshed item under its structural hash. Empty meshes
+        // (unsupported/degenerate geometry) are never cached.
+        if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
+            if !mesh.positions.is_empty() {
+                cache
+                    .lock()
+                    .expect("dedup cache poisoned")
+                    .insert(key, Arc::new(mesh.clone()));
+            }
+        }
+
+        Ok(mesh)
+    }
+
+    /// Cache key for an item: its structural hash combined with the router params
+    /// that change the meshed output (tessellation quality / unit scale / RTC), or
+    /// `None` when dedup is disabled (skips the hash walk so disabled = zero
+    /// overhead). The quality fold is what keeps `setTessellationQuality` correct —
+    /// the shared cache persists across quality changes on a worker, so the key
+    /// must distinguish them (#976).
+    fn item_dedup_key(&self, item: &DecodedEntity, decoder: &mut EntityDecoder) -> Option<u128> {
+        self.item_dedup_cache.as_ref()?;
+        let structural = {
+            let mut memo = self.content_sig_memo.borrow_mut();
+            super::content_hash::item_signature(decoder, item.id, &mut memo)
+        };
+        Some(super::content_hash::key_with_params(
+            structural,
+            self.tessellation_quality.to_index(),
+            self.unit_scale,
+            self.rtc_offset,
+        ))
+    }
+
+    /// The meshing body of [`Self::process_representation_item`] (everything except
+    /// the MappedItem path and the content-dedup wrapper).
+    fn process_representation_item_uncached(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Mesh> {
+        // For raw world-coordinate FacetedBrep with RTC: subtract RTC from f64
+        // coordinates BEFORE f32 conversion. Do not use this path for ordinary
+        // local Breps whose large position comes from IfcObjectPlacement; those
+        // are shifted uniformly during the final world transform.
+        if item.ifc_type == IfcType::IfcFacetedBrep
+            && self.has_rtc_offset()
+            && self.representation_item_uses_raw_large_coordinates(item, decoder)
+        {
             let processor = crate::processors::FacetedBrepProcessor::new();
             let rtc_file_units = (
                 self.rtc_offset.0 / self.unit_scale,
                 self.rtc_offset.1 / self.unit_scale,
                 self.rtc_offset.2 / self.unit_scale,
             );
-            let mut mesh = processor.process_with_rtc(item, decoder, &self.schema, rtc_file_units)?;
+            let mut mesh =
+                processor.process_with_rtc(item, decoder, &self.schema, rtc_file_units)?;
             mesh.validate_indices();
             self.scale_mesh(&mut mesh);
             // Mark positions as already RTC-shifted by setting a flag
@@ -863,32 +923,33 @@ impl GeometryRouter {
 
         // Check if we have a processor for this type
         if let Some(processor) = self.processors.get(&item.ifc_type) {
-            let mut mesh = processor.process(item, decoder, &self.schema)?;
+            let mut mesh =
+                processor.process(item, decoder, &self.schema, self.tessellation_quality)?;
             // Safety net: strip any out-of-bounds indices before downstream use
             mesh.validate_indices();
 
-            // For meshes with large coordinates: apply RTC with f64 precision
+            // For raw world-coordinate meshes: apply RTC before unit scaling
             // to avoid jitter from f32 truncation at world-space scale.
             // This covers FaceBasedSurface, ShellBasedSurface, and any other
             // processor that stores raw world-space coordinates as f32.
-            if self.has_rtc_offset() && !mesh.rtc_applied && !mesh.positions.is_empty() {
-                let first_mag = (mesh.positions[0].abs() as f64)
-                    .max(mesh.positions[1].abs() as f64);
-                if first_mag > 10000.0 {
-                    // Positions are in file units (pre-scale). RTC offset is in meters.
-                    // Convert RTC to file units for consistent subtraction.
-                    let rtc_fu = (
-                        self.rtc_offset.0 / self.unit_scale,
-                        self.rtc_offset.1 / self.unit_scale,
-                        self.rtc_offset.2 / self.unit_scale,
-                    );
-                    for chunk in mesh.positions.chunks_exact_mut(3) {
-                        chunk[0] = (chunk[0] as f64 - rtc_fu.0) as f32;
-                        chunk[1] = (chunk[1] as f64 - rtc_fu.1) as f32;
-                        chunk[2] = (chunk[2] as f64 - rtc_fu.2) as f32;
-                    }
-                    mesh.rtc_applied = true;
+            if self.has_rtc_offset()
+                && !mesh.rtc_applied
+                && !mesh.positions.is_empty()
+                && self.representation_item_uses_raw_large_coordinates(item, decoder)
+            {
+                // Positions are in file units (pre-scale). RTC offset is in meters.
+                // Convert RTC to file units for consistent subtraction.
+                let rtc_fu = (
+                    self.rtc_offset.0 / self.unit_scale,
+                    self.rtc_offset.1 / self.unit_scale,
+                    self.rtc_offset.2 / self.unit_scale,
+                );
+                for chunk in mesh.positions.chunks_exact_mut(3) {
+                    chunk[0] = (chunk[0] as f64 - rtc_fu.0) as f32;
+                    chunk[1] = (chunk[1] as f64 - rtc_fu.1) as f32;
+                    chunk[2] = (chunk[2] as f64 - rtc_fu.2) as f32;
                 }
+                mesh.rtc_applied = true;
             }
 
             self.scale_mesh(&mut mesh);
@@ -970,7 +1031,7 @@ impl GeometryRouter {
                 let mut mesh = cached_mesh.as_ref().clone();
                 if let Some(mut transform) = mapping_transform {
                     self.scale_transform(&mut transform);
-                    self.transform_mesh(&mut mesh, &transform);
+                    self.transform_mesh_local(&mut mesh, &transform);
                 }
                 return Ok(mesh);
             }
@@ -1005,7 +1066,9 @@ impl GeometryRouter {
                 continue;
             }
             if let Some(processor) = self.processors.get(&sub_item.ifc_type) {
-                if let Ok(mut sub_mesh) = processor.process(&sub_item, decoder, &self.schema) {
+                if let Ok(mut sub_mesh) =
+                    processor.process(&sub_item, decoder, &self.schema, self.tessellation_quality)
+                {
                     sub_mesh.validate_indices();
                     self.scale_mesh(&mut sub_mesh);
                     mesh.merge(&sub_mesh);
@@ -1022,9 +1085,171 @@ impl GeometryRouter {
         // Apply MappingTarget transformation to this instance
         if let Some(mut transform) = mapping_transform {
             self.scale_transform(&mut transform);
-            self.transform_mesh(&mut mesh, &transform);
+            self.transform_mesh_local(&mut mesh, &transform);
         }
 
         Ok(mesh)
+    }
+
+    /// Tessellate an `IfcRepresentationMap`'s `MappedRepresentation` and bake
+    /// its `MappingOrigin` placement (issue #957).
+    ///
+    /// Used to render geometry that hangs off an `IfcTypeProduct` (e.g.
+    /// `IfcBoilerType`) through its `RepresentationMaps` when no occurrence
+    /// instantiates it — the buildingSMART annex-E "tessellated shape with
+    /// style" samples ship exactly this shape (geometry on the type, declared
+    /// via `IfcRelDeclares`, with no product instance).
+    ///
+    /// Unlike [`Self::process_mapped_item_cached`], this applies `MappingOrigin`
+    /// (`IfcRepresentationMap` attr 0) rather than a `MappingTarget`: there is
+    /// no occurrence placement and no `IfcMappedItem` to carry one, so the
+    /// MappingOrigin axis placement is the only transform. It is the caller's
+    /// responsibility to only invoke this for orphan representation maps so
+    /// normally-instanced typed products aren't double-rendered.
+    pub fn process_representation_map(
+        &self,
+        rep_map: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Mesh> {
+        let empty = rustc_hash::FxHashMap::default();
+        let parts = self.process_representation_map_with_texture(rep_map, decoder, &empty)?;
+        let mut mesh = Mesh::new();
+        for (part, _uvs, _texture) in parts {
+            mesh.merge(&part);
+        }
+        Ok(mesh)
+    }
+
+    /// Texture-aware variant of [`Self::process_representation_map`] (issue
+    /// #961). Returns one render part per output mesh: each textured
+    /// `IfcTriangulatedFaceSet` item becomes its OWN part carrying its UVs +
+    /// decoded image (so a representation with several differently-textured
+    /// items renders each with the correct image), and all untextured items are
+    /// merged into a single part with empty UVs / no texture. The MappingOrigin
+    /// placement is baked into every part.
+    pub fn process_representation_map_with_texture(
+        &self,
+        rep_map: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        texture_index: &rustc_hash::FxHashMap<u32, crate::processors::texture::ResolvedTextureMap>,
+    ) -> Result<Vec<(Mesh, Vec<f32>, Option<crate::processors::MeshTexture>)>> {
+        // attr 1: MappedRepresentation (IfcShapeRepresentation)
+        let mapped_rep_attr = rep_map.get(1).ok_or_else(|| {
+            Error::geometry("RepresentationMap missing MappedRepresentation".to_string())
+        })?;
+        let mapped_rep = decoder
+            .resolve_ref(mapped_rep_attr)?
+            .ok_or_else(|| Error::geometry("Failed to resolve MappedRepresentation".to_string()))?;
+
+        // attr 3: Items
+        let items_attr = mapped_rep
+            .get(3)
+            .ok_or_else(|| Error::geometry("Representation missing Items".to_string()))?;
+        let items = decoder.resolve_ref_list(items_attr)?;
+
+        let mut untextured = Mesh::new();
+        // One entry per textured item — keeps each item with its own image.
+        let mut textured: Vec<(Mesh, Vec<f32>, crate::processors::MeshTexture)> = Vec::new();
+        for item in items {
+            // A nested IfcMappedItem inside a type's own representation: process
+            // it (applies its MappingTarget) rather than dropping its geometry.
+            if item.ifc_type == IfcType::IfcMappedItem {
+                if let Ok(sub_mesh) = self.process_mapped_item_cached(&item, decoder) {
+                    untextured.merge(&sub_mesh); // already scaled inside the cached path
+                }
+                continue;
+            }
+
+            // Textured tessellated face set → its own part with per-vertex UVs (#961).
+            if item.ifc_type == IfcType::IfcTriangulatedFaceSet {
+                if let Some(map) = texture_index.get(&item.id) {
+                    let proc = crate::processors::TriangulatedFaceSetProcessor::new();
+                    if let Ok((mut sub_mesh, sub_uvs)) =
+                        proc.process_with_texture(&item, decoder, map)
+                    {
+                        self.scale_mesh(&mut sub_mesh); // UVs are unaffected by scale
+                        textured.push((sub_mesh, sub_uvs, map.texture.clone()));
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(processor) = self.processors.get(&item.ifc_type) {
+                if let Ok(mut sub_mesh) =
+                    processor.process(&item, decoder, &self.schema, self.tessellation_quality)
+                {
+                    sub_mesh.validate_indices();
+                    self.scale_mesh(&mut sub_mesh);
+                    untextured.merge(&sub_mesh);
+                }
+            }
+        }
+
+        // attr 0: MappingOrigin (IfcAxis2Placement3D) — the only 3D transform;
+        // UVs are 2D and unaffected. Parse once, bake into every part.
+        let origin_transform: Option<nalgebra::Matrix4<f64>> = match rep_map.get(0) {
+            Some(origin_attr) if !origin_attr.is_null() => {
+                match decoder.resolve_ref(origin_attr)? {
+                Some(origin) if origin.ifc_type == IfcType::IfcAxis2Placement3D => {
+                    let mut t = self.parse_axis2_placement_3d(&origin, decoder)?;
+                    self.scale_transform(&mut t);
+                    Some(t)
+                }
+                _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let mut out: Vec<(Mesh, Vec<f32>, Option<crate::processors::MeshTexture>)> = Vec::new();
+        for (mut mesh, uvs, texture) in textured {
+            if let Some(t) = &origin_transform {
+                self.transform_mesh_local(&mut mesh, t);
+            }
+            // Same sliver hygiene as the other mesh-output chokepoints. This is
+            // the type-geometry (RepresentationMap) channel and the only one
+            // carrying a parallel per-vertex UV array; clean_degenerate edits
+            // only indices (vertices/UVs untouched), so the UVs stay in sync.
+            mesh.clean_degenerate();
+            out.push((mesh, uvs, Some(texture)));
+        }
+        if !untextured.is_empty() {
+            if let Some(t) = &origin_transform {
+                self.transform_mesh_local(&mut untextured, t);
+            }
+            untextured.clean_degenerate();
+            out.push((untextured, Vec::new(), None));
+        }
+
+        Ok(out)
+    }
+
+    /// Run an `IfcAlignment` through the dedicated alignment processor, then
+    /// apply the standard unit scale + placement transform. Returns `None`
+    /// when the alignment has no recognisable directrix curve (the caller
+    /// falls back to normal representation processing).
+    fn try_alignment_mesh(
+        &self,
+        element: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Result<Option<Mesh>> {
+        let processor = match self.processors.get(&IfcType::IfcAlignment) {
+            Some(p) => Arc::clone(p),
+            None => return Ok(None),
+        };
+        let mut mesh =
+            match processor.process(element, decoder, &self.schema, self.tessellation_quality) {
+            Ok(m) => m,
+            // Missing Axis or unparseable curve isn't fatal — fall back so
+            // the caller can still walk a normal representation if present.
+            Err(_) => return Ok(None),
+        };
+        if mesh.positions.is_empty() {
+            return Ok(None);
+        }
+        mesh.validate_indices();
+        self.scale_mesh(&mut mesh);
+        self.apply_placement(element, decoder, &mut mesh)?;
+        Ok(Some(mesh))
     }
 }

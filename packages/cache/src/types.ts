@@ -12,8 +12,22 @@ import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 /** Magic bytes: "IFCL" */
 export const MAGIC = 0x4C434649; // "IFCL" in little-endian
 
-/** Current format version */
-export const FORMAT_VERSION = 3;
+/**
+ * Current format version.
+ *
+ * v5: per-mesh `geometryClass` byte (Model/Types view switch, #957). Earlier
+ * caches restored every mesh as class 0, so instanced type-library geometry
+ * (class 2) rendered in Model mode and the Model/Types switch vanished
+ * (`hasTypeGeometry` saw no non-zero classes). Bumping the version also bumps
+ * the viewer's cache key, so stale v4 entries miss and re-mesh fresh.
+ *
+ * v6: per-mesh local-frame `origin` (3×f64) — the per-element AABB-centre the
+ * wasm pipeline stores so building-scale f32 vertices don't collapse into fans
+ * (world = origin + position). Without it, a cache restored from a local-frame
+ * load has small local positions but no origin → every element renders scattered
+ * near scene origin. The bump also invalidates pre-origin caches so they re-mesh.
+ */
+export const FORMAT_VERSION = 6;
 
 /** Section types in the binary format */
 export enum SectionType {
@@ -25,6 +39,7 @@ export enum SectionType {
   Geometry = 6,
   Spatial = 7,
   Bounds = 8,
+  EntityIndex = 9,
 }
 
 /** IFC schema version */
@@ -117,7 +132,7 @@ export interface CacheHeaderInfo {
 /**
  * Complete data store for IFC model
  */
-export interface IfcDataStore {
+export interface CacheDataStore {
   schema: SchemaVersion;
   entityCount: number;
   strings: StringTable;
@@ -126,13 +141,35 @@ export interface IfcDataStore {
   quantities: QuantityTable;
   relationships: RelationshipGraph;
   spatialHierarchy?: SpatialHierarchy;
+  entityIndex?: CacheEntityIndex;
+}
+
+export interface CacheEntityRef {
+  expressId: number;
+  type: string;
+  byteOffset: number;
+  byteLength: number;
+  lineNumber?: number;
+}
+
+export interface CacheEntityIndex {
+  byId: Iterable<[number, CacheEntityRef]>;
+}
+
+export interface CachedEntityIndexColumns {
+  ids: Uint32Array;
+  byteOffsets: Uint32Array;
+  byteLengths: Uint32Array;
+  typeIndices: Uint16Array;
+  typeNames: string[];
 }
 
 /**
  * Result from reading cache
  */
 export interface CacheReadResult {
-  dataStore: IfcDataStore;
+  dataStore: CacheDataStore;
+  entityIndex?: CachedEntityIndexColumns;
   geometry?: {
     meshes: MeshData[];
     totalVertices: number;

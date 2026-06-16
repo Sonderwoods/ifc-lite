@@ -9,6 +9,7 @@
 import { createLogger } from '@ifc-lite/data';
 import { decodeIfcString } from '@ifc-lite/encoding';
 import type { IfcEntity, EntityRef } from './types.js';
+import { safeUtf8Decode } from '@ifc-lite/data';
 
 export type { IfcEntity };
 
@@ -29,12 +30,18 @@ export class EntityExtractor {
    */
   extractEntity(ref: EntityRef): IfcEntity | null {
     try {
-      const entityText = new TextDecoder().decode(
-        this.buffer.subarray(ref.byteOffset, ref.byteOffset + ref.byteLength)
+      const entityText = safeUtf8Decode(
+        this.buffer,
+        ref.byteOffset,
+        ref.byteOffset + ref.byteLength,
       );
 
       // Parse: #ID = TYPE(attr1, attr2, ...)
-      const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\((.*)\)/);
+      // [\s\S] (not `.`) so records whose attribute list spans multiple
+      // source lines still match — `.` stops at the first newline and made
+      // extractEntity return null for ANY multi-line STEP record (lost
+      // storey/covering names + the on-demand attribute fallback).
+      const match = entityText.match(/^#(\d+)\s*=\s*(\w+)\(([\s\S]*)\)/);
       if (!match) return null;
 
       const expressId = parseInt(match[1], 10);
@@ -145,11 +152,27 @@ export class EntityExtractor {
       const items: any[] = [];
       let parenDepth = 0;
       let current = '';
+      let inString = false;
 
       for (let i = 0; i < listContent.length; i++) {
         const char = listContent[i];
 
-        if (char === '(') {
+        if (char === "'") {
+          if (inString) {
+            // Check for escaped quote ('') - STEP uses doubled quotes
+            if (i + 1 < listContent.length && listContent[i + 1] === "'") {
+              current += "''"; // Keep the escaped quote
+              i++; // Skip next quote
+              continue;
+            }
+            inString = false;
+          } else {
+            inString = true;
+          }
+          current += char;
+        } else if (inString) {
+          current += char;
+        } else if (char === '(') {
           parenDepth++;
           current += char;
         } else if (char === ')') {

@@ -12,7 +12,7 @@ import {
   type CacheHeaderInfo,
   type CacheReadOptions,
   type CacheReadResult,
-  type IfcDataStore,
+  type CacheDataStore,
 } from './types.js';
 import { BufferReader } from './utils/buffer-utils.js';
 import { xxhash64 } from './utils/hash.js';
@@ -23,6 +23,7 @@ import { readProperties } from './sections/properties.js';
 import { readQuantities } from './sections/quantities.js';
 import { readRelationships } from './sections/relationships.js';
 import { readGeometry } from './sections/geometry.js';
+import { readEntityIndex } from './sections/entity-index.js';
 
 export class BinaryCacheReader {
   /**
@@ -105,7 +106,7 @@ export class BinaryCacheReader {
     reader.position = relationshipsSection.offset;
     const relationships = readRelationships(reader);
 
-    const dataStore: IfcDataStore = {
+    const dataStore: CacheDataStore = {
       schema: header.schema,
       entityCount: header.entityCount,
       strings,
@@ -116,6 +117,12 @@ export class BinaryCacheReader {
     };
 
     const result: CacheReadResult = { dataStore };
+
+    const entityIndexSection = sectionMap.get(SectionType.EntityIndex);
+    if (entityIndexSection) {
+      reader.position = entityIndexSection.offset;
+      result.entityIndex = readEntityIndex(reader);
+    }
 
     // Read geometry (optional)
     if (!skipGeometry && header.hasGeometry) {

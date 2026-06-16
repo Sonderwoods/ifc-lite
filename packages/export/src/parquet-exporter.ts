@@ -110,7 +110,7 @@ export class ParquetExporter {
             ValueReal: Array.from(properties.valueReal),
             ValueInt: Array.from(properties.valueInt),
             ValueBool: mapTypedArray(properties.valueBool, v => v === 255 ? null : v === 1),
-        });
+        }, new Set(['ValueReal']));
     }
 
     private async writeQuantities(): Promise<Uint8Array> {
@@ -123,7 +123,7 @@ export class ParquetExporter {
             QuantityType: mapTypedArray(quantities.quantityType, t => QuantityTypeToString(t)),
             Value: Array.from(quantities.value),
             Formula: mapTypedArray(quantities.formula, i => i > 0 ? strings.get(i) : null),
-        });
+        }, new Set(['Value']));
     }
 
     private async writeRelationships(): Promise<Uint8Array> {
@@ -182,7 +182,19 @@ export class ParquetExporter {
         const allNormals: number[] = [];
 
         for (const mesh of this.geometryResult.meshes) {
-            allPositions.push(...Array.from(mesh.positions));
+            // Positions are in the element's local frame (world = origin + position).
+            // The BOS columnar layout has no transform column, so bake the per-mesh
+            // origin into the world vertices. Normals are origin-invariant. No-op
+            // when origin is absent/[0,0,0].
+            const o = mesh.origin;
+            if (o && (o[0] !== 0 || o[1] !== 0 || o[2] !== 0)) {
+                const p = mesh.positions;
+                for (let i = 0; i < p.length; i += 3) {
+                    allPositions.push(p[i] + o[0], p[i + 1] + o[1], p[i + 2] + o[2]);
+                }
+            } else {
+                allPositions.push(...Array.from(mesh.positions));
+            }
             allNormals.push(...Array.from(mesh.normals));
         }
 
@@ -379,10 +391,15 @@ export class ParquetExporter {
     // UTILITIES
     // ═══════════════════════════════════════════════════════════════
 
-    private async toParquet(columns: Record<string, any[]>): Promise<Uint8Array> {
+    private async toParquet(columns: Record<string, any[]>, floatColumns?: Set<string>): Promise<Uint8Array> {
         try {
-            // Dynamic imports for better tree-shaking
-            const arrow = await import('apache-arrow');
+            // Dynamic imports for better tree-shaking. The package's
+            // browser/node exports map keeps `Arrow.dom.mjs` opaque to
+            // TS5's strict resolver, so the import is typed `any` here
+            // and consumers fall back to runtime checks. See:
+            // https://github.com/apache/arrow/issues/35835
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const arrow: any = await import('apache-arrow');
 
             // Build Arrow vectors from column data
             const vectors: Record<string, any> = {};
@@ -401,7 +418,15 @@ export class ParquetExporter {
                     // All nulls - create string vector with nulls
                     vectors[name] = arrow.vectorFromArray(data);
                 } else if (typeof sample === 'number') {
-                    // Check if it's integer or float
+                    // Columns declared as REAL-typed by the caller (e.g. ValueReal,
+                    // quantity Value) always use Float64 — content inference alone
+                    // would demote whole-number reals like 3.0/1200.0 to Int32,
+                    // losing the float schema and risking wrap for |x| > 2^31.
+                    if (floatColumns?.has(name)) {
+                        vectors[name] = arrow.vectorFromArray(data, new arrow.Float64());
+                        continue;
+                    }
+                    // Otherwise check if it's integer or float by content.
                     const isFloat = data.some((v) => typeof v === 'number' && !Number.isInteger(v));
                     if (isFloat) {
                         vectors[name] = arrow.vectorFromArray(data, new arrow.Float64());

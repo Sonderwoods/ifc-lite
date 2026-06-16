@@ -17,7 +17,7 @@
  */
 
 import { useEffect, type MutableRefObject, type RefObject } from 'react';
-import type { Renderer, VisualEnhancementOptions } from '@ifc-lite/renderer';
+import type { Renderer, VisualEnhancementOptions, LightingEnvironment } from '@ifc-lite/renderer';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import type { SectionPlane } from '@/store';
 
@@ -37,8 +37,16 @@ export interface UseAnimationLoopParams {
   selectedModelIndexRef: MutableRefObject<number | undefined>;
   clearColorRef: MutableRefObject<[number, number, number, number]>;
   visualEnhancementRef: MutableRefObject<VisualEnhancementOptions>;
+  /** Lighting environment (sun, hemisphere ambient, exposure, sky pass). */
+  environmentRef: MutableRefObject<LightingEnvironment>;
   sectionPlaneRef: MutableRefObject<SectionPlane>;
   sectionRangeRef: MutableRefObject<{ min: number; max: number } | null>;
+  /**
+   * Mirror of the renderer's model bounds, written each frame after
+   * render. Read by the section face-pick handler so the cardinal-
+   * fallback `position` % can be computed against the live extents.
+   */
+  modelBoundsRef?: MutableRefObject<{ min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null>;
   selectedEntityIdsRef: MutableRefObject<Set<number> | undefined>;
   coordinateInfoRef: MutableRefObject<CoordinateInfo | undefined>;
   isInteractingRef: MutableRefObject<boolean>;
@@ -71,8 +79,10 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     selectedModelIndexRef,
     clearColorRef,
     visualEnhancementRef,
+    environmentRef,
     sectionPlaneRef,
     sectionRangeRef,
+    modelBoundsRef,
     selectedEntityIdsRef,
     coordinateInfoRef,
     isInteractingRef,
@@ -95,6 +105,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     let lastRotationUpdate = 0;
     let lastScaleUpdate = 0;
     let lastRenderTime = 0;
+    let wasAnimating = false;
 
     // Adaptive render throttle: large models get fewer FPS during continuous
     // rendering (interaction + inertia) to prevent the main thread from being
@@ -143,6 +154,16 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
       // 2. Camera update (animation / inertia)
       const isAnimating = camera.update(deltaTime);
 
+      // Camera tweens (Home / view cube / zoom-extent) render their frames
+      // with isInteracting=true; without a settle render the last tween frame
+      // could stay on screen at degraded quality until the next incidental
+      // render. Mouse/wheel/touch paths already request their own settle
+      // frame on release — this covers the animation path.
+      if (wasAnimating && !isAnimating && !isInteractingRef.current) {
+        renderer.requestRender();
+      }
+      wasAnimating = isAnimating;
+
       // 3. Render if anything changed
       // Peek first — only consume the flag when we actually commit to rendering.
       // This prevents a throttled frame from eating the dirty flag.
@@ -167,16 +188,43 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
           selectedModelIndex: selectedModelIndexRef.current,
           clearColor: clearColorRef.current,
           visualEnhancement: visualEnhancementRef.current,
+          environment: environmentRef.current,
           isInteracting: isInteractingRef.current || isAnimating,
+          // Let the effects governor judge missed frames against the
+          // intentional large-model throttle instead of display refresh.
+          interactionFrameIntervalMs: continuousThrottleMs || undefined,
           buildingRotation: coordinateInfoRef.current?.buildingRotation,
           sectionPlane: activeToolRef.current === 'section' ? {
-            ...sectionPlaneRef.current,
+            axis: sectionPlaneRef.current.axis,
+            position: sectionPlaneRef.current.position,
+            enabled: sectionPlaneRef.current.enabled,
+            flipped: sectionPlaneRef.current.flipped,
+            // Cap rendering settings — the renderer reads these to draw the
+            // filled, hatched cut surfaces.
+            showCap: sectionPlaneRef.current.showCap,
+            showOutlines: sectionPlaneRef.current.showOutlines,
+            capStyle: sectionPlaneRef.current.capStyle,
             min: sectionRangeRef.current?.min,
             max: sectionRangeRef.current?.max,
+            // Custom (face-picked) plane override (issue #243). When set
+            // the renderer uses these verbatim and ignores axis/position/
+            // min/max for the clip math; cap polygons are still emitted
+            // through the same Section2DOverlayRenderer with a custom
+            // basis so the silhouette lands on the tilted plane.
+            normal:   sectionPlaneRef.current.custom?.normal,
+            distance: sectionPlaneRef.current.custom?.distance,
           } : undefined,
           terrainClipY: terrainClipYRef.current ?? undefined,
         });
         lastRenderTime = currentTime;
+        // Snapshot the renderer's current model bounds so the section
+        // face-pick handler can compute a correct cardinal-fallback
+        // `position` percentage. Cheap (a few field reads) and avoids a
+        // race where the click handler reads stale bounds during the
+        // first few frames after a model loads.
+        if (modelBoundsRef) {
+          modelBoundsRef.current = renderer.getModelBounds() ?? modelBoundsRef.current;
+        }
       }
 
       // 4. Sync UI widgets

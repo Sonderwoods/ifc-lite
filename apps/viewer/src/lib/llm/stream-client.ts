@@ -9,6 +9,8 @@
  * back as SSE. Extracts usage headers from the response for UI display.
  */
 
+import { buildCacheableSystem, logCacheHit } from './prompt-cache.js';
+
 /** A text content part in a multimodal message */
 export interface TextContentPart {
   type: 'text';
@@ -53,8 +55,6 @@ export interface StreamOptions {
   messages: StreamMessage[];
   /** System prompt */
   system?: string;
-  /** Auth JWT */
-  authToken?: string | null;
   /** AbortSignal for cancellation */
   signal?: AbortSignal;
   /** Called for each text chunk as it arrives */
@@ -118,15 +118,65 @@ export function drainSseBuffer(buffer: string, flush: boolean = false): { events
 }
 
 /**
+ * Read an SSE stream, invoking onEvent for each `data:` payload.
+ * Skips `[DONE]` sentinels and malformed lines. Returns true if the stream
+ * completed normally; false on abort or error (errors are forwarded via
+ * onError, aborts are silent).
+ */
+export async function readSseStream(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal | undefined,
+  onEvent: (data: string) => void,
+  onError: (err: Error) => void,
+): Promise<boolean> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const dispatchDrained = (events: string[]) => {
+    for (const evt of events) {
+      for (const line of evt.split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          onEvent(data);
+        } catch (err) {
+          // Malformed JSON payloads are expected and skipped, but a genuine
+          // callback failure (onChunk/onUsageInfo/logCacheHit/fullText) would
+          // otherwise be silently dropped — surface it for diagnosability.
+          console.debug('[sse] skipped event', err);
+        }
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const drained = drainSseBuffer(buffer);
+      buffer = drained.remainder;
+      dispatchDrained(drained.events);
+    }
+    buffer += decoder.decode();
+    dispatchDrained(drainSseBuffer(buffer, true).events);
+    return true;
+  } catch (err) {
+    if (signal?.aborted) return false;
+    onError(err instanceof Error ? err : new Error(String(err)));
+    return false;
+  }
+}
+
+/**
  * Fetch current usage snapshot without sending a chat message.
  * Used for instant UI hydration and periodic refresh.
  */
-export async function fetchUsageSnapshot(proxyUrl: string, authToken?: string | null): Promise<UsageInfo | null> {
+export async function fetchUsageSnapshot(proxyUrl: string): Promise<UsageInfo | null> {
   const isDev = Boolean((import.meta as unknown as { env?: Record<string, unknown> }).env?.DEV);
   const headers: Record<string, string> = {};
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
 
   const snapshotUrl = `${proxyUrl}${proxyUrl.includes('?') ? '&' : '?'}usage=1`;
   const appSnapshotUrl = '/api/chat?usage=1';
@@ -165,17 +215,24 @@ export async function fetchUsageSnapshot(proxyUrl: string, authToken?: string | 
  * Parses SSE format (data: {...}\n\n).
  */
 export async function streamChat(options: StreamOptions): Promise<void> {
-  const { proxyUrl, model, messages, system, authToken, signal, onChunk, onComplete, onError, onUsageInfo, onFinishReason } = options;
+  const { proxyUrl, model, messages, system, signal, onChunk, onComplete, onError, onUsageInfo, onFinishReason } = options;
   const isDev = Boolean((import.meta as unknown as { env?: Record<string, unknown> }).env?.DEV);
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  if (authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
 
-  const requestBody = JSON.stringify({ messages, model, system });
+  // Shape the system prompt with cache_control markers when it's
+  // long enough to be worth caching. The proxy passes the body
+  // through to Anthropic, which accepts both string and array forms.
+  // Authoring turns (which ship the ~5 KiB manifest/widget/capability
+  // contract) hit this path; one-shot turns fall under the threshold
+  // and pass through as plain string.
+  const requestBody = JSON.stringify({
+    messages,
+    model,
+    system: buildCacheableSystem(system),
+  });
   const fetchChat = async (url: string) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(new Error('Chat request timed out. Please try again.')), STREAM_REQUEST_TIMEOUT_MS);
@@ -255,21 +312,13 @@ export async function streamChat(options: StreamOptions): Promise<void> {
       };
       errorDetail = errorBody.error || errorDetail;
 
-      if (response.status === 403 && errorBody.upgrade) {
-        errorDetail = 'Upgrade to Pro to use this model.';
-      }
-
       if (response.status === 401) {
-        errorDetail = 'Authentication expired. Please sign out and sign in again.';
+        errorDetail = 'Authentication error.';
       }
 
       if (response.status === 429) {
-        if (errorBody.type === 'credits') {
-          const contactEmail = errorBody.contactEmail as string | undefined;
-          const contactSuffix = contactEmail ? ` Need more? Reach out at ${contactEmail}.` : '';
-          errorDetail = `Monthly credits used up. Resets ${errorBody.resetAt ? new Date(errorBody.resetAt).toLocaleDateString() : 'next month'}.${contactSuffix}`;
-        } else if (errorBody.type === 'request_cap') {
-          errorDetail = errorBody.error || 'Daily limit reached. Upgrade to Pro for more.';
+        if (errorBody.type === 'request_cap') {
+          errorDetail = errorBody.error || 'Daily limit reached. Add your own API key in Settings for unlimited access.';
         } else {
           errorDetail = errorBody.error || 'Limit reached. Please try again later.';
         }
@@ -308,102 +357,42 @@ export async function streamChat(options: StreamOptions): Promise<void> {
     return;
   }
 
-  // Parse SSE stream
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let fullText = '';
   let finishReason: string | null = null;
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  const ok = await readSseStream(response.body, signal, (data) => {
+    const parsed = JSON.parse(data) as {
+      __ifcLiteUsage?: UsageInfo & {
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+      };
+      choices?: Array<{
+        delta?: { content?: string };
+        finish_reason?: string | null;
+      }>;
+    };
 
-      buffer += decoder.decode(value, { stream: true });
-
-      const drained = drainSseBuffer(buffer);
-      buffer = drained.remainder;
-
-      for (const event of drained.events) {
-        for (const line of event.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-
-          if (data === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(data) as {
-              __ifcLiteUsage?: UsageInfo;
-              choices?: Array<{
-                delta?: { content?: string };
-                finish_reason?: string | null;
-              }>;
-            };
-
-            // Final usage update emitted by proxy after stream-end reconciliation.
-            if (parsed.__ifcLiteUsage && onUsageInfo) {
-              onUsageInfo(parsed.__ifcLiteUsage);
-              continue;
-            }
-
-            const content = parsed.choices?.[0]?.delta?.content;
-            if (content) {
-              fullText += content;
-              onChunk(content);
-            }
-            const chunkFinishReason = parsed.choices?.[0]?.finish_reason;
-            if (chunkFinishReason) {
-              finishReason = chunkFinishReason;
-            }
-          } catch {
-            // Skip malformed SSE lines
-          }
-        }
-      }
+    // Final usage update emitted by proxy after stream-end reconciliation.
+    if (parsed.__ifcLiteUsage && onUsageInfo) {
+      onUsageInfo(parsed.__ifcLiteUsage);
+      // Surface cache hit/miss numbers under the same logger as the
+      // direct path; observability stays consistent across both flows.
+      logCacheHit(parsed.__ifcLiteUsage);
+      return;
     }
-    buffer += decoder.decode();
-    const drained = drainSseBuffer(buffer, true);
-    for (const event of drained.events) {
-      for (const line of event.split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6);
 
-        if (data === '[DONE]') continue;
-
-        try {
-          const parsed = JSON.parse(data) as {
-            __ifcLiteUsage?: UsageInfo;
-            choices?: Array<{
-              delta?: { content?: string };
-              finish_reason?: string | null;
-            }>;
-          };
-
-          if (parsed.__ifcLiteUsage && onUsageInfo) {
-            onUsageInfo(parsed.__ifcLiteUsage);
-            continue;
-          }
-
-          const content = parsed.choices?.[0]?.delta?.content;
-          if (content) {
-            fullText += content;
-            onChunk(content);
-          }
-          const chunkFinishReason = parsed.choices?.[0]?.finish_reason;
-          if (chunkFinishReason) {
-            finishReason = chunkFinishReason;
-          }
-        } catch {
-          // Skip malformed SSE lines
-        }
-      }
+    const content = parsed.choices?.[0]?.delta?.content;
+    if (content) {
+      fullText += content;
+      onChunk(content);
     }
-  } catch (err) {
-    if (signal?.aborted) return;
-    onError(err instanceof Error ? err : new Error(String(err)));
-    return;
-  }
+    const chunkFinishReason = parsed.choices?.[0]?.finish_reason;
+    if (chunkFinishReason) {
+      finishReason = chunkFinishReason;
+    }
+  }, onError);
+
+  if (!ok) return;
 
   onFinishReason?.(finishReason);
   onComplete(fullText);

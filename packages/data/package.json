@@ -1,14 +1,15 @@
 {
   "name": "@ifc-lite/data",
-  "version": "1.15.2",
+  "version": "2.0.3",
   "description": "Columnar data structures for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "default": "./dist/index.js"
     }
   },
   "scripts": {
@@ -16,21 +17,25 @@
     "dev": "pnpm exec tsc --watch",
     "test": "vitest run",
     "generate:epsg-index": "tsx ../../scripts/generate-epsg-index.ts",
-    "augment:epsg-proj4": "tsx ../../scripts/augment-epsg-proj4.ts"
+    "augment:epsg-proj4": "tsx ../../scripts/augment-epsg-proj4.ts",
+    "verify:epsg": "tsx scripts/verify-epsg-roundtrip.ts",
+    "generate:ifc-schema": "tsx scripts/generate-ifc-schema.ts"
   },
   "devDependencies": {
-    "typescript": "^5.3.0",
-    "vitest": "^1.6.0"
+    "@types/node": "^25.9.3",
+    "proj4": "^2.20.9",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.0"
   },
   "license": "MPL-2.0",
   "author": "Louis True",
   "repository": {
     "type": "git",
-    "url": "https://github.com/louistrue/ifc-lite.git",
+    "url": "https://github.com/LTplus-AG/ifc-lite.git",
     "directory": "packages/data"
   },
-  "homepage": "https://louistrue.github.io/ifc-lite/",
-  "bugs": "https://github.com/louistrue/ifc-lite/issues",
+  "homepage": "https://ltplus-ag.github.io/ifc-lite/",
+  "bugs": "https://github.com/LTplus-AG/ifc-lite/issues",
   "keywords": [
     "ifc",
     "bim",

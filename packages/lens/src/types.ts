@@ -94,6 +94,26 @@ export interface LensDataProvider {
     name: string;
     quantities: ReadonlyArray<{ name: string }>;
   }>;
+
+  /**
+   * Get the federated model identifier for an entity.
+   * Optional — engine skips model criteria when not implemented.
+   */
+  getModelId?(globalId: number): string | undefined;
+
+  /**
+   * Get the display name for a model identifier (for legends and UI).
+   * Optional — falls back to the raw modelId when not implemented.
+   */
+  getModelName?(modelId: string): string | undefined;
+
+  /**
+   * Get the groups/zones an entity is assigned to via IfcRelAssignsToGroup
+   * (IfcZone, IfcGroup, IfcSystem). Used by the "group" criterion / auto-color
+   * source to colour or isolate by zone membership. Optional — the engine skips
+   * group criteria when not implemented (#1075).
+   */
+  getEntityGroups?(globalId: number): ReadonlyArray<{ id: number; name?: string; type: string }>;
 }
 
 /** Property set returned by {@link LensDataProvider.getPropertySets} */
@@ -118,7 +138,7 @@ export interface ClassificationInfo {
 
 /** Criteria for matching entities */
 export interface LensCriteria {
-  type: 'ifcType' | 'property' | 'material' | 'attribute' | 'quantity' | 'classification';
+  type: 'ifcType' | 'property' | 'material' | 'attribute' | 'quantity' | 'classification' | 'model' | 'group';
   /** IFC class name (e.g. "IfcWall") — used when type === "ifcType" */
   ifcType?: string;
   /** Property set name (e.g. "Pset_WallCommon") — used when type === "property" */
@@ -145,6 +165,12 @@ export interface LensCriteria {
   classificationSystem?: string;
   /** Classification code (e.g. "Pr_60_10_32") — used when type === "classification" */
   classificationCode?: string;
+  /** Federated model identifier — used when type === "model" */
+  modelId?: string;
+  /** Group/zone name to match (case-insensitive substring) — used when
+   *  type === "group". Matches if the entity is assigned to an IfcZone /
+   *  IfcGroup whose name contains this value (#1075). */
+  groupName?: string;
 }
 
 /** A single rule within a Lens */
@@ -166,8 +192,12 @@ export interface LensRule {
  * to each group. No manual rule authoring needed.
  */
 export interface AutoColorSpec {
-  source: 'ifcType' | 'attribute' | 'property' | 'quantity' | 'classification' | 'material';
-  /** Property/quantity set name — for source "property" or "quantity" */
+  source: 'ifcType' | 'attribute' | 'property' | 'quantity' | 'classification' | 'material' | 'model' | 'group';
+  /**
+   * Property/quantity set name — for source "property" or "quantity".
+   * For source "classification" it acts as a classification-system filter
+   * (case-insensitive substring match), selecting which reference to key off.
+   */
   psetName?: string;
   /** Attribute, property, or quantity name */
   propertyName?: string;
@@ -219,12 +249,12 @@ export interface AutoColorLegendEntry {
 
 /** Supported auto-color data sources for display in UI */
 export const AUTO_COLOR_SOURCES = [
-  'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material',
+  'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material', 'model', 'group',
 ] as const;
 
 /** All supported criteria types for lens rules */
 export const LENS_CRITERIA_TYPES = [
-  'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material',
+  'ifcType', 'attribute', 'property', 'quantity', 'classification', 'material', 'model', 'group',
 ] as const;
 
 /** Common entity attribute names for the lens rule editor */
@@ -245,7 +275,7 @@ export const COMMON_IFC_CLASSES = [
   'IfcCurtainWall', 'IfcPlate',
   'IfcFooting', 'IfcPile',
   'IfcMember', 'IfcBuildingElementProxy',
-  'IfcFurnishingElement', 'IfcSpace',
+  'IfcFurnishingElement', 'IfcSpace', 'IfcSpatialZone', 'IfcZone',
   'IfcFlowSegment', 'IfcFlowTerminal', 'IfcFlowFitting',
   'IfcDistributionElement',
   'IfcOpeningElement',

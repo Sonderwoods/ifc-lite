@@ -19,9 +19,11 @@ export type NodeType =
   | 'IfcBridgePart'       // IFC4.3 bridge part
   | 'IfcRoadPart'         // IFC4.3 road part
   | 'IfcRailwayPart'      // IFC4.3 railway part
-  | 'IfcSpace'            // Space node
+  | 'IfcSpace'            // Space node (net room area)
+  | 'IfcSpatialZone'      // Spatial zone node (modelled gross area / GFA)
   | 'type-group'          // IFC class grouping header (e.g., "IfcWall (47)")
   | 'ifc-type'            // IFC type entity node (e.g., "IfcWallType/W01")
+  | 'material-group'      // Material grouping (e.g., "Concrete (47)") from the Materials tab
   | 'element';            // Individual element
 
 export interface TreeNode {

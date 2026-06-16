@@ -16,6 +16,7 @@ import { propsCommand } from './commands/props.js';
 import { exportCommand } from './commands/export.js';
 import { idsCommand } from './commands/ids.js';
 import { bcfCommand } from './commands/bcf.js';
+import { clashCommand } from './commands/clash.js';
 import { createCommand } from './commands/create.js';
 import { evalCommand } from './commands/eval.js';
 import { runCommand } from './commands/run.js';
@@ -27,10 +28,13 @@ import { validateCommand } from './commands/validate.js';
 import { bsddCommand } from './commands/bsdd.js';
 import { statsCommand } from './commands/stats.js';
 import { mutateCommand } from './commands/mutate.js';
+import { generateSpacesCommand } from './commands/generate-spaces.js';
 import { askCommand } from './commands/ask.js';
 import { viewCommand } from './commands/view.js';
 import { analyzeCommand } from './commands/analyze.js';
 import { lodCommand } from './commands/lod.js';
+import { mcpCommand } from './commands/mcp.js';
+import { extCommand } from './commands/ext.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -63,6 +67,7 @@ const HELP = `
     export    <file.ifc> --format csv|json|ifc    Export data to file or stdout
     ids       <file.ifc> <rules.ids>              Validate against IDS rules
     bcf       <create|list|add-comment>           Work with BCF collaboration files
+    clash     <file.ifc> [--matrix] [--bcf F]      Detect geometric clashes between elements
     create    <type> [options] --out F             Create IFC elements (30+ types)
     eval      <file.ifc> "<expression>"           Evaluate SDK expression
     run       <script.js> <file.ifc>              Execute a script against model
@@ -74,10 +79,13 @@ const HELP = `
     bsdd      <class|search|psets|qsets> <arg>     buildingSMART Data Dictionary lookup
     stats     <file.ifc>                          Auto-calculated model KPIs and health check
     mutate    <file.ifc> --id N --set P=V --out F  Modify properties/attributes and save
+    generate-spaces <file.ifc> --out F           Derive IfcSpace from walls (slab/roof-aware height)
     ask       <file.ifc> "<question>"            Natural language BIM queries
     view      <file.ifc> [--port N]              Interactive 3D viewer in browser
     analyze   <file.ifc> --viewer <port>        Query + visualize analysis results
     lod       <file.ifc> --level 0|1            Generate lightweight LOD artifacts
+    mcp       <file.ifc> [--transport stdio|http] Start an MCP server bound to one or more IFC files
+    ext       validate <path>|init <dir>          Manage IFClite extensions (Phase 0 — validate, init)
 
   Options:
     --help, -h       Show help
@@ -101,6 +109,9 @@ const HELP = `
     ifc-lite export model.ifc --format json --type IfcWall,IfcDoor
     ifc-lite ids model.ifc requirements.ids --json
     ifc-lite bcf create --title "Missing door" --out issue.bcf
+    ifc-lite clash model.ifc --matrix --json
+    ifc-lite clash model.ifc --a "IfcDuct*|IfcPipe*" --b "IfcWall*" --mode clearance --clearance 0.05
+    ifc-lite clash model.ifc --matrix --bcf clashes.bcfzip
     ifc-lite create wall --height 3 --thickness 0.2 --start 0,0,0 --end 5,0,0 --out wall.ifc
     ifc-lite create stair --number-of-risers 12 --riser-height 0.175 --width 1.2 --out stair.ifc
     ifc-lite create door --width 0.9 --height 2.1 --position 0,0,0 --out door.ifc
@@ -134,6 +145,10 @@ const HELP = `
     ifc-lite analyze model.ifc --viewer 3456 --rules rules.json --json
     ifc-lite lod model.ifc --level 0 --out model.lod0.json
     ifc-lite lod model.ifc --level 1 --out model.glb --meta model.lod1.json
+    ifc-lite mcp model.ifc
+    ifc-lite mcp model.ifc --read-only
+    ifc-lite mcp arch.ifc struct.ifc --federate
+    ifc-lite mcp model.ifc --transport http --port 8765 --token abc
 
   Pipe-friendly:
     ifc-lite query model.ifc --type IfcWall --json | jq '.[].name'
@@ -185,6 +200,9 @@ async function main(): Promise<void> {
     case 'bcf':
       await bcfCommand(commandArgs);
       break;
+    case 'clash':
+      await clashCommand(commandArgs);
+      break;
     case 'create':
       await createCommand(commandArgs);
       break;
@@ -218,6 +236,9 @@ async function main(): Promise<void> {
     case 'mutate':
       await mutateCommand(commandArgs);
       break;
+    case 'generate-spaces':
+      await generateSpacesCommand(commandArgs);
+      break;
     case 'ask':
       await askCommand(commandArgs);
       break;
@@ -230,6 +251,12 @@ async function main(): Promise<void> {
     case 'lod':
       await lodCommand(commandArgs);
       break;
+    case 'mcp':
+      await mcpCommand(commandArgs);
+      break;
+    case 'ext':
+      await extCommand(commandArgs);
+      break;
     default:
       process.stderr.write(`Unknown command: ${command}\n`);
       process.stderr.write(`Run 'ifc-lite --help' for usage.\n`);
@@ -240,7 +267,7 @@ async function main(): Promise<void> {
 main().catch((err: Error) => {
   process.stderr.write(`Error: ${err.message}\n`);
   if (process.env.DEBUG) {
-    process.stderr.write(err.stack ?? '' + '\n');
+    process.stderr.write((err.stack ?? '') + '\n');
   }
   process.exit(1);
 });

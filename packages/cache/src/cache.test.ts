@@ -18,7 +18,7 @@ import {
   RelationshipType,
 } from '@ifc-lite/data';
 import { BinaryCacheWriter, BinaryCacheReader, xxhash64, SchemaVersion, FORMAT_VERSION } from './index.js';
-import type { IfcDataStore } from './types.js';
+import type { CacheDataStore } from './types.js';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 
 describe('xxhash64', () => {
@@ -44,7 +44,7 @@ describe('xxhash64', () => {
 });
 
 describe('BinaryCacheWriter and BinaryCacheReader', () => {
-  let dataStore: IfcDataStore;
+  let dataStore: CacheDataStore;
   let sourceBuffer: ArrayBuffer;
 
   beforeEach(() => {
@@ -104,6 +104,46 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
     relationshipBuilder.addEdge(3, 5, RelationshipType.ContainsElements, 101);
     const relationships = relationshipBuilder.build();
 
+    const source = new TextEncoder().encode([
+      'ISO-10303-21;',
+      'HEADER;',
+      'ENDSEC;',
+      'DATA;',
+      "#1=IFCPROJECT('guid-project');",
+      "#2=IFCSITE('guid-site');",
+      "#3=IFCBUILDING('guid-building');",
+      "#4=IFCWALL('guid-wall-1');",
+      "#5=IFCWALL('guid-wall-2');",
+      'ENDSEC;',
+      'END-ISO-10303-21;',
+    ].join('\n'));
+    sourceBuffer = source.buffer;
+    const entityRefs = new Map<number, { expressId: number; type: string; byteOffset: number; byteLength: number; lineNumber: number }>();
+    // Find the full `#<id>=` marker (not just the first `#` byte) so a `#`
+    // appearing inside a string value can't produce a wrong offset.
+    const findMarker = (needle: Uint8Array, from: number): number => {
+      outer: for (let i = from; i <= source.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+          if (source[i + j] !== needle[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    };
+    for (const id of [1, 2, 3, 4, 5]) {
+      const marker = new TextEncoder().encode(`#${id}=`);
+      const byteOffset = findMarker(marker, id === 1 ? 0 : (entityRefs.get(id - 1)?.byteOffset ?? 0) + 1);
+      const lineEnd = source.indexOf(0x3b, byteOffset) + 1;
+      const type = id === 1 ? 'IFCPROJECT' : id === 2 ? 'IFCSITE' : id === 3 ? 'IFCBUILDING' : 'IFCWALL';
+      entityRefs.set(id, {
+        expressId: id,
+        type,
+        byteOffset,
+        byteLength: lineEnd - byteOffset,
+        lineNumber: 0,
+      });
+    }
+
     dataStore = {
       schema: SchemaVersion.IFC4,
       entityCount: 5,
@@ -112,10 +152,8 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
       properties,
       quantities,
       relationships,
+      entityIndex: { byId: entityRefs },
     };
-
-    // Mock source buffer
-    sourceBuffer = new TextEncoder().encode('ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n#1=IFCPROJECT();\nENDSEC;\nEND-ISO-10303-21;').buffer;
   });
 
   it('should write and read cache without geometry', async () => {
@@ -143,6 +181,9 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
         normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
         indices: new Uint32Array([0, 1, 2]),
         color: [0.8, 0.8, 0.8, 1.0],
+        // Instanced type-library shape (#957) — must survive the cache round
+        // trip or the viewer's Model/Types switch breaks on cache hits.
+        geometryClass: 2,
       },
     ];
 
@@ -169,6 +210,7 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
     expect(result.geometry).toBeTruthy();
     expect(result.geometry!.meshes.length).toBe(1);
     expect(result.geometry!.meshes[0].expressId).toBe(4);
+    expect(result.geometry!.meshes[0].geometryClass).toBe(2);
     expect(result.geometry!.totalVertices).toBe(3);
     expect(result.geometry!.totalTriangles).toBe(1);
   });
@@ -285,6 +327,28 @@ describe('BinaryCacheWriter and BinaryCacheReader', () => {
     // Check inverse relationships
     const containers = relationships.getRelated(4, RelationshipType.ContainsElements, 'inverse');
     expect(containers).toContain(3);
+  });
+
+  it('should preserve entity index byte offsets through round-trip', async () => {
+    const writer = new BinaryCacheWriter();
+    const cacheBuffer = await writer.write(dataStore, undefined, sourceBuffer, {
+      includeGeometry: false,
+    });
+
+    const reader = new BinaryCacheReader();
+    const result = await reader.read(cacheBuffer);
+
+    expect(result.entityIndex).toBeDefined();
+    expect(Array.from(result.entityIndex!.ids)).toEqual([1, 2, 3, 4, 5]);
+    const wallIndex = Array.from(result.entityIndex!.ids).indexOf(4);
+    expect(result.entityIndex!.typeNames[result.entityIndex!.typeIndices[wallIndex]]).toBe('IFCWALL');
+    const wallText = new TextDecoder().decode(
+      new Uint8Array(sourceBuffer).subarray(
+        result.entityIndex!.byteOffsets[wallIndex],
+        result.entityIndex!.byteOffsets[wallIndex] + result.entityIndex!.byteLengths[wallIndex],
+      ),
+    );
+    expect(wallText).toBe("#4=IFCWALL('guid-wall-1');");
   });
 
   it('should preserve ifcType in geometry through round-trip', async () => {

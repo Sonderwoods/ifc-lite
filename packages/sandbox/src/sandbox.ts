@@ -61,29 +61,40 @@ export class Sandbox {
   /** Initialize the sandbox (loads WASM module if not cached) */
   async init(): Promise<void> {
     const module = await getModule();
+    // Set this.runtime before the try so dispose() can free it if any
+    // subsequent step (newContext / buildBridge) throws — otherwise a failed
+    // init() leaks the WASM runtime for the page/process lifetime, since the
+    // caller never receives a handle to dispose.
     this.runtime = module.newRuntime();
 
-    // Apply resource limits
-    this.runtime.setMemoryLimit(this.config.limits.memoryBytes ?? DEFAULT_LIMITS.memoryBytes);
-    this.runtime.setMaxStackSize(this.config.limits.maxStackBytes ?? DEFAULT_LIMITS.maxStackBytes);
+    try {
+      // Apply resource limits
+      this.runtime.setMemoryLimit(this.config.limits.memoryBytes ?? DEFAULT_LIMITS.memoryBytes);
+      this.runtime.setMaxStackSize(this.config.limits.maxStackBytes ?? DEFAULT_LIMITS.maxStackBytes);
 
-    // CPU limit via interrupt handler — reads instance field set by eval()
-    const timeoutMs = this.config.limits.timeoutMs ?? DEFAULT_LIMITS.timeoutMs;
-    this.runtime.setInterruptHandler(() => {
-      if (this.evalStartTime > 0 && Date.now() - this.evalStartTime > timeoutMs) {
-        return true; // Interrupt execution
-      }
-      return false;
-    });
+      // CPU limit via interrupt handler — reads instance field set by eval()
+      const timeoutMs = this.config.limits.timeoutMs ?? DEFAULT_LIMITS.timeoutMs;
+      this.runtime.setInterruptHandler(() => {
+        if (this.evalStartTime > 0 && Date.now() - this.evalStartTime > timeoutMs) {
+          return true; // Interrupt execution
+        }
+        return false;
+      });
 
-    this.vm = this.runtime.newContext();
+      this.vm = this.runtime.newContext();
 
-    // Build the bim API inside the sandbox
-    const { logs, dispose } = buildBridge(this.vm, this.sdk, this.config.permissions, {
-      sandboxSessionId: this.sessionId,
-    });
-    this.logs = logs;
-    this.bridgeDispose = dispose;
+      // Build the bim API inside the sandbox
+      const { logs, dispose } = buildBridge(this.vm, this.sdk, this.config.permissions, {
+        sandboxSessionId: this.sessionId,
+      });
+      this.logs = logs;
+      this.bridgeDispose = dispose;
+    } catch (err) {
+      // dispose() is idempotent and null-checks each field, freeing the
+      // bridge, vm, and runtime in order without risk of double-free.
+      this.dispose();
+      throw err;
+    }
   }
 
   /**
@@ -110,23 +121,61 @@ export class Sandbox {
     this.evalStartTime = Date.now();
 
     const result = this.vm.evalCode(jsCode, options?.filename ?? 'script.js');
+
+    // Drain the QuickJS job queue. Promise callbacks and `async`
+    // function bodies are scheduled as jobs — without this, an entry
+    // wrapped as `async function run()` returns a pending promise and
+    // its body never executes (the tool "succeeds" in 1ms doing
+    // nothing). executePendingJobs runs them to completion.
+    if (this.runtime) {
+      try {
+        this.runtime.executePendingJobs();
+      } catch {
+        // A job that throws must not abort the eval result handling.
+      }
+    }
+
     const durationMs = Date.now() - this.evalStartTime;
     this.evalStartTime = 0;
 
+    // Disposing an eval-result handle must never crash the run. If the
+    // realm became invalid mid-eval, `.dispose()` throws "Lifetime not
+    // alive" — swallow that so the real error (or value) still gets
+    // through instead of being masked by a teardown failure.
+    const safeDispose = (h: { dispose(): void } | undefined): void => {
+      if (!h) return;
+      try { h.dispose(); } catch { /* handle already dead — nothing to free */ }
+    };
+
     if (result.error) {
-      const errorData = this.vm.dump(result.error);
-      result.error.dispose();
+      let errorData: unknown;
+      try {
+        errorData = this.vm.dump(result.error);
+      } catch (dumpErr) {
+        errorData = { message: dumpErr instanceof Error ? dumpErr.message : String(dumpErr) };
+      }
+      safeDispose(result.error);
       throw new ScriptError(
         typeof errorData === 'object' && errorData !== null && 'message' in errorData
-          ? String(errorData.message)
+          ? String((errorData as { message: unknown }).message)
           : String(errorData),
         this.logs,
         durationMs,
       );
     }
 
-    const value = this.vm.dump(result.value);
-    result.value.dispose();
+    let value: unknown;
+    try {
+      value = this.vm.dump(result.value);
+    } catch (dumpErr) {
+      safeDispose(result.value);
+      throw new ScriptError(
+        `Sandbox realm became invalid during execution: ${dumpErr instanceof Error ? dumpErr.message : String(dumpErr)}`,
+        this.logs,
+        durationMs,
+      );
+    }
+    safeDispose(result.value);
 
     return {
       value,

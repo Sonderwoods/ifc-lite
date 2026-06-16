@@ -79,7 +79,7 @@ Guide to setting up a development environment for IFClite.
 ### 1. Clone Repository
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/louistrue/ifc-lite.git
+GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/LTplus-AG/ifc-lite.git
 cd ifc-lite
 ```
 
@@ -160,7 +160,7 @@ cd apps/viewer
 pnpm dev
 ```
 
-Open http://localhost:5173 in your browser.
+Open http://localhost:3000 in your browser.
 
 ### Building WASM
 

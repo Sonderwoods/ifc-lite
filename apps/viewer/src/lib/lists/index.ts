@@ -14,10 +14,12 @@ export type {
   ConditionOperator,
   DiscoveredColumns,
   EntityAttribute,
+  ListGrouping,
 } from '@ifc-lite/lists';
 export {
   ENTITY_ATTRIBUTES,
   executeList,
+  summariseListRows,
   listResultToCSV,
   discoverColumns,
   LIST_PRESETS,

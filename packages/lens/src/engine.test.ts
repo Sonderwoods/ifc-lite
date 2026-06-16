@@ -334,6 +334,39 @@ describe('evaluateAutoColorLens', () => {
     expect(result.colorMap.get(3)).toEqual(GHOST_COLOR); // no classification → ghost
   });
 
+  it('should honor psetName as a classification-system filter for multi-system entities', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall' },
+      { id: 2, type: 'IfcSlab' },
+    ];
+    const provider = createMockProvider(entities);
+    // Each entity carries references from two classification systems. The first
+    // reference is Uniclass; psetName must steer grouping to OmniClass instead.
+    (provider as Record<string, unknown>).getClassifications = (id: number) => {
+      if (id === 1) {
+        return [
+          { system: 'Uniclass', identification: 'EF_25_10', name: 'Walls' },
+          { system: 'OmniClass', identification: '23-13', name: 'Walls' },
+        ];
+      }
+      if (id === 2) {
+        return [
+          { system: 'Uniclass', identification: 'EF_25_30', name: 'Floors' },
+          { system: 'OmniClass', identification: '23-13', name: 'Floors' },
+        ];
+      }
+      return [];
+    };
+
+    const spec: AutoColorSpec = { source: 'classification', psetName: 'OmniClass' };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    // Both entities share the same OmniClass code → a single group.
+    expect(result.legend.length).toBe(1);
+    expect(result.legend[0].name).toBe('OmniClass: 23-13');
+    expect(result.legend[0].count).toBe(2);
+  });
+
   it('should auto-color by material when provider supports getMaterialName', () => {
     const entities = [
       { id: 1, type: 'IfcWall' },
@@ -387,5 +420,57 @@ describe('evaluateAutoColorLens', () => {
     // All 30 colors should be unique (no repeats)
     const colors = new Set(result.legend.map(l => l.color));
     expect(colors.size).toBe(30);
+  });
+
+  it('should auto-color by model when provider supports getModelId', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall', modelId: 'model-a' },
+      { id: 2, type: 'IfcWall', modelId: 'model-a' },
+      { id: 3, type: 'IfcSlab', modelId: 'model-b' },
+    ];
+    const entityMap = new Map(entities.map(e => [e.id, e]));
+    const modelNames = new Map([
+      ['model-a', 'Building A.ifc'],
+      ['model-b', 'Building B.ifc'],
+    ]);
+
+    const provider = createMockProvider(entities);
+    (provider as LensDataProvider).getModelId = (id) => entityMap.get(id)?.modelId;
+    (provider as LensDataProvider).getModelName = (modelId) => modelNames.get(modelId);
+
+    const spec: AutoColorSpec = { source: 'model' };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    expect(result.legend.length).toBe(2);
+    expect(result.colorMap.size).toBe(3);
+
+    const groupA = result.legend.find(e => e.name === 'Building A.ifc');
+    const groupB = result.legend.find(e => e.name === 'Building B.ifc');
+    expect(groupA).toBeDefined();
+    expect(groupA!.count).toBe(2);
+    expect(groupB).toBeDefined();
+    expect(groupB!.count).toBe(1);
+
+    const colors = new Set(result.legend.map(e => e.color));
+    expect(colors.size).toBe(2);
+  });
+
+  it('should auto-color single model as one group', () => {
+    const entities = [
+      { id: 1, type: 'IfcWall', modelId: 'legacy' },
+      { id: 2, type: 'IfcSlab', modelId: 'legacy' },
+    ];
+    const entityMap = new Map(entities.map(e => [e.id, e]));
+
+    const provider = createMockProvider(entities);
+    (provider as LensDataProvider).getModelId = (id) => entityMap.get(id)?.modelId;
+    (provider as LensDataProvider).getModelName = () => 'Model';
+
+    const spec: AutoColorSpec = { source: 'model' };
+    const result = evaluateAutoColorLens(spec, provider);
+
+    expect(result.legend.length).toBe(1);
+    expect(result.legend[0].name).toBe('Model');
+    expect(result.legend[0].count).toBe(2);
   });
 });

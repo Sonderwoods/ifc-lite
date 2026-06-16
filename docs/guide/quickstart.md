@@ -47,7 +47,7 @@ Process IFC files entirely in the browser using WebAssembly.
     npm run dev
     ```
 
-Open `http://localhost:5173` and drag an IFC file onto the viewer.
+Open `http://localhost:3000` and drag an IFC file onto the viewer.
 
 !!! tip "No WebGPU? Use Three.js or Babylon.js"
     The `threejs` and `babylonjs` templates use WebGL, which works in all modern browsers. See the [Three.js](../tutorials/threejs-integration.md) and [Babylon.js](../tutorials/babylonjs-integration.md) integration guides for details.
@@ -91,12 +91,15 @@ async function main() {
   console.log(`Parsed ${store.entityCount} entities`);
 
   // Process geometry from the IFC buffer
-  const geometryResult = await geometry.process(new Uint8Array(buffer));
+  const meshes = [];
+  for await (const event of geometry.processAdaptive(new Uint8Array(buffer))) {
+    if (event.type === 'batch') meshes.push(...event.meshes);
+  }
 
-  console.log(`Extracted ${geometryResult.meshes.length} meshes`);
+  console.log(`Extracted ${meshes.length} meshes`);
 
   // Load geometry into renderer (creates GPU buffers and batches)
-  renderer.loadGeometry(geometryResult);
+  renderer.loadGeometry(meshes);
 
   // Fit camera to model bounds
   renderer.fitToView();
@@ -212,7 +215,7 @@ Process IFC files on a high-performance Rust server with intelligent caching.
 
 ```bash
 # Using Docker
-docker run -p 3001:8080 ghcr.io/louistrue/ifc-lite-server
+docker run -p 3001:8080 ghcr.io/LTplus-AG/ifc-lite-server
 
 # Or using native binary
 npx @ifc-lite/server-bin
@@ -401,8 +404,11 @@ renderer.addMeshes(result.meshes);
 // Option 2: Load geometry from GeometryProcessor result
 const geometry = new GeometryProcessor();
 await geometry.init();
-const geometryResult = await geometry.process(new Uint8Array(buffer));
-renderer.loadGeometry(geometryResult);
+const meshes = [];
+for await (const event of geometry.processAdaptive(new Uint8Array(buffer))) {
+  if (event.type === 'batch') meshes.push(...event.meshes);
+}
+renderer.loadGeometry(meshes);
 
 // Fit camera to model
 renderer.fitToView();

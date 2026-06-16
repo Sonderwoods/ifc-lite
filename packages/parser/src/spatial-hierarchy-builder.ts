@@ -12,6 +12,7 @@ import {
   RelationshipType,
   createLogger,
   isBuildingLikeSpatialType,
+  isSpaceLikeSpatialType,
   isSpatialStructureType,
   isStoreyLikeSpatialType,
 } from '@ifc-lite/data';
@@ -72,7 +73,8 @@ export class SpatialHierarchyBuilder {
       storeyElevations,
       elementToStorey,
       entityTypeMap,
-      lengthUnitScale
+      lengthUnitScale,
+      new Set<number>()
     );
 
     // Note: storeyHeights remains empty for client path - uses on-demand property extraction
@@ -171,10 +173,26 @@ export class SpatialHierarchyBuilder {
     storeyElevations: Map<number, number>,
     elementToStorey: Map<number, number>,
     entityTypeMap: Map<number, IfcTypeEnum>,
-    lengthUnitScale: number
+    lengthUnitScale: number,
+    visited: Set<number>
   ): SpatialNode {
     const typeEnum = entityTypeMap.get(expressId) ?? IfcTypeEnum.Unknown;
     const name = entities.getName(expressId);
+
+    // Guard against cyclic IfcRelAggregates chains (A aggregates B, B aggregates A),
+    // which would otherwise recurse unbounded and overflow the stack. A revisited node
+    // is returned as a leaf so the rest of the hierarchy still builds.
+    if (visited.has(expressId)) {
+      return {
+        expressId,
+        type: typeEnum,
+        name,
+        elevation: undefined,
+        children: [],
+        elements: [],
+      };
+    }
+    visited.add(expressId);
 
     // Extract elevation for storeys (apply unit scale to convert to meters)
     let elevation: number | undefined;
@@ -193,10 +211,28 @@ export class SpatialHierarchyBuilder {
       RelationshipType.ContainsElements,
       'forward'
     );
-    const containedElements = rawContainedElements.filter((id) => {
+    // Keep entities whose type isn't in the EntityTable (e.g. IFC4x3 leaves the
+    // categorizer skipped). The filter's purpose is to peel off spatial-structure
+    // children — those become recursive nodes via the aggregates branch — not to
+    // gate on whether the EntityTable happened to record the type. Dropping
+    // missing entities silently hides every IfcReferent/IfcSignal/IfcAlignment
+    // under an IfcRailway/IfcRoad even though the relationship graph has them.
+    // A contained spatial element — an IfcSpace / IfcSpatialZone attached to a
+    // storey via IfcRelContainedInSpatialStructure, which is what Revit Family +
+    // Dynamo emit instead of IfcRelAggregates — is a tree NODE, not a contained
+    // product. Split it out here and promote it below; without this it was
+    // filtered out and vanished from the hierarchy (#1075). Unknown-typed
+    // entities (not in the EntityTable, e.g. some IFC4x3 leaves) stay elements.
+    const containedElements: number[] = [];
+    const containedSpatialChildren: number[] = [];
+    for (const id of rawContainedElements) {
       const childType = entityTypeMap.get(id);
-      return childType !== undefined && !isSpatialStructureType(childType);
-    });
+      if (childType !== undefined && isSpatialStructureType(childType) && childType !== IfcTypeEnum.IfcProject) {
+        containedSpatialChildren.push(id);
+      } else {
+        containedElements.push(id);
+      }
+    }
 
     // Get child spatial elements via IfcRelAggregates (inverse - who aggregates this?)
     // Actually, we want forward - what does this element aggregate?
@@ -206,12 +242,17 @@ export class SpatialHierarchyBuilder {
       'forward'
     );
 
-    // Filter to supported spatial container types, including IFC4.3 facility/facility-part hierarchies.
+    // Spatial child nodes come from BOTH aggregation and containment. Dedupe so a
+    // space referenced by both relationships isn't built twice (which `visited`
+    // would otherwise reduce to a duplicate leaf node).
     const childNodes: SpatialNode[] = [];
-    for (const childId of aggregatedChildren) {
+    const spatialChildIds = new Set<number>();
+    const addSpatialChild = (childId: number) => {
+      if (spatialChildIds.has(childId)) return;
       const childType = entityTypeMap.get(childId) ?? IfcTypeEnum.Unknown;
       if (isSpatialStructureType(childType) && childType !== IfcTypeEnum.IfcProject) {
-        const childNode = this.buildNode(
+        spatialChildIds.add(childId);
+        childNodes.push(this.buildNode(
           childId,
           entities,
           relationships,
@@ -225,11 +266,13 @@ export class SpatialHierarchyBuilder {
           storeyElevations,
           elementToStorey,
           entityTypeMap,
-          lengthUnitScale
-        );
-        childNodes.push(childNode);
+          lengthUnitScale,
+          visited
+        ));
       }
-    }
+    };
+    for (const childId of aggregatedChildren) addSpatialChild(childId);
+    for (const childId of containedSpatialChildren) addSpatialChild(childId);
 
     // Add elements to appropriate maps
     if (isStoreyLikeSpatialType(typeEnum)) {
@@ -238,13 +281,22 @@ export class SpatialHierarchyBuilder {
       byBuilding.set(expressId, containedElements);
     } else if (typeEnum === IfcTypeEnum.IfcSite) {
       bySite.set(expressId, containedElements);
-    } else if (typeEnum === IfcTypeEnum.IfcSpace) {
+    } else if (isSpaceLikeSpatialType(typeEnum)) {
+      // IfcSpace and IfcSpatialZone both roll up their contained elements here.
       bySpace.set(expressId, containedElements);
     }
 
     if (isStoreyLikeSpatialType(typeEnum)) {
       for (const elementId of containedElements) {
         elementToStorey.set(elementId, expressId);
+      }
+      // Map the storey's spatial children (IfcSpace / IfcSpatialZone) to it too,
+      // so a selected space resolves "which storey it's on" — the space itself
+      // is a child node, not in containedElements (#1075).
+      for (const childId of spatialChildIds) {
+        if (!elementToStorey.has(childId)) {
+          elementToStorey.set(childId, expressId);
+        }
       }
     }
 

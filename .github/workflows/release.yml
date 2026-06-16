@@ -1,5 +1,25 @@
 name: Release
 
+# PUBLISH AUTHENTICATION — Phase B trusted publishing
+#
+# Package registries — short-lived credentials minted via OIDC at runtime:
+#
+#   npm        — Trusted Publisher configured per `@ifc-lite/*` package on
+#                npmjs.com. `id-token: write` + npm CLI ≥ 11.5.1 +
+#                NPM_CONFIG_PROVENANCE=true completes the OIDC handshake
+#                automatically; no NPM_TOKEN needed.
+#   crates.io  — Trusted Publisher configured per crate on crates.io.
+#                rust-lang/crates-io-auth-action exchanges the OIDC token
+#                for a 30-minute CARGO_REGISTRY_TOKEN.
+#
+# Git side (push of `changeset-release/main` + opening the version PR) uses
+# a fine-grained PAT (`secrets.RELEASE_PAT`) — see the inline comment on
+# the Checkout step for why a PAT and not GITHUB_TOKEN or a GitHub App.
+#
+# The release job runs in the `release-publish` GitHub Environment so any
+# residual repo-scoped secrets are unreachable from other jobs. See
+# docs/security/incident-response.md (Phase E) for the rotation runbook.
+
 on:
   push:
     branches:
@@ -7,10 +27,14 @@ on:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
+permissions:
+  contents: read
+
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    environment: release-publish
     permissions:
       contents: write
       pull-requests: write
@@ -19,55 +43,129 @@ jobs:
       published: ${{ steps.changesets.outputs.published }}
       version: ${{ steps.get-version.outputs.version }}
     steps:
+      # AUTH for the changesets version PR (`chore: version packages`):
+      # we use a fine-grained PAT (`secrets.RELEASE_PAT`), NOT the default
+      # GITHUB_TOKEN, because GitHub suppresses pull_request/push workflow
+      # triggers on GITHUB_TOKEN-authored events (recursion guard) so the
+      # required `Build + WASM + Rust + Node` check would never run on a
+      # version PR and it would sit permanently "Expected" (issue #766).
+      #
+      # Previously this used an installation token from a GitHub App
+      # (`ifc-lite-release-bot-org`) but the install didn't carry over when
+      # the repo moved from `louistrue/ifc-lite` to `LTplus-AG/ifc-lite`,
+      # and the App's installation token on the new owner lost
+      # `pull_requests:write` — every Release run after that failed with
+      # "Resource not accessible by integration" on the create-PR API call.
+      #
+      # A fine-grained PAT scoped to this repo with `contents: read+write`
+      # and `pull_requests: read+write` survives org/repo moves and removes
+      # the App-management surface entirely. Rotate the PAT in the repo
+      # secrets when it expires; no workflow change needed for rotation.
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           lfs: false
+          # Persist the PAT so the version-packages branch push made by
+          # changesets/action is PAT-authored too — not just the PR API call.
+          # Both must be PAT-authored for the pull_request event to fire.
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10
+        # v6 reads the version from the `packageManager` field in
+        # package.json (`pnpm@10.8.1`); specifying `with.version` here
+        # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
+        uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 20
+          # Node 24 ships npm ≥ 11.5.1 out of the box, which is what npm
+          # trusted publishing (OIDC handshake) needs. We tried staying on
+          # Node 22 and self-upgrading npm at runtime in Release #426/#427,
+          # but `npm install -g npm@latest` (with and without --force)
+          # leaves the live npm process unable to resolve its own bundled
+          # deps mid-install — `Cannot find module 'promise-retry'` from
+          # @npmcli/arborist/lib/arborist/rebuild.js. Node 24 sidesteps
+          # the self-upgrade entirely.
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # rust-toolchain.toml pins nightly-2025-11-15 + wasm32-unknown-unknown.
+      # `rustup show` installs that exact toolchain on GHA runners; matches
+      # test.yml so the published bundle is byte-identical
+      # to what CI tested. Plain @stable would leave the nightly missing and
+      # `wasm-pack build` would fail with "toolchain not installed" — exactly
+      # the regression observed on Release #403 after #657 untracked the wasm.
+      # Rust + wasm-pack for the wasm32 build (pure-Rust kernel — no C++
+      # toolchain since M9). Single-sourced in
+      # .github/actions/setup-wasm-build (shared with test.yml / sdk-canary.yml).
+      - name: Setup WASM build toolchain
+        uses: ./.github/actions/setup-wasm-build
+        with:
+          cache-prefix: release
 
       - name: Install Dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
+      # Cache + fetch fixtures so cross-package tests that load
+      # tests/models/ifc5/*.ifcx (pointcloud, export, ifcx) can run.
+      # Mirrors the Test workflow; key changes only when the manifest does.
+      - name: Cache test fixtures
+        id: fixtures-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: tests/models
+          # Namespace cache key separately from `test.yml` (which uses
+          # `ci-fixtures-…`). Phase A hardening — keeps the privileged
+          # release runner from ever reading a cache writeable by a
+          # fork-triggered job. See AGENTS.md security notes.
+          key: release-fixtures-${{ runner.os }}-${{ hashFiles('tests/models/manifest.json') }}
+
+      - name: Fetch fixtures
+        if: steps.fixtures-cache.outputs.cache-hit != 'true'
+        run: pnpm fixtures
+
+      - name: Verify fixtures
+        run: pnpm fixtures:check
+
+      # Build the publishable artifacts. Typecheck / ESM-resolution /
+      # unit tests are NOT re-run here: branch protection requires
+      # test.yml's `Build + WASM + Rust + Node` check to be green on
+      # the PR before merge, so the SHA reaching `push: main` has
+      # already passed all of them. Repeating them would add ~8 min
+      # per release without changing the verdict.
       - name: Build Packages
         run: pnpm build
 
-      - name: Typecheck
-        run: pnpm typecheck
-        continue-on-error: true
-
-      - name: Run Tests
-        run: pnpm test
+      # Exchange the workflow's OIDC ID-token for a short-lived (30-minute)
+      # crates.io access token. Trusted Publisher must be configured on
+      # crates.io for each of ifc-lite-core, ifc-lite-geometry, ifc-lite-wasm
+      # pointing at this repo + this workflow before the first run.
+      - name: Authenticate to crates.io (OIDC)
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
 
       - name: Create Release Pull Request or Publish
         id: changesets
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           version: pnpm run version
           publish: pnpm run release
           commit: 'chore: version packages'
           title: 'chore: version packages'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # PAT (not GITHUB_TOKEN) so the version PR + its commits are
+          # authored by a real user identity and CI triggers on them — see
+          # the comment on the Checkout step for the full rationale.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+          # npm publishes use OIDC trusted publishing — no NPM_TOKEN.
+          # `id-token: write` (set at job level) + npm CLI ≥ 11.5.1 +
+          # NPM_CONFIG_PROVENANCE complete the handshake automatically
+          # and attach SLSA provenance to every tarball.
+          NPM_CONFIG_PROVENANCE: 'true'
+          # crates.io token minted via OIDC above; expires in 30 minutes.
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
 
       - name: Get Version
         id: get-version
@@ -94,6 +192,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # @ifc-lite/server-bin downloads its native archive from a GitHub
+      # release tagged `v<its-own-version>` (packages/server-bin/src/binary.ts).
+      # The root `v<version>` release above is keyed to the *highest* workspace
+      # package version, which is usually NOT server-bin's — so without a
+      # matching tag `npx @ifc-lite/server-bin` 404s on download, and native
+      # binaries never carry geometry fixes that bump only server-bin/wasm.
+      # Create a release at server-bin's own version: that `release: published`
+      # event triggers server-binaries.yml to build + upload the per-platform
+      # archives to this tag, so the download URL resolves with fresh binaries.
+      - name: Create server-bin binary release
+        if: steps.changesets.outputs.published == 'true'
+        run: |
+          SB_VERSION=$(node -p "require('./packages/server-bin/package.json').version")
+          TAG="v${SB_VERSION}"
+          # Skip when the tag already exists (server-bin unchanged this cycle,
+          # or it happens to equal the root release already created above).
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping (server binaries already published)"
+          else
+            git tag "$TAG" || true
+            git push origin "$TAG" || true
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Native server binary for @ifc-lite/server-bin v${SB_VERSION}. See CHANGELOG.md."
+          fi
+        env:
+          # Use the fine-grained PAT, NOT GITHUB_TOKEN: a release created with
+          # GITHUB_TOKEN does NOT emit a `release: published` event that starts new
+          # workflow runs (GitHub recursion guard). server-binaries.yml uploads
+          # binaries only on `release: published`, so a GITHUB_TOKEN-created release
+          # would sit empty and downloads would still 404. The PAT is a real
+          # identity, so the event fires and binaries build + upload to this tag.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
   # Verify every published package is actually reachable on npm.
   # Catches packages accidentally skipped during release before users hit them.
   verify-npm-publish:
@@ -103,19 +235,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           lfs: false
+          persist-credentials: false
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10
+        # v6 reads the version from the `packageManager` field in
+        # package.json (`pnpm@10.8.1`); specifying `with.version` here
+        # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
+        uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 20
+          node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify all packages on npm

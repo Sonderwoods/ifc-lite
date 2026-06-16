@@ -34,6 +34,28 @@ export interface SectionPlaneConfig {
   position: number;
   /** Whether to flip the view direction */
   flipped: boolean;
+  /**
+   * Optional arbitrary-normal override (issue #243). When supplied, the
+   * cutter uses this plane verbatim (`dot(p, normal) = distance`) and
+   * projects intersection points to 2D via `(dot(p − origin, tangent),
+   * dot(p − origin, bitangent))`. The cardinal `axis` / `position` /
+   * `flipped` fields are then only used by downstream code that pre-dates
+   * arbitrary planes (e.g. legacy SVG export); the geometry produced by
+   * the cutter itself is correct for the explicit plane.
+   *
+   * `tangent` and `bitangent` MUST be the same basis the cap renderer
+   * uses (`planeBasis(normal)` from `@ifc-lite/renderer`) so the round-
+   * trip 3D→2D→3D in the cap pipeline stays exact.
+   */
+  customPlane?: {
+    normal:    Vec3;
+    /** Plane offset: `dot(pointOnPlane, normal)`. */
+    distance:  number;
+    /** Origin = the projected pick point on the plane (basis origin). */
+    origin:    Vec3;
+    tangent:   Vec3;
+    bitangent: Vec3;
+  };
 }
 
 export interface SectionConfig {
@@ -41,6 +63,15 @@ export interface SectionConfig {
   plane: SectionPlaneConfig;
   /** Depth range beyond cut plane to include for projection lines (world units) */
   projectionDepth: number;
+  /**
+   * Construction-projection band depths (issue #979). When set, projection
+   * lines split into a VISIBLE band below the cut (thin solid) within
+   * `projectionBelowDepth`, and an OVERHEAD band above the cut (dashed) within
+   * `projectionAboveDepth`. Both default to `projectionDepth` when omitted, so
+   * legacy callers keep their single-window behaviour.
+   */
+  projectionBelowDepth?: number;
+  projectionAboveDepth?: number;
   /** Whether to compute hidden lines */
   includeHiddenLines: boolean;
   /** Crease angle threshold in degrees (edges sharper than this are feature edges) */
@@ -263,6 +294,28 @@ export interface EdgeData {
   ifcType: string;
   /** Model index */
   modelIndex: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MESH OUTLINE (from WASM meshOutline2d — winding-robust footprint, issue #979)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * A winding-robust 2D footprint outline of a mesh, produced by the Rust
+ * `meshOutline2d` WASM binding (it unions projected triangle areas, so it is
+ * correct regardless of ifc-lite's unreliable triangle winding — unlike
+ * normal-based silhouette extraction).
+ *
+ * `contours` are closed rings in **drawing 2D space** (the same basis as
+ * `projectTo2D`, so they coincide with the section-cut polygons); each is a
+ * flat `[u0, v0, u1, v1, …]` with NO duplicated closing vertex. `axisMin` /
+ * `axisMax` are the element's extent along the cut axis (world units), used to
+ * classify the outline into the visible/overhead projection band.
+ */
+export interface MeshOutline2D {
+  contours: ReadonlyArray<ArrayLike<number>>;
+  axisMin: number;
+  axisMax: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

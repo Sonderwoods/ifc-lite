@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { getInheritanceChain } from '../src/ifc-schema';
+import { getInheritanceChain } from '../src/ifc-schema.js';
 
 describe('IFC entity inheritance chain', () => {
     it('IfcAirTerminal has IfcFlowTerminal in its inheritance chain', () => {
@@ -42,5 +42,22 @@ describe('IFC entity inheritance chain', () => {
     it('accepts UPPERCASE input (as passed from getCategory)', () => {
         const chain = getInheritanceChain('IFCAIRTERMINAL');
         expect(chain.map(c => c.toUpperCase())).toContain('IFCFLOWTERMINAL');
+    });
+
+    // Regression for the railway/signal/alignment hierarchy bug: every IFC4x3
+    // infrastructure leaf must inherit from IfcProduct so the schema-driven
+    // CAT_RELEVANT check in columnar-parser.ts can pick them up without
+    // hand-enumerating each new entity type. If a future schema bump adds a
+    // new product leaf, the inheritance chain assertion below will hold
+    // automatically and no parser-side change will be needed.
+    it.each([
+        'IfcReferent', 'IfcSignal', 'IfcSign', 'IfcAlignment', 'IfcPavement',
+        'IfcCourse', 'IfcKerb', 'IfcMooringDevice', 'IfcNavigationElement',
+        'IfcTrackElement', 'IfcVehicle', 'IfcEarthworksFill', 'IfcEarthworksCut',
+        'IfcEarthworksElement', 'IfcSolidStratum', 'IfcVoidStratum', 'IfcWaterStratum',
+        'IfcPositioningElement',
+    ])('%s inherits from IfcProduct (so columnar-parser categorizes it as CAT_RELEVANT)', (type) => {
+        const chain = getInheritanceChain(type).map(c => c.toUpperCase());
+        expect(chain).toContain('IFCPRODUCT');
     });
 });

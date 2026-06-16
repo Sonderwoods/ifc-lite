@@ -2,13 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { IfcParser, parseIfcx, type IfcDataStore } from '@ifc-lite/parser';
-import { GeometryProcessor, GeometryQuality, type CoordinateInfo, type GeometryResult, type MeshData } from '@ifc-lite/geometry';
+import { parseIfcx, createSyntheticDataStore, type IfcDataStore, type PointCloudExtraction } from '@ifc-lite/parser';
+import { type GeometryResult, type MeshData, type PointCloudAsset } from '@ifc-lite/geometry';
 import { loadGLBToMeshData } from '@ifc-lite/cache';
 import type { SchemaVersion } from '../../store/types.js';
-import { calculateMeshBounds, calculateStoreyHeights, createCoordinateInfo, normalizeColor } from '../../utils/localParsingUtils.js';
-
-type RgbaColor = [number, number, number, number];
+import { calculateMeshBounds, createCoordinateInfo, normalizeColor } from '../../utils/localParsingUtils.js';
 
 interface RawIfcxMesh {
   expressId?: number;
@@ -26,40 +24,6 @@ export interface ViewerModelPayload {
   dataStore: IfcDataStore;
   geometryResult: GeometryResult;
   schemaVersion: SchemaVersion;
-}
-
-export interface StepBatchEvent {
-  batchIndex: number;
-  estimatedTotal: number;
-  totalSoFar: number;
-  meshes: MeshData[];
-  coordinateInfo?: CoordinateInfo | null;
-}
-
-export interface StepRtcOffsetEvent {
-  rtcOffset: { x: number; y: number; z: number };
-}
-
-export interface StepBufferIngestOptions {
-  fileName: string;
-  buffer: ArrayBuffer;
-  fileSizeMB: number;
-  getDynamicBatchSize: (fileSizeMB: number) => number | { initial: number; subsequent: number };
-  onProgress?: (progress: { phase: string; percent: number }) => void;
-  onBatch?: (event: StepBatchEvent) => void;
-  onColorUpdate?: (updates: Map<number, RgbaColor>) => void;
-  onSpatialReady?: (dataStore: IfcDataStore) => void;
-  onRtcOffset?: (event: StepRtcOffsetEvent) => void;
-  shouldAbort?: () => boolean;
-  /** Shared RTC offset from first federated model (IFC Z-up coords).
-   *  When set, this model uses the same RTC as the first model instead of
-   *  computing its own, ensuring all models share the same coordinate space. */
-  sharedRtcOffset?: { x: number; y: number; z: number };
-}
-
-export interface StepBufferIngestResult extends ViewerModelPayload {
-  allMeshes: MeshData[];
-  cumulativeColorUpdates: Map<number, RgbaColor>;
 }
 
 export function convertIfcxMeshes(rawMeshes: RawIfcxMesh[]): MeshData[] {
@@ -80,30 +44,15 @@ export function convertIfcxMeshes(rawMeshes: RawIfcxMesh[]): MeshData[] {
 }
 
 export function createMinimalGlbDataStore(buffer: ArrayBuffer, meshCount: number): IfcDataStore {
-  return {
+  // A GLB carries renderable meshes but no IFC entities. Build a typed,
+  // entity-less store via the shared factory so the full `IfcDataStore`
+  // contract (including the lazy `getEntity` / `getProperties` accessors the
+  // query path calls) is compiler-enforced instead of cast away (#1004).
+  return createSyntheticDataStore({
+    schemaVersion: 'IFC4',
     fileSize: buffer.byteLength,
-    schemaVersion: 'IFC4' as const,
     entityCount: meshCount,
-    parseTime: 0,
-    source: new Uint8Array(0),
-    entityIndex: { byId: new Map(), byType: new Map() },
-    strings: { getString: () => undefined, getStringId: () => undefined, count: 0 } as unknown as IfcDataStore['strings'],
-    entities: { count: 0, getId: () => 0, getType: () => 0, getName: () => undefined, getGlobalId: () => undefined } as unknown as IfcDataStore['entities'],
-    properties: { count: 0, getPropertiesForEntity: () => [], getPropertySetForEntity: () => [] } as unknown as IfcDataStore['properties'],
-    quantities: { count: 0, getQuantitiesForEntity: () => [] } as unknown as IfcDataStore['quantities'],
-    relationships: { count: 0, getRelationships: () => [], getRelated: () => [] } as unknown as IfcDataStore['relationships'],
-    spatialHierarchy: null as unknown as IfcDataStore['spatialHierarchy'],
-  } as unknown as IfcDataStore;
-}
-
-export function normalizeDataStoreStoreys(dataStore: IfcDataStore): IfcDataStore {
-  if (dataStore.spatialHierarchy && dataStore.spatialHierarchy.storeyHeights.size === 0 && dataStore.spatialHierarchy.storeyElevations.size > 1) {
-    const calculatedHeights = calculateStoreyHeights(dataStore.spatialHierarchy.storeyElevations);
-    for (const [storeyId, height] of calculatedHeights) {
-      dataStore.spatialHierarchy.storeyHeights.set(storeyId, height);
-    }
-  }
-  return dataStore;
+  });
 }
 
 export function getMaxExpressId(dataStore: IfcDataStore, meshes: MeshData[]): number {
@@ -133,11 +82,26 @@ export async function parseIfcxViewerModel(
   });
 
   const meshes = convertIfcxMeshes(ifcxResult.meshes);
-  if (meshes.length === 0 && ifcxResult.entityCount > 0) {
+  const pointClouds = convertIfcxPointClouds(ifcxResult.pointClouds ?? []);
+  // Treat as overlay-only ONLY when neither meshes nor pointclouds were extracted.
+  // Files that carry just point cloud assets (the buildingSMART Point_Cloud
+  // samples) still represent a renderable model on their own.
+  if (meshes.length === 0 && pointClouds.length === 0 && ifcxResult.entityCount > 0) {
     throw new Error('overlay-only-ifcx');
   }
 
   const { bounds, stats } = calculateMeshBounds(meshes);
+  // Expand bounds to include point cloud asset extents so fit-to-view, the
+  // section-plane slider, and camera near/far all see the points too.
+  for (const pc of pointClouds) {
+    const { min, max } = pc.chunk.bbox;
+    bounds.min.x = Math.min(bounds.min.x, min[0]);
+    bounds.min.y = Math.min(bounds.min.y, min[1]);
+    bounds.min.z = Math.min(bounds.min.z, min[2]);
+    bounds.max.x = Math.max(bounds.max.x, max[0]);
+    bounds.max.y = Math.max(bounds.max.y, max[1]);
+    bounds.max.z = Math.max(bounds.max.z, max[2]);
+  }
   return {
     dataStore: {
       fileSize: ifcxResult.fileSize,
@@ -155,12 +119,26 @@ export async function parseIfcxViewerModel(
     } as unknown as IfcDataStore,
     geometryResult: {
       meshes,
+      pointClouds,
       totalVertices: stats.totalVertices,
       totalTriangles: stats.totalTriangles,
       coordinateInfo: createCoordinateInfo(bounds),
     },
     schemaVersion: 'IFC5',
   };
+}
+
+export function convertIfcxPointClouds(extractions: PointCloudExtraction[]): PointCloudAsset[] {
+  return extractions.map((pc) => ({
+    expressId: pc.expressId,
+    ifcType: pc.ifcType,
+    chunk: {
+      positions: pc.positions,
+      colors: pc.colors,
+      pointCount: pc.pointCount,
+      bbox: pc.bbox,
+    },
+  }));
 }
 
 export async function parseGlbViewerModel(buffer: ArrayBuffer): Promise<ViewerModelPayload> {
@@ -179,102 +157,5 @@ export async function parseGlbViewerModel(buffer: ArrayBuffer): Promise<ViewerMo
       coordinateInfo: createCoordinateInfo(bounds),
     },
     schemaVersion: 'IFC4',
-  };
-}
-
-export async function parseStepBufferViewerModel(options: StepBufferIngestOptions): Promise<StepBufferIngestResult> {
-  const geometryProcessor = new GeometryProcessor({ quality: GeometryQuality.Balanced });
-  await geometryProcessor.init();
-
-  const parser = new IfcParser();
-  const wasmApi = geometryProcessor.getApi();
-  const allMeshes: MeshData[] = [];
-  const cumulativeColorUpdates = new Map<number, RgbaColor>();
-  let finalCoordinateInfo: CoordinateInfo | null = null;
-  let batchIndex = 0;
-  let estimatedTotal = 0;
-  let capturedRtcOffset: { x: number; y: number; z: number } | null = null;
-
-  const dataStorePromise = parser.parseColumnar(options.buffer, {
-    wasmApi,
-    onSpatialReady: (partialStore) => {
-      if (options.shouldAbort?.()) {
-        return;
-      }
-      options.onSpatialReady?.(normalizeDataStoreStoreys(partialStore));
-    },
-  });
-
-  for await (const event of geometryProcessor.processAdaptive(new Uint8Array(options.buffer), {
-    sizeThreshold: 2 * 1024 * 1024,
-    batchSize: options.getDynamicBatchSize(options.fileSizeMB),
-    sharedRtcOffset: options.sharedRtcOffset,
-  })) {
-    if (options.shouldAbort?.()) {
-      break;
-    }
-    switch (event.type) {
-      case 'start':
-        estimatedTotal = event.totalEstimate;
-        break;
-      case 'colorUpdate':
-        for (const [expressId, color] of event.updates) {
-          cumulativeColorUpdates.set(expressId, color);
-        }
-        options.onColorUpdate?.(event.updates);
-        break;
-      case 'rtcOffset':
-        if (event.hasRtc) {
-          capturedRtcOffset = event.rtcOffset;
-          options.onRtcOffset?.({ rtcOffset: event.rtcOffset });
-        }
-        break;
-      case 'batch':
-        batchIndex += 1;
-        for (let i = 0; i < event.meshes.length; i++) {
-          allMeshes.push(event.meshes[i]);
-        }
-        finalCoordinateInfo = event.coordinateInfo ?? null;
-        options.onBatch?.({
-          batchIndex,
-          estimatedTotal,
-          totalSoFar: event.totalSoFar,
-          meshes: event.meshes,
-          coordinateInfo: event.coordinateInfo ?? null,
-        });
-        options.onProgress?.({
-          phase: `Processing geometry (${event.totalSoFar} meshes)`,
-          percent: 10 + Math.min(80, (allMeshes.length / 1000) * 0.8),
-        });
-        break;
-      case 'complete':
-        finalCoordinateInfo = event.coordinateInfo ?? null;
-        break;
-    }
-  }
-
-  const dataStore = normalizeDataStoreStoreys(await dataStorePromise);
-  if (!finalCoordinateInfo) {
-    finalCoordinateInfo = createCoordinateInfo(calculateMeshBounds(allMeshes).bounds);
-  }
-  if (capturedRtcOffset) {
-    finalCoordinateInfo.wasmRtcOffset = capturedRtcOffset;
-  }
-
-  return {
-    dataStore,
-    geometryResult: {
-      meshes: allMeshes,
-      totalVertices: allMeshes.reduce((sum, mesh) => sum + mesh.positions.length / 3, 0),
-      totalTriangles: allMeshes.reduce((sum, mesh) => sum + mesh.indices.length / 3, 0),
-      coordinateInfo: finalCoordinateInfo,
-    },
-    schemaVersion: dataStore.schemaVersion === 'IFC4X3'
-      ? 'IFC4X3'
-      : dataStore.schemaVersion === 'IFC4'
-        ? 'IFC4'
-        : 'IFC2X3',
-    allMeshes,
-    cumulativeColorUpdates,
   };
 }

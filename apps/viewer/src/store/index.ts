@@ -19,6 +19,8 @@ import { createUISlice, type UISlice } from './slices/uiSlice.js';
 import { createHoverSlice, type HoverSlice } from './slices/hoverSlice.js';
 import { createCameraSlice, type CameraSlice } from './slices/cameraSlice.js';
 import { createSectionSlice, type SectionSlice } from './slices/sectionSlice.js';
+export { customPlaneCenter, loadLastSectionMode } from './slices/sectionSlice.js';
+export type { LastSectionMode } from './slices/sectionSlice.js';
 import { createMeasurementSlice, type MeasurementSlice } from './slices/measurementSlice.js';
 import { createDataSlice, type DataSlice } from './slices/dataSlice.js';
 import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
@@ -27,23 +29,36 @@ import { createDrawing2DSlice, type Drawing2DSlice } from './slices/drawing2DSli
 import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
+import { createExtensionsSlice, type ExtensionsSlice } from './slices/extensionsSlice.js';
 import { createListSlice, type ListSlice } from './slices/listSlice.js';
 import { createPinboardSlice, type PinboardSlice } from './slices/pinboardSlice.js';
 import { createLensSlice, type LensSlice } from './slices/lensSlice.js';
+import { createClashSlice, type ClashSlice } from './slices/clashSlice.js';
+import { createCompareSlice, type CompareSlice } from './slices/compareSlice.js';
 import { createScriptSlice, type ScriptSlice } from './slices/scriptSlice.js';
 import { createChatSlice, type ChatSlice } from './slices/chatSlice.js';
 import { createCesiumSlice, type CesiumSlice } from './slices/cesiumSlice.js';
-import { createDesktopEntitlementSlice, type DesktopEntitlementSlice } from './slices/desktopEntitlementSlice.js';
+import { createSolarSlice, type SolarSlice } from './slices/solarSlice.js';
+import { createEnvironmentSlice, type EnvironmentSlice } from './slices/environmentSlice.js';
+import { createScheduleSlice, type ScheduleSlice } from './slices/scheduleSlice.js';
+import { createPlaybackSlice, type PlaybackSlice } from './slices/playbackSlice.js';
+import { createOverlaySlice, type OverlaySlice } from './slices/overlaySlice.js';
+import { createSearchSlice, type SearchSlice } from './slices/searchSlice.js';
+import { createAnnotationsSlice, type AnnotationsSlice } from './slices/annotationsSlice.js';
+import { createAddElementSlice, type AddElementSlice } from './slices/addElementSlice.js';
+import { createSplitToolSlice, type SplitToolSlice } from './slices/splitToolSlice.js';
+import { createLevelDisplaySlice, type LevelDisplaySlice } from './slices/levelDisplaySlice.js';
+import { createPointCloudSlice, type PointCloudSlice, POINT_CLOUD_DEFAULTS } from './slices/pointCloudSlice.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
 
 // Import constants for reset function
-import { CAMERA_DEFAULTS, SECTION_PLANE_DEFAULTS, UI_DEFAULTS, TYPE_VISIBILITY_DEFAULTS } from './constants.js';
+import { CAMERA_DEFAULTS, SECTION_PLANE_DEFAULTS, UI_DEFAULTS, getPersistedTypeVisibility, getPersistedTypeViewMode } from './constants.js';
 
 // Re-export types for consumers
 export type * from './types.js';
 
 // Explicitly re-export multi-model types that need to be imported by name
-export type { EntityRef, SchemaVersion, FederatedModel, MeasurementConstraintEdge, OrthogonalAxis } from './types.js';
+export type { EntityRef, SchemaVersion, FederatedModel, MeasurementConstraintEdge, OrthogonalAxis, SectionCapStyle, SectionCapHatchId, SectionPlane, SectionPlaneAxis } from './types.js';
 
 // Re-export utility functions for entity references
 export { entityRefToString, stringToEntityRef, entityRefEquals, isIfcxDataStore } from './types.js';
@@ -51,6 +66,7 @@ export { entityRefToString, stringToEntityRef, entityRefEquals, isIfcxDataStore 
 // Re-export single source of truth for globalId → EntityRef resolution
 export { resolveEntityRef } from './resolveEntityRef.js';
 export { fromGlobalIdFromModels, toGlobalIdFromModels, toGlobalIdForRef } from './globalId.js';
+export type { ForwardModelMapLike } from './globalId.js';
 
 // Re-export Drawing2D types
 export type { Drawing2DState, Drawing2DStatus, Annotation2DTool, PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, SelectedAnnotation2D } from './slices/drawing2DSlice.js';
@@ -72,16 +88,32 @@ export type { PinboardSlice } from './slices/pinboardSlice.js';
 
 // Re-export Lens types
 export type { LensSlice, Lens, LensRule, LensCriteria } from './slices/lensSlice.js';
+export type { CompareSlice, CompareResult } from './slices/compareSlice.js';
 
 // Re-export Script types
 export type { ScriptSlice } from './slices/scriptSlice.js';
 
 // Re-export Chat types
 export type { ChatSlice } from './slices/chatSlice.js';
-export type { DesktopEntitlementSlice } from './slices/desktopEntitlementSlice.js';
 
 // Re-export Cesium types
-export type { CesiumSlice, CesiumDataSource } from './slices/cesiumSlice.js';
+export type { CesiumSlice, CesiumDataSource, CesiumPlacementDraft } from './slices/cesiumSlice.js';
+
+// Re-export Schedule (4D) types + selectors
+export type { ScheduleSlice, ScheduleTimeRange, GanttTimeScale } from './slices/scheduleSlice.js';
+export type { PlaybackSlice } from './slices/playbackSlice.js';
+export type { OverlaySlice, OverlayLayer, RGBA as OverlayRGBA } from './slices/overlaySlice.js';
+export { composeLayers as composeOverlayLayers } from './slices/overlaySlice.js';
+export {
+  computeScheduleRange,
+  computeHiddenProductIds,
+  computeActiveProductIds,
+  countGeneratedTasks,
+  taskStartEpoch,
+  taskFinishEpoch,
+  parseIsoDate,
+} from './slices/scheduleSlice.js';
+export { resolveScheduleSourceModelId } from './slices/schedule-edit-helpers.js';
 
 // Combined store type
 export type ViewerState = LoadingSlice &
@@ -102,11 +134,34 @@ export type ViewerState = LoadingSlice &
   ListSlice &
   PinboardSlice &
   LensSlice &
+  ClashSlice &
+  CompareSlice &
   ScriptSlice &
   ChatSlice &
   CesiumSlice &
-  DesktopEntitlementSlice & {
+  SolarSlice &
+  EnvironmentSlice &
+  ScheduleSlice &
+  PlaybackSlice &
+  OverlaySlice &
+  SearchSlice &
+  AnnotationsSlice &
+  AddElementSlice &
+  SplitToolSlice &
+  LevelDisplaySlice &
+  PointCloudSlice &
+  ExtensionsSlice & {
     resetViewerState: () => void;
+    /**
+     * Open one right-side analysis panel and close the others, so the chosen
+     * panel is always the topmost/active one. The right panel renders a single
+     * mutually-exclusive chain (lens → clash → ids → bcf → extensions), so
+     * leaving a sibling flag set would keep the higher-precedence panel on top
+     * (the cause of "I have to close clash before I see BCF"). Also un-collapses
+     * the right panel. Routed through by the toolbar, command palette, and the
+     * BCF overlay so every entry point behaves identically.
+     */
+    openWorkspacePanel: (panel: 'bcf' | 'ids' | 'lens' | 'clash' | 'compare' | 'extensions') => void;
   };
 
 /**
@@ -132,10 +187,23 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
   ...createListSlice(...args),
   ...createPinboardSlice(...args),
   ...createLensSlice(...args),
+  ...createClashSlice(...args),
+  ...createCompareSlice(...args),
   ...createScriptSlice(...args),
   ...createChatSlice(...args),
   ...createCesiumSlice(...args),
-  ...createDesktopEntitlementSlice(...args),
+  ...createSolarSlice(...args),
+  ...createEnvironmentSlice(...args),
+  ...createScheduleSlice(...args),
+  ...createPlaybackSlice(...args),
+  ...createOverlaySlice(...args),
+  ...createSearchSlice(...args),
+  ...createAnnotationsSlice(...args),
+  ...createAddElementSlice(...args),
+  ...createSplitToolSlice(...args),
+  ...createLevelDisplaySlice(...args),
+  ...createPointCloudSlice(...args),
+  ...createExtensionsSlice(...args),
 
   // Reset all viewer state when loading new file
   // Note: Does NOT clear models - use clearAllModels() for that
@@ -147,20 +215,24 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       selectedEntityId: null,
       selectedEntityIds: new Set(),
       selectedStoreys: new Set(),
+      // Drop the shared active storey — it references the outgoing model, so a
+      // new file must not inherit a stale storey for Solo / Space Sketch.
+      activeStorey: null,
 
       // Selection (multi-model)
       selectedEntity: null,
       selectedEntitiesSet: new Set(),
+      selectedEntities: [],
+      selectedModelId: null,
 
       // Visibility (legacy)
       hiddenEntities: new Set(),
       isolatedEntities: null,
       classFilter: null,
-      typeVisibility: {
-        spaces: TYPE_VISIBILITY_DEFAULTS.SPACES,
-        openings: TYPE_VISIBILITY_DEFAULTS.OPENINGS,
-        site: TYPE_VISIBILITY_DEFAULTS.SITE,
-      },
+      // Re-read persisted toggles on every file load so a new model never
+      // reverts the user's visibility choices (e.g. "Show Annotations").
+      typeVisibility: getPersistedTypeVisibility(),
+      typeViewMode: getPersistedTypeViewMode(),
 
       // Visibility (multi-model)
       hiddenEntitiesByModel: new Map(),
@@ -176,6 +248,14 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       error: null,
       pendingColorUpdates: null,
       pendingMeshColorUpdates: null,
+
+      // Compare (#924): drop any stale diff result — it references models by
+      // id and the loaded set is changing. Keep panel visibility + A/B/scope
+      // choices (UI prefs); the user re-runs against the new set.
+      compareResult: null,
+      compareSelectedKey: null,
+      compareRunning: false,
+      compareError: null,
 
       // Hover/Context
       hoverState: { entityId: null, screenX: 0, screenY: 0 },
@@ -195,12 +275,18 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         cornerValence: 0,
       },
 
-      // Section plane
+      // Section plane: reset axis/position/enabled/flipped (those are
+      // model-relative and meaningless when switching files), but PRESERVE
+      // the user's cap appearance preferences (showCap, showOutlines,
+      // capStyle). Those round-trip to localStorage via the slice's
+      // persistence helpers; clobbering them here was the cause of "my
+      // hatch / colour resets to defaults every time I open a file".
       sectionPlane: {
-        axis: SECTION_PLANE_DEFAULTS.AXIS,
+        ...get().sectionPlane,
+        axis:     SECTION_PLANE_DEFAULTS.AXIS,
         position: SECTION_PLANE_DEFAULTS.POSITION,
-        enabled: SECTION_PLANE_DEFAULTS.ENABLED,
-        flipped: SECTION_PLANE_DEFAULTS.FLIPPED,
+        enabled:  SECTION_PLANE_DEFAULTS.ENABLED,
+        flipped:  SECTION_PLANE_DEFAULTS.FLIPPED,
       },
 
       // Camera
@@ -212,6 +298,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
 
       // UI
       activeTool: UI_DEFAULTS.ACTIVE_TOOL,
+      editEnabled: false,
       visualEnhancementsEnabled: UI_DEFAULTS.VISUAL_ENHANCEMENTS_ENABLED,
       edgeContrastEnabled: UI_DEFAULTS.EDGE_CONTRAST_ENABLED,
       edgeContrastIntensity: UI_DEFAULTS.EDGE_CONTRAST_INTENSITY,
@@ -227,10 +314,12 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       cesiumAvailable: false,
       cesiumEnabled: false,
       cesiumTerrainHeight: null,
-      cesiumTerrainClamp: false,
       cesiumSourceModelId: null,
       cesiumTerrainClipY: null,
       cesiumGlbLoaded: false,
+      cesiumPlacementEditMode: false,
+      cesiumPlacementDraftModelId: null,
+      cesiumPlacementDraft: null,
 
       // Drawing 2D
       drawing2D: null,
@@ -248,6 +337,8 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         show3DOverlay: true,
         scale: 100,
         useSymbolicRepresentations: false,
+        showIfcAnnotations: true,
+        showConstructionProjection: false,
       },
       // Graphic overrides (keep presets, reset active and custom)
       activePresetId: 'preset-3d-colors',
@@ -332,6 +423,21 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       chatError: null,
       chatAbortController: null,
 
+      // Schedule (4D) - drop panel + data; definitions are re-extracted on
+      // next load. `playbackSpeed`, `playbackLoop`, and `ganttTimeScale` are
+      // intentionally preserved as user preferences that survive file loads.
+      ganttPanelVisible: false,
+      generateScheduleDialogOpen: false,
+      scheduleData: null,
+      scheduleRange: null,
+      activeWorkScheduleId: '',
+      expandedTaskGlobalIds: new Set<string>(),
+      hoveredTaskGlobalId: null,
+      selectedTaskGlobalIds: new Set<string>(),
+      animationEnabled: false,
+      playbackIsPlaying: false,
+      playbackTime: 0,
+
       // Mutations - clear all mutation state so stale changes don't carry over
       mutationViews: new Map(),
       changeSets: new Map(),
@@ -340,6 +446,46 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
       redoStacks: new Map(),
       dirtyModels: new Set(),
       mutationVersion: get().mutationVersion + 1,
+
+      // Search - results reference the previous model's expressIds, drop them.
+      searchQuery: '',
+      searchOpen: false,
+      searchHighlightIndex: 0,
+      searchIndexes: new Map(),
+      searchVimCycle: null,
+      searchModalOpen: false,
+      searchFieldFilter: 'all',
+      searchModelFilter: null,
+      searchFilterResult: null,
+      searchFilterRunning: false,
+      searchFilterError: null,
+      searchFilter: { rules: [], combinator: 'AND', limit: 500 },
+      searchFilterSchema: new Map(),
+
+      // Annotations — drop draft + selection so a new file doesn't
+      // inherit the previous file's pin authoring state. Persisted
+      // pins themselves stay in localStorage (cross-file workspace).
+      draft: null,
+      selectedAnnotationId: null,
+
+      // Point cloud — clear runtime fields so a new file doesn't
+      // inherit the previous file's color mode / size / EDL state.
+      // Single-source-of-truth defaults shared with createPointCloudSlice.
+      ...POINT_CLOUD_DEFAULTS,
+      pointCloudFixedColor: [...POINT_CLOUD_DEFAULTS.pointCloudFixedColor] as [number, number, number, number],
+    });
+  },
+
+  openWorkspacePanel: (panel) => {
+    const [set] = args;
+    set({
+      bcfPanelVisible: panel === 'bcf',
+      idsPanelVisible: panel === 'ids',
+      lensPanelVisible: panel === 'lens',
+      clashPanelVisible: panel === 'clash',
+      comparePanelVisible: panel === 'compare',
+      extensionsPanelVisible: panel === 'extensions',
+      rightPanelCollapsed: false,
     });
   },
 }));

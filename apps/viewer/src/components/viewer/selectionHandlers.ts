@@ -9,6 +9,10 @@
  */
 
 import type { MouseHandlerContext } from './mouseHandlerTypes.js';
+import { useViewerStore } from '@/store';
+import { fromGlobalIdFromModels, toGlobalIdFromModels } from '@/store/globalId';
+import { pointInPolygon } from '@/lib/polygon-clip';
+import { toast } from '@/components/ui/toast';
 
 /**
  * Handle click event for selection (single click and double click).
@@ -34,6 +38,226 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
   // Measure tool now uses drag interaction (see mousedown/mousemove/mouseup)
   if (tool === 'measure') {
     return; // Skip click handling for measure tool
+  }
+
+  // Section-tool face-pick (issue #243): clicking any visible face places
+  // the clip plane through it. Intercept BEFORE the generic select path
+  // so the click doesn't also flip the selection.
+  //
+  // Camera-aware orientation: we flip the picked normal if it faces away
+  // from the camera, so the kept half-space is the one the user is looking
+  // at by default (the most common expectation; if the cut goes the wrong
+  // way the existing Flip button still works). This addresses the
+  // CodeRabbit minor on PR #581 about face-pick not being camera-aware.
+  if (tool === 'section' && ctx.sectionPickModeRef?.current) {
+    const hit = renderer.raycastScene(x, y, {
+      hiddenIds:   ctx.hiddenEntitiesRef.current,
+      isolatedIds: ctx.isolatedEntitiesRef.current,
+    });
+    if (hit?.intersection) {
+      const n = hit.intersection.normal;
+      const p = hit.intersection.point;
+      const cam = renderer.getCamera().getPosition();
+      // View vector = camera → hit. If `dot(view, normal) > 0` the normal
+      // points away from the camera; invert so the cut keeps the side
+      // facing the user.
+      const vx = cam.x - p.x, vy = cam.y - p.y, vz = cam.z - p.z;
+      const dot = vx * n.x + vy * n.y + vz * n.z;
+      const sign = dot < 0 ? -1 : 1;
+      const bounds = ctx.modelBoundsRef?.current;
+      ctx.setSectionPlaneFromFace?.(
+        [sign * n.x, sign * n.y, sign * n.z],
+        [p.x, p.y, p.z],
+        bounds ? {
+          min: [bounds.min.x, bounds.min.y, bounds.min.z],
+          max: [bounds.max.x, bounds.max.y, bounds.max.z],
+        } : undefined,
+      );
+    } else {
+      // Missed geometry — disarm so the user isn't stuck in pick mode
+      // after an errant background click.
+      ctx.setSectionPickMode?.(false);
+    }
+    return;
+  }
+
+  // Add-element tool — multi-click placement (start→end for walls/beams,
+  // corner→opposite for slab rectangle, N+Enter for slab polygon, single
+  // for columns). Uses magnetic snap so points lock to vertices/edges
+  // when the cursor is near them — same UX as the measure tool.
+  // Split tool — click on a wall / beam / column / member to cut
+  // it at the cursor's projected position. Hover preview lives on
+  // the store (splitHoverPoint / splitHoverDistance) and
+  // SplitOverlay renders the SVG guide; this handler commits the
+  // click by dispatching to the right action for the latched
+  // target's element type.
+  if (tool === 'split') {
+    const state = useViewerStore.getState();
+    const targetModelId = state.splitTargetModelId;
+    const targetExpressId = state.splitTargetExpressId;
+    if (targetModelId === null || targetExpressId === null) {
+      // Click missed any splittable element — no-op so the cursor
+      // doesn't fight the user. The overlay's hint stays visible.
+      return;
+    }
+
+    // Slab two-click flow takes precedence when we're mid-anchor.
+    // The second click commits the cut line from anchor → cursor.
+    // Raycast onto the SOURCE SLAB'S floor (not the global active
+    // storey) so federated / non-active-storey splits land at the
+    // right elevation.
+    if (state.splitMode === 'first-anchor' && state.slabCutAnchor) {
+      const slabFloorY = resolveSlabFloorY(targetModelId, targetExpressId);
+      const cutPoint = raycastStoreyFloor(ctx, x, y, slabFloorY ?? undefined);
+      if (!cutPoint) {
+        toast.error("Couldn't read cut point");
+        return;
+      }
+      const cursorIfc = rendererPointToIfcStoreyLocal(cutPoint);
+      const result = state.splitSlabByLine(
+        targetModelId,
+        targetExpressId,
+        state.slabCutAnchor,
+        [cursorIfc[0], cursorIfc[1]],
+      );
+      if (!result.ok) {
+        toast.error(`Couldn't split slab: ${result.reason}`);
+        return;
+      }
+      state.clearSplitHover();
+      // Move selection to whichever half contains the click. Both
+      // halves are valid polygons; the click landed at `cursorIfc`.
+      const rightFp = state.readSlabFootprint(targetModelId, result.right.expressId);
+      const inRight = rightFp
+        ? pointInPolygon(rightFp.footprint, [cursorIfc[0], cursorIfc[1]])
+        : false;
+      state.setSelectedEntityId(inRight ? result.right.globalId : result.left.globalId);
+      toast.success('Slab split — Ctrl+Z to undo');
+      return;
+    }
+
+    // Single-click element split (wall / beam / column / member).
+    // Wall first because most edits land on walls; if that returns
+    // null we try the linear-element path.
+    const distance = state.splitHoverDistance;
+    if (distance !== null && distance > 0) {
+      const wallTry = state.splitWallAtDistance(targetModelId, targetExpressId, distance);
+      if (wallTry.ok) {
+        state.clearSplitHover();
+        state.setSelectedEntityId(wallTry.right.globalId);
+        // Mention opening reassignment in the toast only when it
+        // happened — silence is preferable to "0 openings moved"
+        // for a wall with no doors / windows.
+        const op = wallTry.openings;
+        const opSummary =
+          op.toLeft + op.toRight > 0
+            ? ` (${op.toLeft + op.toRight} opening${op.toLeft + op.toRight === 1 ? '' : 's'} reassigned)`
+            : '';
+        toast.success(`Wall split${opSummary} — Ctrl+Z to undo`);
+        return;
+      }
+      const linearTry = state.splitLinearElementAtDistance(
+        targetModelId,
+        targetExpressId,
+        distance,
+      );
+      if (linearTry.ok) {
+        state.clearSplitHover();
+        state.setSelectedEntityId(linearTry.right.globalId);
+        toast.success('Element split — Ctrl+Z to undo');
+        return;
+      }
+    }
+
+    // Fall through to the slab path: first click latches the
+    // anchor, second click (handled above) commits. Anchor lands
+    // on the source slab's storey floor (not the global active
+    // storey) — `slabFootprint.storeyElevation` is already the
+    // exact value we need, so pass it through directly.
+    const slabFootprint = state.readSlabFootprint(targetModelId, targetExpressId);
+    if (slabFootprint) {
+      const anchorPoint = raycastStoreyFloor(ctx, x, y, slabFootprint.storeyElevation);
+      if (!anchorPoint) {
+        toast.error("Couldn't read anchor point");
+        return;
+      }
+      const anchorIfc = rendererPointToIfcStoreyLocal(anchorPoint);
+      state.setSlabCutAnchor(
+        [anchorIfc[0], anchorIfc[1]],
+        slabFootprint.footprint,
+        slabFootprint.storeyElevation,
+      );
+      return;
+    }
+
+    toast.error("Couldn't split: not a splittable element");
+    return;
+  }
+
+  if (tool === 'addElement') {
+    const currentLock = ctx.edgeLockStateRef.current;
+    const result = renderer.raycastSceneMagnetic(x, y, {
+      edge: currentLock.edge,
+      meshExpressId: currentLock.meshExpressId,
+      lockStrength: currentLock.lockStrength,
+    }, {
+      hiddenIds: ctx.hiddenEntitiesRef.current,
+      isolatedIds: ctx.isolatedEntitiesRef.current,
+      snapOptions: ctx.snapEnabledRef.current ? {
+        snapToVertices: true,
+        snapToEdges: true,
+        snapToFaces: true,
+        screenSnapRadius: 40,
+      } : {
+        snapToVertices: false,
+        snapToEdges: false,
+        snapToFaces: false,
+        screenSnapRadius: 0,
+      },
+    });
+    const point = result.snapTarget?.position
+      ?? result.intersection?.point
+      ?? raycastStoreyFloor(ctx, x, y);
+    if (!point) return;
+    // Smart-placement: if the click landed on (or snapped to) an
+    // existing entity, infer the target storey from THAT entity's
+    // spatial-hierarchy entry rather than the AddElement panel's
+    // dropdown. Lets the user click on a wall on storey 3 to add
+    // a beam there without first changing the storey selector.
+    // Only kicks in when we actually have an entity under the
+    // cursor — empty-space clicks fall back to the panel value.
+    const hitExpressId = result.snapTarget?.expressId
+      ?? result.intersection?.expressId
+      ?? null;
+    const inferredStorey = hitExpressId !== null
+      ? inferStoreyForGlobalId(hitExpressId)
+      : null;
+    await handleAddElementDrop(point, inferredStorey ?? undefined);
+    return;
+  }
+
+  // Annotate tool — drop a pin at the cursor's world point.
+  // Raycasts the scene; if the click misses geometry the draft is
+  // not opened (annotations are anchored to surface points by
+  // design, not floating in space).
+  if (tool === 'annotate') {
+    const result = renderer.raycastScene(x, y, ctx.getPickOptions());
+    if (!result?.intersection) return;
+    const { intersection } = result;
+    const store = useViewerStore.getState();
+    // Federated models — resolve which model the hit globalId belongs
+    // to so the annotation carries enough context to render its
+    // popover header. Falls back to (null, expressId) when there's
+    // only the legacy single-model state.
+    const modelLookup = fromGlobalIdFromModels(store.models, intersection.expressId);
+    const modelId = modelLookup?.modelId ?? null;
+    const localExpressId = modelLookup?.expressId ?? intersection.expressId;
+    store.beginDraft(
+      { x: intersection.point.x, y: intersection.point.y, z: intersection.point.z },
+      localExpressId ?? null,
+      modelId,
+    );
+    return;
   }
 
   const now = Date.now();
@@ -72,12 +296,572 @@ export async function handleSelectionClick(ctx: MouseHandlerContext, e: MouseEve
 }
 
 /**
+ * Resolve the storey + model for a hit globalId so the AddElement
+ * click handler can place the new entity in the SAME storey as the
+ * existing element under the cursor. Returns null when the hit
+ * doesn't resolve to any model's spatial-hierarchy entry — caller
+ * falls back to the AddElement panel's storey selector.
+ *
+ * Federation-aware via `fromGlobalIdFromModels`.
+ */
+function inferStoreyForGlobalId(
+  globalId: number,
+): { modelId: string; storeyId: number } | null {
+  const state = useViewerStore.getState();
+  const local = fromGlobalIdFromModels(state.models, globalId);
+  if (!local) return null;
+  const ds = state.models.get(local.modelId)?.ifcDataStore;
+  const storeyId = ds?.spatialHierarchy?.elementToStorey.get(local.expressId);
+  if (storeyId === undefined) return null;
+  return { modelId: local.modelId, storeyId };
+}
+
+/**
+ * Find the first IfcBuildingStorey entity in the active model. Used as a
+ * fallback when the user hasn't picked a target storey in the panel.
+ */
+function firstStoreyExpressId(modelId: string): number | null {
+  const state = useViewerStore.getState();
+  const model = state.models.get(modelId);
+  const ids = model?.ifcDataStore?.entityIndex.byType.get('IFCBUILDINGSTOREY');
+  return ids && ids.length > 0 ? ids[0] : null;
+}
+
+/**
+ * Active model resolver — falls back through the same legacy chain
+ * the rest of the viewer uses when a single model is loaded.
+ */
+function resolveActiveModelId(): string | null {
+  const state = useViewerStore.getState();
+  if (state.activeModelId) return state.activeModelId;
+  const first = state.models.keys().next();
+  return first.done ? null : first.value;
+}
+
+/**
+ * Convert a renderer Y-up world point to IFC Z-up storey-local
+ * coordinates with Z forced to the storey floor (0). Mirrors the
+ * matrix in `packages/renderer/src/pipeline.ts`. Z is clamped so the
+ * click landing on a vertical surface doesn't lift the element above
+ * the floor — matches construction-tool placement intuition. Refine
+ * via the Raw STEP tab if needed.
+ */
+export function rendererPointToIfcStoreyLocal(point: { x: number; y: number; z: number }): [number, number, number] {
+  return [point.x, -point.z, 0];
+}
+
+/**
+ * Storey-floor ray-plane intersection — used as a fallback when the
+ * scene raycast misses every mesh (so the user can place new elements
+ * in empty space, not just on existing surfaces). The floor sits at
+ * renderer Y = storey elevation.
+ *
+ * `storeyOverride` lets the caller supply an explicit floor Y
+ * (renderer frame). Used by the Split tool so a slab on storey 3
+ * doesn't accidentally project clicks onto storey 0's floor when
+ * the addElement / active-model state points elsewhere. Falls back
+ * to `resolveStoreyFloorY()` (active-model lookup) when omitted.
+ */
+function raycastStoreyFloor(
+  ctx: MouseHandlerContext,
+  x: number,
+  y: number,
+  storeyOverride?: number,
+): { x: number; y: number; z: number } | null {
+  const camera = ctx.renderer.getCamera();
+  const canvas = ctx.renderer.getCanvas();
+  if (!camera || !canvas) return null;
+  // x/y arrive in CSS space (handleSelectionClick subtracts the
+  // bounding-rect origin). `unprojectToRay` expects drawing-buffer
+  // coords, which differ from CSS by DPR. Convert both the cursor
+  // and the canvas size so the ray is computed in the same space
+  // `projectToScreen` writes to — otherwise pick drifts at DPR ≠ 1.
+  const rect = canvas.getBoundingClientRect();
+  const sx = rect.width > 0 ? (x / rect.width) * canvas.width : x;
+  const sy = rect.height > 0 ? (y / rect.height) * canvas.height : y;
+  const ray = camera.unprojectToRay(sx, sy, canvas.width, canvas.height);
+  if (!ray) return null;
+  const planeY = storeyOverride ?? resolveStoreyFloorY();
+  // Looking down typically means D.y < 0; reject parallel / near-parallel
+  // cases so we don't hand back a wildly extrapolated intersection.
+  const dy = ray.direction.y;
+  if (Math.abs(dy) < 1e-6) return null;
+  const t = (planeY - ray.origin.y) / dy;
+  if (!Number.isFinite(t) || t <= 0) return null;
+  return {
+    x: ray.origin.x + ray.direction.x * t,
+    y: planeY,
+    z: ray.origin.z + ray.direction.z * t,
+  };
+}
+
+/**
+ * Helper: resolve a slab's storey elevation in renderer-frame Y so
+ * callers can pass it to `raycastStoreyFloor`. Read from the
+ * model's spatialHierarchy (matches the rest of the split flow's
+ * elevation lookups). Returns null when the slab isn't contained
+ * in a storey we can resolve.
+ */
+function resolveSlabFloorY(modelId: string, expressId: number): number | null {
+  const state = useViewerStore.getState();
+  const ds = state.models.get(modelId)?.ifcDataStore;
+  if (!ds) return null;
+  const storeyId = ds.spatialHierarchy?.elementToStorey.get(expressId);
+  if (storeyId === undefined) return null;
+  const elev = ds.spatialHierarchy?.storeyElevations?.get(storeyId);
+  return typeof elev === 'number' ? elev : null;
+}
+
+/**
+ * Resolve the renderer Y of the currently selected (or first
+ * available) storey's floor. Falls back to 0 when nothing is loaded.
+ */
+function resolveStoreyFloorY(): number {
+  const state = useViewerStore.getState();
+  const modelId = state.addElementModelId ?? state.activeModelId;
+  if (!modelId) return 0;
+  const model = state.models.get(modelId);
+  const ds = model?.ifcDataStore;
+  if (!ds) return 0;
+  const storeyId = state.addElementStoreyId ?? firstStoreyExpressId(modelId);
+  if (storeyId === null) return 0;
+  return ds.spatialHierarchy?.storeyElevations?.get(storeyId) ?? 0;
+}
+
+/**
+ * Update the live hover preview for the add-element tool. Runs the
+ * same magnetic raycast as the click handler and keeps `hoverPoint`
+ * in sync with whatever the next click would place. Used by the
+ * 3D-overlay preview so the user sees the in-progress edge / rectangle
+ * / polygon segment as they move the cursor.
+ *
+ * Returns true when handled so the mouse-controls hook can early-out
+ * before falling through to the generic hover-tooltip path.
+ */
+export function handleAddElementHover(ctx: MouseHandlerContext, x: number, y: number): boolean {
+  const { renderer } = ctx;
+  if (!ctx.measureRaycastPendingRef.current) {
+    ctx.measureRaycastPendingRef.current = true;
+    ctx.measureRaycastFrameRef.current = requestAnimationFrame(() => {
+      ctx.measureRaycastPendingRef.current = false;
+      ctx.measureRaycastFrameRef.current = null;
+
+      const currentLock = ctx.edgeLockStateRef.current;
+      const result = renderer.raycastSceneMagnetic(x, y, {
+        edge: currentLock.edge,
+        meshExpressId: currentLock.meshExpressId,
+        lockStrength: currentLock.lockStrength,
+      }, {
+        hiddenIds: ctx.hiddenEntitiesRef.current,
+        isolatedIds: ctx.isolatedEntitiesRef.current,
+        snapOptions: ctx.snapEnabledRef.current ? {
+          snapToVertices: true,
+          snapToEdges: true,
+          snapToFaces: true,
+          screenSnapRadius: 40,
+        } : {
+          snapToVertices: false,
+          snapToEdges: false,
+          snapToFaces: false,
+          screenSnapRadius: 0,
+        },
+      });
+
+      const point = result.snapTarget?.position
+        ?? result.intersection?.point
+        ?? raycastStoreyFloor(ctx, x, y);
+      const store = useViewerStore.getState();
+      store.setAddElementHoverPoint(point ? { x: point.x, y: point.y, z: point.z } : null);
+
+      // Mirror measure's snap-viz behaviour so vertex/edge/face indicators
+      // appear under the cursor with the same UX shape.
+      ctx.setSnapTarget(result.snapTarget ?? null);
+      if (result.snapTarget) {
+        if (result.edgeLock.shouldRelease) {
+          ctx.clearEdgeLock();
+        } else if (result.edgeLock.shouldLock && result.edgeLock.edge) {
+          ctx.setEdgeLock(result.edgeLock.edge, result.edgeLock.meshExpressId!, result.edgeLock.edgeT);
+        }
+      } else {
+        ctx.clearEdgeLock();
+      }
+    });
+  }
+  return true;
+}
+
+/**
+ * Live hover preview for the Split tool. SCOPED TO THE CURRENT
+ * SPLIT TARGET — the slice's `splitTargetModelId` /
+ * `splitTargetExpressId` are set when the user enters Split mode
+ * (via Geometry-card Split button or K shortcut), and they never
+ * change as the cursor moves over other elements. Hovering over a
+ * different wall does NOT switch target; the user must exit Split
+ * (Esc), re-select, and re-enter.
+ *
+ * This is the v2 model — the previous "free-roam, hover anything,
+ * latch new target each frame" approach surfaced way too many
+ * actionable elements at once and made it unclear what would be
+ * cut. Selection-bound matches the rest of the edit-mode UX
+ * (gizmo, geometry card, etc.).
+ *
+ * The cursor still drives the cut POINT — we ray-cast to get a
+ * world point, project that onto the target's axis (linear) or
+ * use cursor XY (slab), and push the result into the slice for
+ * the SplitOverlay to render.
+ */
+export function handleSplitHover(ctx: MouseHandlerContext, x: number, y: number): boolean {
+  const { renderer } = ctx;
+  if (!ctx.measureRaycastPendingRef.current) {
+    ctx.measureRaycastPendingRef.current = true;
+    ctx.measureRaycastFrameRef.current = requestAnimationFrame(() => {
+      ctx.measureRaycastPendingRef.current = false;
+      ctx.measureRaycastFrameRef.current = null;
+
+      const store = useViewerStore.getState();
+      const targetModelId = store.splitTargetModelId;
+      const targetExpressId = store.splitTargetExpressId;
+      if (targetModelId === null || targetExpressId === null) {
+        // Split engaged with no target — clear any stale hover.
+        if (store.splitMode === 'aiming') store.clearSplitHover();
+        return;
+      }
+
+      // Ray-cast to get a world point under the cursor. We don't
+      // care which entity it hit — we use the world point and
+      // project it onto the TARGET's axis. Falls back to the
+      // storey floor so the user can aim at empty space and still
+      // get a sensible cut.
+      const result = renderer.raycastScene(x, y, {
+        hiddenIds: ctx.hiddenEntitiesRef.current,
+        isolatedIds: ctx.isolatedEntitiesRef.current,
+      });
+      // Fallback raycast uses the TARGET's storey floor (not the
+      // global active storey) so the cursor projection stays in
+      // the same Y plane as the element being split.
+      const targetFloorY = resolveSlabFloorY(targetModelId, targetExpressId) ?? undefined;
+      const worldPoint = result?.intersection?.point
+        ?? raycastStoreyFloor(ctx, x, y, targetFloorY);
+      if (!worldPoint) {
+        if (store.splitMode === 'aiming') store.clearSplitHover();
+        return;
+      }
+      const cursorIfc = rendererPointToIfcStoreyLocal(worldPoint);
+
+      // Project onto the target. Try wall (1D), then linear (1D),
+      // then slab (2D — uses the cursor XY directly as a candidate
+      // cut endpoint).
+      const projection =
+        store.readWallSplitProjection(targetModelId, targetExpressId, cursorIfc) ??
+        store.readLinearElementSplitProjection(targetModelId, targetExpressId, cursorIfc);
+      if (projection) {
+        const model = store.models.get(targetModelId);
+        const storeyId = model?.ifcDataStore?.spatialHierarchy?.elementToStorey.get(targetExpressId);
+        const elevation =
+          (storeyId !== undefined
+            ? model?.ifcDataStore?.spatialHierarchy?.storeyElevations?.get(storeyId)
+            : undefined) ?? 0;
+        const [px, py, pz] = projection.cutPoint;
+        const cutRendererFrame: [number, number, number] = [px, pz + elevation, -py];
+        store.setSplitHover(
+          cutRendererFrame,
+          projection.distance,
+          projection.length,
+          projection.cutPoint,
+          projection.axis,
+        );
+        return;
+      }
+      // Slab path — the overlay outlines the polygon + ghost cut
+      // line; the cursor's IFC XY is the candidate endpoint.
+      const slabFootprint = store.readSlabFootprint(targetModelId, targetExpressId);
+      if (slabFootprint) {
+        const [cx, cy] = cursorIfc;
+        const cursorRendererFrame: [number, number, number] = [
+          cx,
+          slabFootprint.storeyElevation,
+          -cy,
+        ];
+        store.setSplitHover(cursorRendererFrame, 0, 0, [cx, cy, 0], null);
+        return;
+      }
+      // Target isn't a splittable shape (rare — gets latched by
+      // the K shortcut / Split button which already checks). Clear.
+      if (store.splitMode === 'aiming') store.clearSplitHover();
+    });
+  }
+  return true;
+}
+
+/**
+ * Resolve the active model + storey + a snap-aware world point.
+ * Surfaces the same toast errors all add-element entry points share.
+ *
+ * `override` lets the caller force a specific (model, storey) pair —
+ * used by smart placement so clicking on an existing element places
+ * the new entity in that element's storey/model rather than the
+ * AddElement panel's currently-selected one. Falls back through the
+ * panel's selector (`addElementStoreyId`) and then the first storey
+ * of the active model when no override is supplied.
+ */
+function resolveAddElementContext(
+  override?: { modelId: string; storeyId: number },
+): { modelId: string; storeyId: number } | null {
+  if (override) return override;
+  const state = useViewerStore.getState();
+  const modelId = state.addElementModelId ?? resolveActiveModelId();
+  if (!modelId) {
+    toast.error("Couldn't add element: no model loaded");
+    return null;
+  }
+  const storeyId = state.addElementStoreyId ?? firstStoreyExpressId(modelId);
+  if (storeyId === null) {
+    toast.error("Couldn't add element: model has no IfcBuildingStorey");
+    return null;
+  }
+  return { modelId, storeyId };
+}
+
+/** Common post-place: pick the new entity's global id, toast, clear pending. */
+function finishAddElement(
+  result: { expressId: number } | { error: string },
+  modelId: string,
+  label: string,
+): void {
+  const state = useViewerStore.getState();
+  if ('error' in result) {
+    toast.error(`Couldn't add ${label.toLowerCase()}: ${result.error}`);
+    return;
+  }
+  const globalId = toGlobalIdFromModels(state.models, modelId, result.expressId);
+  state.setSelectedEntityId(globalId);
+  state.clearAddElementPending();
+  toast.success(`${label} #${result.expressId} added — undo to remove`);
+}
+
+/**
+ * Handle a click landing on the scene while the addElement tool is
+ * active. Implements a per-type click state machine:
+ *
+ *   - column: 1 click → place
+ *   - wall / beam: 1st click → start, 2nd click → end + place
+ *   - slab (rectangle): 1st click → corner, 2nd click → opposite + place
+ *   - slab (polygon): N clicks accumulate; Enter / double-click closes
+ *     (handled in the keyboard layer; this function only appends)
+ */
+async function handleAddElementDrop(
+  point: { x: number; y: number; z: number },
+  storeyOverride?: { modelId: string; storeyId: number },
+): Promise<void> {
+  const ctx = resolveAddElementContext(storeyOverride);
+  if (!ctx) return;
+  const { modelId, storeyId } = ctx;
+
+  const state = useViewerStore.getState();
+  const type = state.addElementType;
+
+  // Single-click placements: column / door / window all drop on one click.
+  if (type === 'column') {
+    const ifc = rendererPointToIfcStoreyLocal(point);
+    const p = state.addElementColumnParams;
+    finishAddElement(state.addColumn(modelId, storeyId, {
+      Position: ifc, Width: p.Width, Depth: p.Depth, Height: p.Height,
+    }), modelId, 'Column');
+    return;
+  }
+  if (type === 'door') {
+    const ifc = rendererPointToIfcStoreyLocal(point);
+    const p = state.addElementDoorParams;
+    finishAddElement(state.addDoor(modelId, storeyId, {
+      Position: ifc, Width: p.Width, Height: p.Height, FrameThickness: p.FrameThickness,
+    }), modelId, 'Door');
+    return;
+  }
+  if (type === 'window') {
+    const ifc = rendererPointToIfcStoreyLocal(point);
+    const p = state.addElementWindowParams;
+    finishAddElement(state.addWindow(modelId, storeyId, {
+      Position: ifc, Width: p.Width, Height: p.Height, FrameThickness: p.FrameThickness,
+    }), modelId, 'Window');
+    return;
+  }
+
+  if (type === 'wall' || type === 'beam' || type === 'member') {
+    const pending = state.addElementPendingPoints;
+    if (pending.length === 0) {
+      // Start point — store the renderer-frame point and wait for end.
+      state.appendAddElementPendingPoint({ x: point.x, y: point.y, z: point.z });
+      return;
+    }
+    // End point — convert both points to IFC at dispatch time.
+    const startIfc = rendererPointToIfcStoreyLocal(pending[0]);
+    const endIfc = rendererPointToIfcStoreyLocal(point);
+    if (type === 'wall') {
+      const p = state.addElementWallParams;
+      finishAddElement(state.addWall(modelId, storeyId, {
+        Start: startIfc, End: endIfc, Thickness: p.Thickness, Height: p.Height,
+      }), modelId, 'Wall');
+    } else if (type === 'beam') {
+      const p = state.addElementBeamParams;
+      finishAddElement(state.addBeam(modelId, storeyId, {
+        Start: startIfc, End: endIfc, Width: p.Width, Height: p.Height,
+      }), modelId, 'Beam');
+    } else {
+      // member
+      const p = state.addElementMemberParams;
+      finishAddElement(state.addMember(modelId, storeyId, {
+        Start: startIfc, End: endIfc, Width: p.Width, Height: p.Height,
+      }), modelId, 'Member');
+    }
+    return;
+  }
+
+  if (type === 'slab' || type === 'roof' || type === 'plate' || type === 'space') {
+    if (state.addElementSlabMode === 'rectangle') {
+      const pending = state.addElementPendingPoints;
+      if (pending.length === 0) {
+        state.appendAddElementPendingPoint({ x: point.x, y: point.y, z: point.z });
+        return;
+      }
+      const cornerIfc = rendererPointToIfcStoreyLocal(pending[0]);
+      const oppositeIfc = rendererPointToIfcStoreyLocal(point);
+      const minX = Math.min(cornerIfc[0], oppositeIfc[0]);
+      const minY = Math.min(cornerIfc[1], oppositeIfc[1]);
+      const width = Math.abs(oppositeIfc[0] - cornerIfc[0]);
+      const depth = Math.abs(oppositeIfc[1] - cornerIfc[1]);
+      if (width <= 0 || depth <= 0) {
+        toast.error(`${capitalize(type)} corners must span a non-zero rectangle`);
+        return;
+      }
+      const position: [number, number, number] = [minX, minY, 0];
+      switch (type) {
+        case 'slab': {
+          const p = state.addElementSlabParams;
+          finishAddElement(state.addSlab(modelId, storeyId, {
+            Position: position, Width: width, Depth: depth, Thickness: p.Thickness,
+          }), modelId, 'Slab');
+          return;
+        }
+        case 'roof': {
+          const p = state.addElementRoofParams;
+          finishAddElement(state.addRoof(modelId, storeyId, {
+            Position: position, Width: width, Depth: depth, Thickness: p.Thickness,
+          }), modelId, 'Roof');
+          return;
+        }
+        case 'plate': {
+          const p = state.addElementPlateParams;
+          finishAddElement(state.addPlate(modelId, storeyId, {
+            Position: position, Width: width, Depth: depth, Thickness: p.Thickness,
+          }), modelId, 'Plate');
+          return;
+        }
+        case 'space': {
+          const p = state.addElementSpaceParams;
+          finishAddElement(state.addSpace(modelId, storeyId, {
+            Position: position, Width: width, Depth: depth, Height: p.Height,
+          }), modelId, 'Space');
+          return;
+        }
+      }
+    }
+    // Polygon mode — append; close handled by Enter.
+    state.appendAddElementPendingPoint({ x: point.x, y: point.y, z: point.z });
+    return;
+  }
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Signed 2D polygon area via the shoelace formula. */
+function polygonArea2D(points: Array<[number, number]>): number {
+  if (points.length < 3) return 0;
+  let area = 0;
+  for (let i = 0; i < points.length; i++) {
+    const [x1, y1] = points[i];
+    const [x2, y2] = points[(i + 1) % points.length];
+    area += x1 * y2 - x2 * y1;
+  }
+  return area * 0.5;
+}
+
+/**
+ * Close an in-progress polygon for any slab-style type
+ * (slab / roof / plate / space). Triggered by Enter. Requires
+ * ≥3 points; the builder's auto-closure handles the trailing edge.
+ */
+export function commitAddElementSlabPolygon(): void {
+  const state = useViewerStore.getState();
+  if (state.activeTool !== 'addElement') return;
+  const type = state.addElementType;
+  const polygonable = type === 'slab' || type === 'roof' || type === 'plate' || type === 'space';
+  if (!polygonable || state.addElementSlabMode !== 'polygon') return;
+  const pending = state.addElementPendingPoints;
+  if (pending.length < 3) {
+    toast.error(`${capitalize(type)} polygon needs at least 3 points`);
+    return;
+  }
+  const ctx = resolveAddElementContext();
+  if (!ctx) return;
+  const { modelId, storeyId } = ctx;
+  const outer = pending.map((pt) => {
+    const ifc = rendererPointToIfcStoreyLocal(pt);
+    return [ifc[0], ifc[1]] as [number, number];
+  });
+  // Reject degenerate (zero-area) polygons — repeated or collinear
+  // pending points would otherwise produce an OuterCurve that exports
+  // as an invalid slab/roof/plate/space profile.
+  if (Math.abs(polygonArea2D(outer)) < 1e-6) {
+    toast.error(`${capitalize(type)} polygon must have a non-zero area`);
+    return;
+  }
+  switch (type) {
+    case 'slab': {
+      const p = state.addElementSlabParams;
+      finishAddElement(state.addSlab(modelId, storeyId, {
+        Profile: 'polygon', OuterCurve: outer, Thickness: p.Thickness,
+      }), modelId, 'Slab');
+      return;
+    }
+    case 'roof': {
+      const p = state.addElementRoofParams;
+      finishAddElement(state.addRoof(modelId, storeyId, {
+        Profile: 'polygon', OuterCurve: outer, Thickness: p.Thickness,
+      }), modelId, 'Roof');
+      return;
+    }
+    case 'plate': {
+      const p = state.addElementPlateParams;
+      finishAddElement(state.addPlate(modelId, storeyId, {
+        Profile: 'polygon', OuterCurve: outer, Thickness: p.Thickness,
+      }), modelId, 'Plate');
+      return;
+    }
+    case 'space': {
+      const p = state.addElementSpaceParams;
+      finishAddElement(state.addSpace(modelId, storeyId, {
+        Profile: 'polygon', OuterCurve: outer, Height: p.Height,
+      }), modelId, 'Space');
+      return;
+    }
+  }
+}
+
+/**
  * Handle context menu event (right-click).
  * Picks the entity under the cursor and opens the context menu.
  */
 export async function handleContextMenu(ctx: MouseHandlerContext, e: MouseEvent): Promise<void> {
   e.preventDefault();
-  const { canvas, renderer } = ctx;
+  const { canvas, renderer, mouseState } = ctx;
+  // Right-drag is the pan gesture (see useMouseControls). Some browsers
+  // still fire `contextmenu` after a tiny right-drag — skip when the
+  // user actually moved, so panning never accidentally pops the menu.
+  if (mouseState.didDrag) {
+    return;
+  }
   const rect = canvas.getBoundingClientRect();
   const x = e.clientX - rect.left;
   const y = e.clientY - rect.top;

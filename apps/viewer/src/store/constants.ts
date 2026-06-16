@@ -6,6 +6,8 @@
  * Store constants - extracted magic numbers for maintainability
  */
 
+import type { TypeVisibility } from './types.js';
+
 // ============================================================================
 // Camera Defaults
 // ============================================================================
@@ -26,10 +28,37 @@ export const SECTION_PLANE_DEFAULTS = {
   AXIS: 'down' as const,
   /** Default section plane position (percentage of model bounds) */
   POSITION: 50,
-  /** Default enabled state */
-  ENABLED: true,
+  /**
+   * Default enabled state.
+   *
+   * MUST be `false`: opening the section tool (button or `x` shortcut)
+   * should leave the model uncut and arm pick mode instead — the cut
+   * appears only after the user clicks a face (or moves the slider /
+   * picks an axis). With `enabled: true` here the user saw a Down cut
+   * appear immediately on tool open even though the panel's mount
+   * effect was about to arm pick mode (issue #243 follow-up).
+   */
+  ENABLED: false,
   /** Default flipped state */
   FLIPPED: false,
+  /** Default: render filled/hatched cap surfaces at the cut */
+  SHOW_CAP: true,
+  /** Default: draw polygon outlines on the cut surfaces */
+  SHOW_OUTLINES: true,
+} as const;
+
+/**
+ * Default cut-surface appearance. RGBA tuples are 0-1 per channel. Screen-space
+ * hatch settings are in pixels so the hatch stays readable at any zoom level.
+ */
+export const SECTION_CAP_DEFAULTS = {
+  FILL_COLOR:   [0.92, 0.88, 0.78, 1.0] as [number, number, number, number], // warm paper
+  STROKE_COLOR: [0.10, 0.10, 0.10, 1.0] as [number, number, number, number], // ink
+  PATTERN:      'diagonal' as const,
+  SPACING_PX:   8,
+  ANGLE_RAD:    Math.PI / 4,
+  WIDTH_PX:     1.0,
+  SECONDARY_ANGLE_RAD: -Math.PI / 4,
 } as const;
 
 // ============================================================================
@@ -59,6 +88,27 @@ function getInitialTheme(): 'light' | 'dark' | 'colorful' {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+/**
+ * localStorage key for the "Merge Multilayer Walls" load-time toggle
+ * (issue #540). Reading the same key both here and on application
+ * boot keeps the user's choice sticky between sessions.
+ */
+export const MERGE_LAYERS_STORAGE_KEY = 'ifc-lite-merge-layers';
+
+/**
+ * Resolve the initial value of the merge-layers toggle from
+ * localStorage. Default `false` matches the IFC-Lite WASM default
+ * — toggling the UI without ever loading a model is a no-op.
+ */
+function getInitialMergeLayers(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return localStorage.getItem(MERGE_LAYERS_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
 export const UI_DEFAULTS = {
   /** Default active tool */
   ACTIVE_TOOL: 'select',
@@ -86,20 +136,117 @@ export const UI_DEFAULTS = {
   SEPARATION_LINES_INTENSITY: 0.38,
   /** Separation-line radius in pixels */
   SEPARATION_LINES_RADIUS: 1.0,
+  /**
+   * Issue #540: load-time toggle that asks the WASM geometry engine
+   * to merge Revit-style multilayer walls into a single solid. Read
+   * from localStorage on boot so the user's preference survives
+   * reloads. Default `false` keeps existing per-layer rendering.
+   */
+  MERGE_LAYERS: getInitialMergeLayers(),
 } as const;
 
 // ============================================================================
 // Type Visibility Defaults
 // ============================================================================
 
-export const TYPE_VISIBILITY_DEFAULTS = {
-  /** IfcSpace visibility - off by default */
-  SPACES: false,
-  /** IfcOpeningElement visibility - off by default */
-  OPENINGS: false,
-  /** IfcSite visibility - on by default (when has geometry) */
-  SITE: true,
+/**
+ * localStorage keys for the type-visibility toggles. Each maps to a
+ * single boolean preference; same persistence pattern as
+ * `MERGE_LAYERS_STORAGE_KEY` (`'true'` / `'false'` string, anything
+ * else falls back to the semantic default). One key per toggle so a
+ * user can clear an individual preference without nuking the rest.
+ */
+export const TYPE_VISIBILITY_STORAGE_KEYS = {
+  spaces:         'ifc-lite-ifc-spaces-visible',
+  spatialZones:   'ifc-lite-ifc-spatial-zones-visible',
+  openings:       'ifc-lite-ifc-openings-visible',
+  site:           'ifc-lite-ifc-site-visible',
+  ifcAnnotations: 'ifc-lite-ifc-annotations-visible',
+  ifcGrid:        'ifc-lite-ifc-grid-visible',
 } as const;
+
+/** Legacy alias — kept until external callers migrate. */
+export const IFC_ANNOTATIONS_STORAGE_KEY = TYPE_VISIBILITY_STORAGE_KEYS.ifcAnnotations;
+
+function readPersistedBool(key: string, fallback: boolean): boolean {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Semantic defaults applied when no localStorage preference is set.
+// IfcSpace / IfcOpeningElement off — they cover walls and confuse novices
+// on first load. IfcSite + IfcAnnotation + IfcGrid on — all three convey
+// design intent users expect to see by default. (Issue #862 split grid
+// into its own toggle so dense-grid models can hide grids without losing
+// dimensions/labels.) Exported so the "Reset" action in the visibility
+// menu can restore these without re-deriving them.
+export const TYPE_VISIBILITY_SEMANTIC_DEFAULTS: TypeVisibility = {
+  spaces: false,
+  spatialZones: false,
+  openings: false,
+  site: true,
+  ifcAnnotations: true,
+  ifcGrid: true,
+};
+
+/**
+ * Resolve the full type-visibility preference set from localStorage.
+ *
+ * Read fresh on EVERY call — not captured once at module load. The store
+ * applies this both at boot (slice init) and on every new-file load
+ * (`resetViewerState`). A module-level constant would snapshot localStorage
+ * at first import and then go stale after the first in-session toggle, so
+ * loading a second model would silently revert the user's choices (e.g.
+ * "Show Annotations" flipping back on). Reading live keeps every toggle
+ * sticky across reloads AND across model swaps within a session.
+ */
+export function getPersistedTypeVisibility(): TypeVisibility {
+  return {
+    spaces:         readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.spaces, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.spaces),
+    spatialZones:   readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.spatialZones, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.spatialZones),
+    openings:       readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.openings, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.openings),
+    site:           readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.site, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.site),
+    ifcAnnotations: readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.ifcAnnotations, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.ifcAnnotations),
+    // Issue #862. Migration: if the new grid key isn't set yet, fall back to
+    // the legacy combined `ifcAnnotations` preference so a user who turned
+    // the old "Annotations & Grids" toggle off keeps grids hidden after
+    // upgrade instead of grids silently reappearing (PR #868 review).
+    ifcGrid:        readPersistedBool(
+      TYPE_VISIBILITY_STORAGE_KEYS.ifcGrid,
+      readPersistedBool(TYPE_VISIBILITY_STORAGE_KEYS.ifcAnnotations, TYPE_VISIBILITY_SEMANTIC_DEFAULTS.ifcGrid),
+    ),
+  };
+}
+
+/**
+ * The 3D view mode for the Model/Types switch (#957 follow-up).
+ *   'model' — show placed occurrences (the default; the building as designed).
+ *   'types' — show the type-library shapes (each IfcTypeProduct's
+ *             RepresentationMap at its MappingOrigin), hiding occurrences.
+ * Orphan type geometry (a type with no occurrence, e.g. annex-E showcase files)
+ * shows in BOTH modes since it is the only geometry the file has.
+ */
+export type TypeViewMode = 'model' | 'types';
+
+export const TYPE_VIEW_MODE_STORAGE_KEY = 'ifc-lite-type-view-mode';
+export const TYPE_VIEW_MODE_DEFAULT: TypeViewMode = 'model';
+
+/** Resolve the persisted Model/Types view mode (read fresh, like type visibility). */
+export function getPersistedTypeViewMode(): TypeViewMode {
+  if (typeof window === 'undefined') return TYPE_VIEW_MODE_DEFAULT;
+  try {
+    return localStorage.getItem(TYPE_VIEW_MODE_STORAGE_KEY) === 'types' ? 'types' : 'model';
+  } catch {
+    return TYPE_VIEW_MODE_DEFAULT;
+  }
+}
 
 // ============================================================================
 // Data Defaults

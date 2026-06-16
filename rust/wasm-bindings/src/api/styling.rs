@@ -4,160 +4,6 @@
 
 //! Styling, color extraction, and building rotation for IFC-Lite API
 
-/// Build style index: maps geometry express IDs to RGBA colors
-/// Follows the chain: IfcStyledItem → IfcSurfaceStyle → IfcSurfaceStyleRendering → IfcColourRgb
-pub(crate) fn build_geometry_style_index(
-    content: &str,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> rustc_hash::FxHashMap<u32, [f32; 4]> {
-    use ifc_lite_core::EntityScanner;
-    use rustc_hash::FxHashMap;
-
-    let mut style_index: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
-    let mut scanner = EntityScanner::new(content);
-
-    // First pass: find all IfcStyledItem entities
-    while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        if type_name != "IFCSTYLEDITEM" {
-            continue;
-        }
-
-        // Decode the IfcStyledItem
-        let styled_item = match decoder.decode_at_with_id(id, start, end) {
-            Ok(entity) => entity,
-            Err(_) => continue,
-        };
-
-        // IfcStyledItem: Item (ref to geometry), Styles (list of style refs), Name
-        // Attribute 0: Item (geometry reference)
-        let geometry_id = match styled_item.get_ref(0) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        // Skip if we already have a color for this geometry
-        if style_index.contains_key(&geometry_id) {
-            continue;
-        }
-
-        // Attribute 1: Styles (list of style assignment refs)
-        let styles_attr = match styled_item.get(1) {
-            Some(attr) => attr,
-            None => continue,
-        };
-
-        // Extract color from styles list
-        if let Some(color) = extract_color_from_styles(styles_attr, decoder) {
-            style_index.insert(geometry_id, color);
-        }
-    }
-
-    style_index
-}
-
-/// Build element style index: maps building element IDs to RGBA colors
-/// Follows: Element → IfcProductDefinitionShape → IfcShapeRepresentation → geometry items
-pub(crate) fn build_element_style_index(
-    content: &str,
-    geometry_styles: &rustc_hash::FxHashMap<u32, [f32; 4]>,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> rustc_hash::FxHashMap<u32, [f32; 4]> {
-    use ifc_lite_core::EntityScanner;
-    use rustc_hash::FxHashMap;
-
-    let mut element_styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
-
-    // Short-circuit: if no geometry has styles, skip the entire traversal.
-    // ~85-95% of IFC files have few styled items; for files with zero styles
-    // this avoids decoding every building element's representation chain.
-    if geometry_styles.is_empty() {
-        return element_styles;
-    }
-
-    let mut scanner = EntityScanner::new(content);
-
-    // Scan all building elements
-    while let Some((element_id, type_name, start, end)) = scanner.next_entity() {
-        // Check if this is a building element type
-        if !ifc_lite_core::has_geometry_by_name(type_name) {
-            continue;
-        }
-
-        // Decode the element
-        let element = match decoder.decode_at_with_id(element_id, start, end) {
-            Ok(entity) => entity,
-            Err(_) => continue,
-        };
-
-        // Building elements have Representation attribute at index 6
-        // IfcProduct: GlobalId, OwnerHistory, Name, Description, ObjectType, ObjectPlacement, Representation
-        let repr_id = match element.get_ref(6) {
-            Some(id) => id,
-            None => continue,
-        };
-
-        // Decode IfcProductDefinitionShape
-        let product_shape = match decoder.decode_by_id(repr_id) {
-            Ok(entity) => entity,
-            Err(_) => continue,
-        };
-
-        // IfcProductDefinitionShape: Name, Description, Representations (list)
-        // Attribute 2: Representations
-        let reprs_attr = match product_shape.get(2) {
-            Some(attr) => attr,
-            None => continue,
-        };
-
-        let reprs_list = match reprs_attr.as_list() {
-            Some(list) => list,
-            None => continue,
-        };
-
-        // Look through representations for geometry with styles
-        'repr_loop: for repr_item in reprs_list {
-            let shape_repr_id = match repr_item.as_entity_ref() {
-                Some(id) => id,
-                None => continue,
-            };
-
-            // Decode IfcShapeRepresentation
-            let shape_repr = match decoder.decode_by_id(shape_repr_id) {
-                Ok(entity) => entity,
-                Err(_) => continue,
-            };
-
-            // IfcShapeRepresentation: ContextOfItems, RepresentationIdentifier, RepresentationType, Items
-            // Attribute 3: Items (list of geometry items)
-            let items_attr = match shape_repr.get(3) {
-                Some(attr) => attr,
-                None => continue,
-            };
-
-            let items_list = match items_attr.as_list() {
-                Some(list) => list,
-                None => continue,
-            };
-
-            // Check each geometry item for a style
-            for geom_item in items_list {
-                let geom_id = match geom_item.as_entity_ref() {
-                    Some(id) => id,
-                    None => continue,
-                };
-
-                // Check if this geometry has a style, following MappedItem references if needed
-                if let Some(color) = find_color_for_geometry(geom_id, geometry_styles, decoder) {
-                    element_styles.insert(element_id, color);
-                    break 'repr_loop; // Found a color — stop all representation traversal
-                }
-            }
-        }
-    }
-
-    element_styles
-}
-
 /// Find color for a geometry item, following MappedItem references if needed.
 /// This handles the case where IfcStyledItem points to geometry inside a MappedRepresentation,
 /// not to the MappedItem itself.
@@ -210,17 +56,19 @@ pub(crate) fn find_color_for_geometry(
     None
 }
 
-/// Extract RGBA color from IfcStyledItem.Styles attribute
-fn extract_color_from_styles(
+/// Extract `(apparent_color, shading_color)` from IfcStyledItem.Styles.
+/// See [`ifc_lite_processing::style::extract_surface_style_colors`] for the
+/// tuple semantics.
+pub(crate) fn extract_color_pair_from_styles(
     styles_attr: &ifc_lite_core::AttributeValue,
     decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<[f32; 4]> {
+) -> Option<([f32; 4], Option<[f32; 4]>)> {
     // Styles can be a list or a single reference
     if let Some(list) = styles_attr.as_list() {
         for item in list {
             if let Some(style_id) = item.as_entity_ref() {
-                if let Some(color) = extract_color_from_style_assignment(style_id, decoder) {
-                    return Some(color);
+                if let Some(pair) = extract_color_from_style_assignment(style_id, decoder) {
+                    return Some(pair);
                 }
             }
         }
@@ -231,42 +79,60 @@ fn extract_color_from_styles(
     None
 }
 
-/// Extract color from IfcPresentationStyleAssignment or IfcSurfaceStyle
+/// Convenience wrapper returning only the rendering colour. Most callers
+/// don't need the shading variant — the GLB-export pre-pass is the only
+/// consumer of the pair today.
+pub(crate) fn extract_color_from_styles(
+    styles_attr: &ifc_lite_core::AttributeValue,
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> Option<[f32; 4]> {
+    extract_color_pair_from_styles(styles_attr, decoder).map(|(c, _)| c)
+}
+
+/// Extract colour from `IfcPresentationStyle(Assignment)` or `IfcSurfaceStyle`,
+/// delegating the surface-style colour leaf to the canonical
+/// [`ifc_lite_processing::style::extract_surface_style_colors`] (#913-style
+/// single source of truth — so the viewer and server can't disagree on
+/// `SurfaceColour` vs `DiffuseColour` precedence). Returns
+/// `(apparent_color, optional_shading_color)`.
 fn extract_color_from_style_assignment(
     style_id: u32,
     decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<[f32; 4]> {
+) -> Option<([f32; 4], Option<[f32; 4]>)> {
     use ifc_lite_core::IfcType;
 
     let style = decoder.decode_by_id(style_id).ok()?;
 
     match style.ifc_type {
         IfcType::IfcPresentationStyle => {
-            // IfcPresentationStyle has Styles at attr 0
+            // IfcPresentationStyle has Styles at attr 0.
             let styles_attr = style.get(0)?;
             if let Some(list) = styles_attr.as_list() {
                 for item in list {
                     if let Some(inner_id) = item.as_entity_ref() {
-                        if let Some(color) = extract_color_from_surface_style(inner_id, decoder) {
-                            return Some(color);
+                        if let Some(pair) = ifc_lite_processing::style::extract_surface_style_colors(
+                            inner_id, decoder,
+                        ) {
+                            return Some(pair);
                         }
                     }
                 }
             }
         }
         IfcType::IfcSurfaceStyle => {
-            return extract_color_from_surface_style(style_id, decoder);
+            return ifc_lite_processing::style::extract_surface_style_colors(style_id, decoder);
         }
         _ => {
-            // FIX: Handle IfcPresentationStyleAssignment (IFC2x3 entity not in IFC4 schema)
-            // IfcPresentationStyleAssignment has Styles list at attribute 0
-            // It's decoded as Unknown type, so we check by structure
+            // IfcPresentationStyleAssignment (IFC2x3 entity absent from the IFC4
+            // schema) decodes as Unknown; its Styles list is at attribute 0.
             let styles_attr = style.get(0)?;
             if let Some(list) = styles_attr.as_list() {
                 for item in list {
                     if let Some(inner_id) = item.as_entity_ref() {
-                        if let Some(color) = extract_color_from_surface_style(inner_id, decoder) {
-                            return Some(color);
+                        if let Some(pair) = ifc_lite_processing::style::extract_surface_style_colors(
+                            inner_id, decoder,
+                        ) {
+                            return Some(pair);
                         }
                     }
                 }
@@ -275,90 +141,6 @@ fn extract_color_from_style_assignment(
     }
 
     None
-}
-
-/// Extract color from IfcSurfaceStyle
-fn extract_color_from_surface_style(
-    style_id: u32,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<[f32; 4]> {
-    use ifc_lite_core::IfcType;
-
-    let style = decoder.decode_by_id(style_id).ok()?;
-
-    if style.ifc_type != IfcType::IfcSurfaceStyle {
-        return None;
-    }
-
-    // IfcSurfaceStyle: Name, Side, Styles (list of surface style elements)
-    // Attribute 2: Styles
-    let styles_attr = style.get(2)?;
-
-    if let Some(list) = styles_attr.as_list() {
-        for item in list {
-            if let Some(element_id) = item.as_entity_ref() {
-                if let Some(color) = extract_color_from_rendering(element_id, decoder) {
-                    return Some(color);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract color from IfcSurfaceStyleRendering or IfcSurfaceStyleShading
-fn extract_color_from_rendering(
-    rendering_id: u32,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<[f32; 4]> {
-    use ifc_lite_core::IfcType;
-
-    let rendering = decoder.decode_by_id(rendering_id).ok()?;
-
-    match rendering.ifc_type {
-        IfcType::IfcSurfaceStyleRendering | IfcType::IfcSurfaceStyleShading => {
-            // Attr 0: SurfaceColour (inherited from IfcSurfaceStyleShading)
-            // Attr 1: Transparency (inherited, 0.0=opaque, 1.0=transparent)
-            let color_ref = rendering.get_ref(0)?;
-            let [r, g, b, _] = extract_color_rgb(color_ref, decoder)?;
-
-            // Read transparency and convert to alpha
-            // Transparency: 0.0 = opaque, 1.0 = fully transparent
-            // Alpha: 1.0 = opaque, 0.0 = fully transparent
-            // So: alpha = 1.0 - transparency
-            let transparency = rendering.get_float(1).unwrap_or(0.0);
-            let alpha = 1.0 - transparency as f32;
-
-            return Some([r, g, b, alpha.max(0.0).min(1.0)]);
-        }
-        _ => {}
-    }
-
-    None
-}
-
-/// Extract RGB color from IfcColourRgb
-fn extract_color_rgb(
-    color_id: u32,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<[f32; 4]> {
-    use ifc_lite_core::IfcType;
-
-    let color = decoder.decode_by_id(color_id).ok()?;
-
-    if color.ifc_type != IfcType::IfcColourRgb {
-        return None;
-    }
-
-    // IfcColourRgb: Name, Red, Green, Blue
-    // Note: In IFC2x3, attributes are at indices 1, 2, 3 (0 is Name)
-    // In IFC4, attributes are also at 1, 2, 3
-    let red = color.get_float(1).unwrap_or(0.8);
-    let green = color.get_float(2).unwrap_or(0.8);
-    let blue = color.get_float(3).unwrap_or(0.8);
-
-    Some([red as f32, green as f32, blue as f32, 1.0])
 }
 
 // ---------------------------------------------------------------------------
@@ -368,12 +150,9 @@ fn extract_color_rgb(
 /// Data collected during the combined single-pass scan.
 /// For a 487 MB file this saves ~2-3 s by eliminating redundant full-file scans.
 pub(crate) struct PrePassData {
-    /// Geometry ID → color (from IfcStyledItem → surface style chain)
-    pub geometry_styles: rustc_hash::FxHashMap<u32, [f32; 4]>,
-    /// Host element → opening elements (from IfcRelVoidsElement)
-    pub void_index: rustc_hash::FxHashMap<u32, Vec<u32>>,
-    /// FacetedBrep entity IDs for batch preprocessing
-    pub faceted_brep_ids: Vec<u32>,
+    /// The shared post-scan resolution (styles, material chain, voids) — the
+    /// exact resolver the native pipeline and the streaming prepass run.
+    pub resolved: ifc_lite_processing::prepass::ResolvedPrepass,
     /// IfcProject entity ID (for unit extraction)
     pub project_id: Option<u32>,
     /// IfcSite entity position (id, start, end) — for building rotation extraction
@@ -382,92 +161,42 @@ pub(crate) struct PrePassData {
     pub simple_jobs: Vec<(u32, usize, usize, ifc_lite_core::IfcType)>,
     /// Complex geometry jobs (windows, doors, furniture …)
     pub complex_jobs: Vec<(u32, usize, usize, ifc_lite_core::IfcType)>,
-    /// Element ID → list of material-based colors (from IfcRelAssociatesMaterial chain).
-    /// Used as fallback when a sub-mesh has no direct IfcStyledItem style.
-    pub element_material_styles: rustc_hash::FxHashMap<u32, Vec<[f32; 4]>>,
 }
 
 /// Single EntityScanner pass that collects everything needed before geometry
-/// processing. Replaces the former sequence of:
-///   build_geometry_style_index  (full scan)
-///   build_element_style_index   (full scan + 208 K decodes)
-///   pre-pass for void + brep    (full scan)
-///   processing scan              (full scan)
+/// processing: the scan loop stashes spans, and ALL semantic resolution
+/// (styled-item precedence, #663/#858 indexed colours, the #407 material
+/// chain, voids + #845 aggregate propagation) runs in the SHARED
+/// `ifc_lite_processing::prepass::resolve_prepass` — the same code the native
+/// pipeline and `buildPrePassStreaming` run.
 pub(crate) fn combined_pre_pass(
-    content: &str,
+    content: &[u8],
     decoder: &mut ifc_lite_core::EntityDecoder,
 ) -> PrePassData {
     use ifc_lite_core::EntityScanner;
-    use rustc_hash::FxHashMap;
+    use ifc_lite_processing::prepass::{resolve_prepass, PrepassSpans, ResolveOptions};
 
     let estimated_elements = content.len() / 2000;
 
-    let mut geometry_styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
-    let mut void_index: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    let mut faceted_brep_ids: Vec<u32> = Vec::with_capacity(estimated_elements / 10);
+    let mut spans = PrepassSpans::default();
     let mut project_id: Option<u32> = None;
     let mut site_position: Option<(u32, usize, usize)> = None;
     let mut simple_jobs = Vec::with_capacity(estimated_elements / 2);
     let mut complex_jobs = Vec::with_capacity(estimated_elements / 2);
 
-    // Material chain collection: orphan styled items, material def reprs, rel associates
-    // Orphan IfcStyledItem (null Item): styled_item_id → color
-    let mut orphan_styled_items: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
-    // IfcMaterialDefinitionRepresentation: material_id → [styled_repr_id, ...]
-    let mut material_def_reprs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    // IfcRelAssociatesMaterial: element_id → material_select_id
-    let mut element_to_material: FxHashMap<u32, u32> = FxHashMap::default();
-
     let mut scanner = EntityScanner::new(content);
 
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         match type_name {
-            "IFCSTYLEDITEM" => {
-                if let Ok(styled_item) = decoder.decode_at_with_id(id, start, end) {
-                    if let Some(geometry_id) = styled_item.get_ref(0) {
-                        // Normal IfcStyledItem with Item reference → geometry_styles
-                        if !geometry_styles.contains_key(&geometry_id) {
-                            if let Some(styles_attr) = styled_item.get(1) {
-                                if let Some(color) = extract_color_from_styles(styles_attr, decoder)
-                                {
-                                    geometry_styles.insert(geometry_id, color);
-                                }
-                            }
-                        }
-                    } else {
-                        // Orphan IfcStyledItem (null Item) — material-based color
-                        if let Some(styles_attr) = styled_item.get(1) {
-                            if let Some(color) = extract_color_from_styles(styles_attr, decoder) {
-                                orphan_styled_items.insert(id, color);
-                            }
-                        }
-                    }
-                }
+            "IFCSTYLEDITEM" => spans.styled_items.push((id, start, end)),
+            "IFCINDEXEDCOLOURMAP" => spans.indexed_colour_maps.push((id, start, end)),
+            "IFCMATERIALDEFINITIONREPRESENTATION" => {
+                spans.material_def_reprs.push((id, start, end))
             }
-            "IFCMATERIALDEFINITIONREPRESENTATION" | "IFCRELASSOCIATESMATERIAL" => {
-                collect_material_entity(
-                    id,
-                    type_name,
-                    start,
-                    end,
-                    decoder,
-                    &mut orphan_styled_items,
-                    &mut material_def_reprs,
-                    &mut element_to_material,
-                );
-            }
-            "IFCRELVOIDSELEMENT" => {
-                if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
-                    if let (Some(host_id), Some(opening_id)) =
-                        (entity.get_ref(4), entity.get_ref(5))
-                    {
-                        void_index.entry(host_id).or_default().push(opening_id);
-                    }
-                }
-            }
-            "IFCFACETEDBREP" => {
-                faceted_brep_ids.push(id);
-            }
+            "IFCRELASSOCIATESMATERIAL" => spans.rel_associates_material.push((id, start, end)),
+            "IFCRELVOIDSELEMENT" => spans.void_rels.push((id, start, end)),
+            "IFCRELFILLSELEMENT" => spans.fills_rels.push((id, start, end)),
+            "IFCRELAGGREGATES" => spans.aggregate_rels.push((id, start, end)),
             "IFCPROJECT" => {
                 if project_id.is_none() {
                     project_id = Some(id);
@@ -483,7 +212,7 @@ pub(crate) fn combined_pre_pass(
             _ => {
                 if ifc_lite_core::has_geometry_by_name(type_name) {
                     let ifc_type = ifc_lite_core::IfcType::from_str(type_name);
-                    if is_simple_geometry_type(type_name) {
+                    if ifc_lite_core::is_simple_geometry_type(type_name) {
                         simple_jobs.push((id, start, end, ifc_type));
                     } else {
                         complex_jobs.push((id, start, end, ifc_type));
@@ -493,431 +222,181 @@ pub(crate) fn combined_pre_pass(
         }
     }
 
-    // Build material style index: material_id → [color, ...]
-    // Chain: material → IfcMaterialDefinitionRepresentation → IfcStyledRepresentation → orphan IfcStyledItem
-    let material_styles =
-        build_material_style_index(&material_def_reprs, &orphan_styled_items, decoder);
+    // Shared post-scan resolution. Full per-triangle palettes stay per-worker
+    // rebuilds (`get_or_build_indexed_colour_maps`); the prepass only ships
+    // the dominant colours on the wire.
+    let resolved = resolve_prepass(
+        &spans,
+        decoder,
+        ResolveOptions {
+            collect_indexed_colour_full: false,
+            defer_attached_styles: false,
+        },
+    );
 
-    // Build element → material colors map
-    let element_material_styles =
-        build_element_material_styles(&element_to_material, &material_styles, decoder);
-
-    // Propagate voids from aggregate parents (IfcWall) to children (IfcBuildingElementPart)
-    // so that multilayer wall parts also get window/door cutouts.
-    ifc_lite_geometry::propagate_voids_to_parts(&mut void_index, content, decoder);
+    // #957 + Model/Types switch: emit IfcTypeProduct RepresentationMap geometry
+    // (annex-E orphan types AND instanced type-library shapes). processGeometryBatch
+    // tags each with a geometry_class so the viewer can show/hide it per view mode.
+    complex_jobs.extend(collect_type_geometry_jobs(content, decoder));
 
     PrePassData {
-        geometry_styles,
-        void_index,
-        faceted_brep_ids,
+        resolved,
         project_id,
         site_position,
         simple_jobs,
         complex_jobs,
-        element_material_styles,
     }
 }
 
-/// Build material style index: maps material IDs to their colors.
-/// Follows: material → IfcMaterialDefinitionRepresentation → IfcStyledRepresentation → orphan IfcStyledItem
-fn build_material_style_index(
-    material_def_reprs: &rustc_hash::FxHashMap<u32, Vec<u32>>,
-    orphan_styled_items: &rustc_hash::FxHashMap<u32, [f32; 4]>,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> rustc_hash::FxHashMap<u32, Vec<[f32; 4]>> {
-    use rustc_hash::FxHashMap;
-
-    let mut material_styles: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
-
-    for (&material_id, styled_repr_ids) in material_def_reprs {
-        for &styled_repr_id in styled_repr_ids {
-            // Decode the IfcStyledRepresentation
-            // Inherits from IfcRepresentation: ContextOfItems(0), RepresentationIdentifier(1),
-            //   RepresentationType(2), Items(3)
-            let styled_repr = match decoder.decode_by_id(styled_repr_id) {
-                Ok(entity) => entity,
-                Err(_) => continue,
-            };
-
-            let items_attr = match styled_repr.get(3) {
-                Some(attr) => attr,
-                None => continue,
-            };
-
-            let items_list = match items_attr.as_list() {
-                Some(list) => list,
-                None => continue,
-            };
-
-            // Each item should be an orphan IfcStyledItem (already collected)
-            for item in items_list {
-                if let Some(styled_item_id) = item.as_entity_ref() {
-                    if let Some(&color) = orphan_styled_items.get(&styled_item_id) {
-                        material_styles.entry(material_id).or_default().push(color);
-                    }
-                }
-            }
-        }
-    }
-
-    material_styles
-}
-
-/// Build element → material colors map.
-/// Resolves the full chain from element → IfcRelAssociatesMaterial → material select →
-/// individual materials → colors.
-/// Handles: IfcMaterial, IfcMaterialList, IfcMaterialLayerSet, IfcMaterialLayerSetUsage,
-///          IfcMaterialConstituentSet (IFC4), IfcMaterialProfileSet (IFC4)
-fn build_element_material_styles(
-    element_to_material: &rustc_hash::FxHashMap<u32, u32>,
-    material_styles: &rustc_hash::FxHashMap<u32, Vec<[f32; 4]>>,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> rustc_hash::FxHashMap<u32, Vec<[f32; 4]>> {
-    use rustc_hash::FxHashMap;
-
-    let mut result: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
-
-    for (&element_id, &material_select_id) in element_to_material {
-        let mut colors: Vec<[f32; 4]> = Vec::new();
-
-        // Collect all individual material IDs from the material select
-        let material_ids = resolve_material_ids(material_select_id, decoder);
-
-        for material_id in material_ids {
-            if let Some(mat_colors) = material_styles.get(&material_id) {
-                colors.extend(mat_colors);
-            }
-        }
-
-        if !colors.is_empty() {
-            result.insert(element_id, colors);
-        }
-    }
-
-    result
-}
-
-/// Resolve a material select (which could be IfcMaterial, IfcMaterialList,
-/// IfcMaterialLayerSet, IfcMaterialLayerSetUsage, IfcMaterialConstituentSet,
-/// IfcMaterialProfileSet) into a list of individual IfcMaterial IDs.
-fn resolve_material_ids(
-    material_select_id: u32,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Vec<u32> {
-    resolve_material_ids_inner(material_select_id, decoder, 0)
-}
-
-/// Maximum recursion depth for material resolution (guards against cycles in malformed IFC).
-const MAX_MATERIAL_RESOLVE_DEPTH: u8 = 4;
-
-fn resolve_material_ids_inner(
-    material_select_id: u32,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-    depth: u8,
-) -> Vec<u32> {
-    if depth >= MAX_MATERIAL_RESOLVE_DEPTH {
-        return vec![];
-    }
-
-    use ifc_lite_core::IfcType;
-
-    let entity = match decoder.decode_by_id(material_select_id) {
-        Ok(e) => e,
-        Err(_) => return vec![],
-    };
-
-    match entity.ifc_type {
-        IfcType::IfcMaterial => {
-            vec![material_select_id]
-        }
-        IfcType::IfcMaterialList => {
-            // Attr 0: Materials (list of IfcMaterial refs)
-            extract_refs_from_list(&entity, 0)
-        }
-        IfcType::IfcMaterialLayerSetUsage => {
-            // Attr 0: ForLayerSet (ref to IfcMaterialLayerSet)
-            if let Some(layer_set_id) = entity.get_ref(0) {
-                resolve_material_ids_inner(layer_set_id, decoder, depth + 1)
-            } else {
-                vec![]
-            }
-        }
-        IfcType::IfcMaterialLayerSet => {
-            // Attr 0: MaterialLayers (list of IfcMaterialLayer refs)
-            // IfcMaterialLayer: Attr 0: Material (ref to IfcMaterial)
-            extract_nested_material_ids(&entity, 0, 0, decoder)
-        }
-        IfcType::IfcMaterialConstituentSet => {
-            // Attr 2: MaterialConstituents (list of IfcMaterialConstituent refs)
-            // IfcMaterialConstituent: Attr 2: Material (ref to IfcMaterial)
-            extract_nested_material_ids(&entity, 2, 2, decoder)
-        }
-        IfcType::IfcMaterialProfileSet => {
-            // Attr 2: MaterialProfiles (list of IfcMaterialProfile refs)
-            // IfcMaterialProfile: Attr 2: Material (ref to IfcMaterial)
-            extract_nested_material_ids(&entity, 2, 2, decoder)
-        }
-        IfcType::IfcMaterialProfileSetUsage | IfcType::IfcMaterialProfileSetUsageTapering => {
-            // Attr 0: ForProfileSet (ref to IfcMaterialProfileSet)
-            // IfcMaterialProfileSetUsageTapering is a subtype with the same attr layout
-            if let Some(profile_set_id) = entity.get_ref(0) {
-                resolve_material_ids_inner(profile_set_id, decoder, depth + 1)
-            } else {
-                vec![]
-            }
-        }
-        _ => {
-            // Unknown material type — no colors to extract
-            vec![]
-        }
-    }
-}
-
-/// Extract material IDs from a list of container entities (layers, constituents, profiles).
-/// `container_list_attr_idx` is the attribute index of the list on the parent entity.
-/// `material_attr_idx` is the attribute index of the Material ref on each child entity.
-fn extract_nested_material_ids(
-    entity: &ifc_lite_core::DecodedEntity,
-    container_list_attr_idx: usize,
-    material_attr_idx: usize,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Vec<u32> {
-    let container_ids = extract_refs_from_list(entity, container_list_attr_idx);
-    let mut materials = Vec::new();
-    for container_id in container_ids {
-        if let Ok(container) = decoder.decode_by_id(container_id) {
-            if let Some(mat_id) = container.get_ref(material_attr_idx) {
-                materials.push(mat_id);
-            }
-        }
-    }
-    materials
-}
-
-/// Helper: extract entity references from a list attribute.
-fn extract_refs_from_list(entity: &ifc_lite_core::DecodedEntity, index: usize) -> Vec<u32> {
-    entity
-        .get(index)
-        .and_then(|attr| attr.as_list())
-        .map(|list| list.iter().filter_map(|v| v.as_entity_ref()).collect())
-        .unwrap_or_default()
-}
-
-/// Build element material styles by scanning the content for material-related entities.
-/// Standalone version for use in synchronous parse_meshes path (which doesn't use combined_pre_pass).
-pub(crate) fn build_element_material_styles_from_content(
-    content: &str,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> rustc_hash::FxHashMap<u32, Vec<[f32; 4]>> {
-    let (orphan_styled_items, material_def_reprs, element_to_material) =
-        collect_material_data(content, decoder);
-
-    let material_styles =
-        build_material_style_index(&material_def_reprs, &orphan_styled_items, decoder);
-    build_element_material_styles(&element_to_material, &material_styles, decoder)
-}
-
-/// Collect material-related data from an IFC content scan.
-/// Returns: (orphan_styled_items, material_def_reprs, element_to_material)
+/// Collect render jobs for `IfcTypeProduct` `RepresentationMap` geometry — every
+/// type carrying at least one map that no `IfcMappedItem` already draws.
 ///
-/// Shared between `combined_pre_pass` (which integrates collection into its
-/// single-pass loop) and `build_element_material_styles_from_content` (which
-/// needs a standalone scan for the synchronous parse_meshes path).
-fn collect_material_data(
-    content: &str,
+/// Returns `(id, start, end, ifc_type)` per type, appended to the prepass job
+/// list. `processGeometryBatch` turns each into geometry via
+/// [`ifc_lite_geometry::GeometryRouter::process_representation_map`] and tags it
+/// with a `geometry_class` — orphan (no occurrence) vs instanced (an
+/// `IfcRelDefinesByType` links it to an occurrence) — so the viewer's Model/Types
+/// switch can show or hide it (see `gpu_meshes.rs`). A map already referenced by
+/// an `IfcMappedItem` is drawn through its occurrence's mapped representation, so
+/// a type whose maps are ALL referenced yields no renderable job and is skipped.
+///
+/// buildingSMART annex-E "tessellated shape with style" files declare geometry
+/// only on the type (orphan, class 1); ArchiCAD/AC20 files attach a map to nearly
+/// every instanced type while the occurrence carries its own body (class 2,
+/// hidden in Model mode so it does not double-render at the MappingOrigin).
+pub(crate) fn collect_type_geometry_jobs(
+    content: &[u8],
     decoder: &mut ifc_lite_core::EntityDecoder,
-) -> (
-    rustc_hash::FxHashMap<u32, [f32; 4]>,
-    rustc_hash::FxHashMap<u32, Vec<u32>>,
-    rustc_hash::FxHashMap<u32, u32>,
-) {
-    use ifc_lite_core::EntityScanner;
-    use rustc_hash::FxHashMap;
+) -> Vec<(u32, usize, usize, ifc_lite_core::IfcType)> {
+    use ifc_lite_core::{EntityScanner, IfcType};
 
-    let mut orphan_styled_items: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
-    let mut material_def_reprs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    let mut element_to_material: FxHashMap<u32, u32> = FxHashMap::default();
+    // Fast bail-out: type geometry can only exist when the file authors at least
+    // one IfcRepresentationMap. The overwhelming majority of files pay only a
+    // single substring search instead of a full entity scan + decode.
+    if !content
+        .windows(b"IFCREPRESENTATIONMAP".len())
+        .any(|window| window == b"IFCREPRESENTATIONMAP")
+    {
+        return Vec::new();
+    }
+
+    // Single pass: gather the IfcMappedItem-referenced RepresentationMaps and the
+    // type-product candidates, then drop types whose maps are all referenced
+    // (those are drawn through their occurrence's mapped representation). The
+    // orphan-vs-instanced class is assigned later, in the render loop.
+    let mut referenced: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut candidates: Vec<(u32, usize, usize, IfcType, Vec<u32>)> = Vec::new();
 
     let mut scanner = EntityScanner::new(content);
-
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        collect_material_entity(
-            id,
-            type_name,
-            start,
-            end,
-            decoder,
-            &mut orphan_styled_items,
-            &mut material_def_reprs,
-            &mut element_to_material,
-        );
-    }
-
-    (orphan_styled_items, material_def_reprs, element_to_material)
-}
-
-/// Process a single entity for material-related data collection.
-/// Called from both `combined_pre_pass` (inline in the scan loop) and
-/// `collect_material_data` (standalone scan).
-fn collect_material_entity(
-    id: u32,
-    type_name: &str,
-    start: usize,
-    end: usize,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-    orphan_styled_items: &mut rustc_hash::FxHashMap<u32, [f32; 4]>,
-    material_def_reprs: &mut rustc_hash::FxHashMap<u32, Vec<u32>>,
-    element_to_material: &mut rustc_hash::FxHashMap<u32, u32>,
-) {
-    match type_name {
-        "IFCSTYLEDITEM" => {
-            if let Ok(styled_item) = decoder.decode_at_with_id(id, start, end) {
-                // Only collect orphan styled items (null Item attribute)
-                if styled_item.get_ref(0).is_none() {
-                    if let Some(styles_attr) = styled_item.get(1) {
-                        if let Some(color) = extract_color_from_styles(styles_attr, decoder) {
-                            orphan_styled_items.insert(id, color);
-                        }
-                    }
-                }
-            }
-        }
-        "IFCMATERIALDEFINITIONREPRESENTATION" => {
+        if type_name == "IFCMAPPEDITEM" {
             if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
-                if let Some(material_id) = entity.get_ref(3) {
-                    if let Some(reprs_attr) = entity.get(2) {
-                        if let Some(list) = reprs_attr.as_list() {
-                            for item in list {
-                                if let Some(repr_id) = item.as_entity_ref() {
-                                    material_def_reprs
-                                        .entry(material_id)
-                                        .or_default()
-                                        .push(repr_id);
-                                }
-                            }
-                        }
-                    }
+                // IfcMappedItem.MappingSource = attr 0.
+                if let Some(source_id) = entity.get_ref(0) {
+                    referenced.insert(source_id);
                 }
             }
-        }
-        "IFCRELASSOCIATESMATERIAL" => {
+        } else if type_name.ends_with("TYPE") || type_name.ends_with("STYLE") {
+            // Cheap suffix pre-filter keeps the is_subtype_of check off the hot
+            // path for the all-non-type majority of entities.
+            let ifc_type = IfcType::from_str(type_name);
+            if !ifc_type.is_subtype_of(IfcType::IfcTypeProduct) {
+                continue;
+            }
             if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
-                if let Some(material_select_id) = entity.get_ref(5) {
-                    if let Some(related_attr) = entity.get(4) {
-                        if let Some(list) = related_attr.as_list() {
-                            for item in list {
-                                if let Some(element_id) = item.as_entity_ref() {
-                                    element_to_material.insert(element_id, material_select_id);
-                                }
-                            }
-                        }
-                    }
+                // IfcTypeProduct.RepresentationMaps = attr 6.
+                let rep_maps: Vec<u32> = entity
+                    .get(6)
+                    .and_then(|a| a.as_list())
+                    .map(|list| list.iter().filter_map(|v| v.as_entity_ref()).collect())
+                    .unwrap_or_default();
+                if !rep_maps.is_empty() {
+                    candidates.push((id, start, end, ifc_type, rep_maps));
                 }
             }
         }
-        _ => {}
     }
+
+    candidates
+        .into_iter()
+        .filter(|(_, _, _, _, maps)| maps.iter().any(|rm| !referenced.contains(rm)))
+        .map(|(id, start, end, ifc_type, _)| (id, start, end, ifc_type))
+        .collect()
 }
 
-/// Resolve color for a sub-mesh using the fallback chain:
-/// direct geometry style -> material-based style -> element style -> default.
-///
-/// `mat_color_idx` is the current index for material color alternation (transparent/opaque).
-/// It is incremented when a material fallback is attempted (caller should track this).
-pub(crate) fn resolve_submesh_color(
-    geometry_id: u32,
-    geometry_styles: &rustc_hash::FxHashMap<u32, [f32; 4]>,
+/// #957: the set of `RepresentationMap`s instantiated by an `IfcMappedItem`, so
+/// `processGeometryBatch` can tell which of a type's RepresentationMaps are
+/// orphan (rendered directly) vs already drawn through an occurrence.
+pub(crate) fn build_referenced_representation_maps(
+    content: &[u8],
     decoder: &mut ifc_lite_core::EntityDecoder,
-    material_colors: Option<&Vec<[f32; 4]>>,
-    mat_color_idx: &mut usize,
-    element_color: Option<[f32; 4]>,
-    default_color: [f32; 4],
-) -> [f32; 4] {
-    // 1. Direct geometry style (IfcStyledItem -> geometry item)
-    if let Some(color) = find_color_for_geometry(geometry_id, geometry_styles, decoder) {
-        return color;
-    }
-
-    // 2. Material-based fallback (alternating transparent/opaque)
-    if let Some(colors) = material_colors {
-        let prefer_transparent = *mat_color_idx % 2 == 0;
-        *mat_color_idx += 1;
-        if let Some(color) = pick_material_style_for_submesh(colors, prefer_transparent) {
-            return color;
+) -> rustc_hash::FxHashSet<u32> {
+    use ifc_lite_core::EntityScanner;
+    let mut referenced: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut scanner = EntityScanner::new(content);
+    while let Some((id, type_name, start, end)) = scanner.next_entity() {
+        if type_name == "IFCMAPPEDITEM" {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+                // IfcMappedItem.MappingSource = attr 0 (the IfcRepresentationMap).
+                if let Some(source_id) = entity.get_ref(0) {
+                    referenced.insert(source_id);
+                }
+            }
         }
     }
-
-    // 3. Element-level style or default
-    element_color.unwrap_or(default_color)
+    referenced
 }
 
-/// Alpha threshold for distinguishing transparent (glass) from opaque materials.
-const TRANSPARENCY_ALPHA_THRESHOLD: f32 = 0.95;
-
-/// Pick the best material style for a sub-mesh.
-/// Prefers transparent colors (glass) for sub-meshes without a direct style,
-/// since glass sub-elements are the most common case where material-based
-/// styling is the only source of appearance data.
-pub(crate) fn pick_material_style_for_submesh(
-    material_colors: &[[f32; 4]],
-    prefer_transparent: bool,
-) -> Option<[f32; 4]> {
-    if material_colors.is_empty() {
-        return None;
-    }
-
-    if prefer_transparent {
-        // Prefer transparent (glass) — alpha < threshold
-        if let Some(color) = material_colors
-            .iter()
-            .find(|c| c[3] < TRANSPARENCY_ALPHA_THRESHOLD)
-        {
-            return Some(*color);
-        }
-    } else {
-        // Prefer opaque (frame) — alpha >= threshold
-        if let Some(color) = material_colors
-            .iter()
-            .find(|c| c[3] >= TRANSPARENCY_ALPHA_THRESHOLD)
-        {
-            return Some(*color);
+/// #957 follow-up: the set of type ids that an `IfcRelDefinesByType` instantiates
+/// (i.e. the type has at least one occurrence). `processGeometryBatch` uses it to
+/// suppress type-only geometry for such types — their geometry is already drawn
+/// through their occurrences, so rendering the type's RepresentationMap as well
+/// would double-render it at the MappingOrigin (duplicate at the wrong position).
+pub(crate) fn build_instantiated_type_ids(
+    content: &[u8],
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> rustc_hash::FxHashSet<u32> {
+    use ifc_lite_core::EntityScanner;
+    let mut instantiated: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut scanner = EntityScanner::new(content);
+    while let Some((id, type_name, start, end)) = scanner.next_entity() {
+        if type_name == "IFCRELDEFINESBYTYPE" {
+            if let Ok(entity) = decoder.decode_at_with_id(id, start, end) {
+                // IfcRelDefinesByType.RelatingType = attr 5 (the typed product).
+                if let Some(type_id) = entity.get_ref(5) {
+                    instantiated.insert(type_id);
+                }
+            }
         }
     }
-
-    // Fallback: first available color
-    Some(material_colors[0])
+    instantiated
 }
 
-/// Check if an IFC entity class is "simple" geometry (processed first for fast
-/// first frame).  Instead of whitelisting known simple classes — which breaks
-/// whenever new IFC entity classes appear (e.g. IFC4X3 infrastructure) — we
-/// blacklist the classes that are known to be secondary/complex.  Everything
-/// else with geometry defaults to "simple" priority.
-pub(crate) fn is_simple_geometry_type(type_name: &str) -> bool {
-    !matches!(
-        type_name,
-        // Openings / voids — subtracted, not rendered directly
-        "IFCOPENINGELEMENT" | "IFCOPENINGSTANDARDCASE"
-        // Windows & doors — detailed geometry, lower priority
-        | "IFCWINDOW" | "IFCWINDOWSTANDARDCASE"
-        | "IFCDOOR" | "IFCDOORSTANDARDCASE"
-        // Furnishing — typically high-poly, secondary
-        | "IFCFURNISHINGELEMENT" | "IFCFURNITURE" | "IFCSYSTEMFURNITUREELEMENT"
-        // MEP / distribution — dense small elements
-        | "IFCDISTRIBUTIONELEMENT" | "IFCDISTRIBUTIONFLOWELEMENT" | "IFCDISTRIBUTIONCONTROLELEMENT"
-        | "IFCFLOWSEGMENT" | "IFCFLOWFITTING" | "IFCFLOWTERMINAL"
-        | "IFCFLOWCONTROLLER" | "IFCFLOWMOVINGDEVICE" | "IFCFLOWSTORAGEDEVICE"
-        | "IFCFLOWTREATMENTDEVICE" | "IFCENERGYCONVERSIONDEVICE"
-        // Spatial elements — not structural
-        | "IFCSPACE" | "IFCSITE"
-        // Annotations & virtual
-        | "IFCANNOTATION" | "IFCVIRTUALELEMENT" | "IFCPROXY"
-    )
-}
 
 /// Resolve element color inline during processing by following its
 /// representation chain. Replaces the upfront `build_element_style_index`
 /// scan — avoids decoding every building element twice.
+///
+/// Resolution order (preserves IFC precedence — direct IfcStyledItem on a
+/// geometry item must win over an element-level material chain):
+///
+/// 1. **Direct geometry-item colour.** Walk every `IfcShapeRepresentation`
+///    in the product definition and ask `geometry_styles` for any item's
+///    colour. Items here are `IfcExtrudedAreaSolid`, `IfcMappedItem`, etc.;
+///    `find_color_for_geometry` chases `IfcMappedItem` into its underlying
+///    representation map.
+///
+/// 2. **Element-keyed material fallback.** When the prepass folded the
+///    element's resolved material colour into `geometry_styles` keyed by
+///    the element's own express ID (`buildPrePassStreaming` does this for
+///    every entry in `element_material_styles` — see the prepass body in
+///    `gpu_meshes.rs`), pick that colour up here. Files that author colour
+///    **only** through the `IfcMaterial` → orphan `IfcStyledItem` →
+///    `IfcStyledRepresentation` → `IfcMaterialDefinitionRepresentation`
+///    chain — schependomlaan.ifc and most ArchiCAD / Revit IFC2x3 exports
+///    — land here. Without this fallback the data the prepass already
+///    computed sits unused and every such element renders as the per-type
+///    grey default.
 pub(crate) fn resolve_element_color(
     entity: &ifc_lite_core::DecodedEntity,
     geometry_styles: &rustc_hash::FxHashMap<u32, [f32; 4]>,
@@ -927,18 +406,41 @@ pub(crate) fn resolve_element_color(
         return None;
     }
 
-    // Building elements have Representation at attribute index 6
+    if let Some(color) = walk_representation_for_direct_color(entity, geometry_styles, decoder) {
+        return Some(color);
+    }
+
+    geometry_styles.get(&entity.id).copied()
+}
+
+/// Walk an element's representation chain looking for a colour attached
+/// directly to a geometry item. Split out so a missing or malformed
+/// representation can't short-circuit past the material-chain fallback in
+/// [`resolve_element_color`].
+fn walk_representation_for_direct_color(
+    entity: &ifc_lite_core::DecodedEntity,
+    geometry_styles: &rustc_hash::FxHashMap<u32, [f32; 4]>,
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> Option<[f32; 4]> {
     let repr_id = entity.get_ref(6)?;
     let product_shape = decoder.decode_by_id(repr_id).ok()?;
     let reprs_list = product_shape.get(2)?.as_list()?;
 
     for repr_item in reprs_list {
-        let shape_repr_id = repr_item.as_entity_ref()?;
-        let shape_repr = decoder.decode_by_id(shape_repr_id).ok()?;
-        let items_list = shape_repr.get(3)?.as_list()?;
+        let Some(shape_repr_id) = repr_item.as_entity_ref() else {
+            continue;
+        };
+        let Ok(shape_repr) = decoder.decode_by_id(shape_repr_id) else {
+            continue;
+        };
+        let Some(items_list) = shape_repr.get(3).and_then(|a| a.as_list()) else {
+            continue;
+        };
 
         for geom_item in items_list {
-            let geom_id = geom_item.as_entity_ref()?;
+            let Some(geom_id) = geom_item.as_entity_ref() else {
+                continue;
+            };
             if let Some(color) = find_color_for_geometry(geom_id, geometry_styles, decoder) {
                 return Some(color);
             }
@@ -948,198 +450,132 @@ pub(crate) fn resolve_element_color(
     None
 }
 
-/// Get default color for IFC type (matches default-materials.ts)
-pub(crate) fn get_default_color_for_type(ifc_type: &ifc_lite_core::IfcType) -> [f32; 4] {
-    use ifc_lite_core::IfcType;
+// Default IFC-type colors now come from the single canonical table in
+// `ifc_lite_processing::default_color_for_type` (issue #913). The browser path
+// calls it directly (see `gpu_meshes.rs`); do not reintroduce a table here.
 
-    match ifc_type {
-        // Walls - light gray
-        IfcType::IfcWall | IfcType::IfcWallStandardCase => [0.85, 0.85, 0.85, 1.0],
-
-        // Slabs - darker gray
-        IfcType::IfcSlab => [0.7, 0.7, 0.7, 1.0],
-
-        // Roofs - brown-ish
-        IfcType::IfcRoof => [0.6, 0.5, 0.4, 1.0],
-
-        // Columns/Beams - steel gray
-        IfcType::IfcColumn | IfcType::IfcBeam | IfcType::IfcMember => [0.6, 0.65, 0.7, 1.0],
-
-        // Windows - light blue transparent
-        IfcType::IfcWindow => [0.6, 0.8, 1.0, 0.4],
-
-        // Doors - wood brown
-        IfcType::IfcDoor => [0.6, 0.45, 0.3, 1.0],
-
-        // Stairs
-        IfcType::IfcStair => [0.75, 0.75, 0.75, 1.0],
-
-        // Railings
-        IfcType::IfcRailing => [0.4, 0.4, 0.45, 1.0],
-
-        // Plates/Coverings
-        IfcType::IfcPlate | IfcType::IfcCovering => [0.8, 0.8, 0.8, 1.0],
-
-        // Curtain walls - glass blue
-        IfcType::IfcCurtainWall => [0.5, 0.7, 0.9, 0.5],
-
-        // Furniture - wood
-        IfcType::IfcFurnishingElement => [0.7, 0.55, 0.4, 1.0],
-
-        // Spaces - cyan transparent (matches MainToolbar)
-        IfcType::IfcSpace => [0.2, 0.85, 1.0, 0.3],
-
-        // Opening elements - red-orange transparent
-        IfcType::IfcOpeningElement => [1.0, 0.42, 0.29, 0.4],
-
-        // Site - green
-        IfcType::IfcSite => [0.4, 0.8, 0.3, 1.0],
-
-        // Default gray
-        _ => [0.8, 0.8, 0.8, 1.0],
-    }
-}
-
-/// Extract building rotation from a pre-collected IfcSite position (avoids re-scanning).
-/// Returns rotation angle in radians, or None if not found.
+/// Site/building rotation angle (radians) for the viewer's render-frame
+/// rotation, or `None` if absent. Derived from the **canonical** resolved
+/// placement matrix (`GeometryRouter::resolve_scaled_placement`) + the shared
+/// [`ifc_lite_geometry::rotation_angle_about_z`], so it cannot drift from the
+/// processor's site-local frame on nested / scaled / tilted placements (the old
+/// `atan2`-of-raw-top-level-RefDirection walk was incomplete for those).
 pub(crate) fn extract_building_rotation_from_site(
     site_pos: (u32, usize, usize),
+    router: &ifc_lite_geometry::GeometryRouter,
     decoder: &mut ifc_lite_core::EntityDecoder,
 ) -> Option<f64> {
     let (site_id, start, end) = site_pos;
     let site_entity = decoder.decode_at_with_id(site_id, start, end).ok()?;
-
-    // Get ObjectPlacement (attribute 5 for IfcProduct)
-    let placement_attr = site_entity.get(5).filter(|a| !a.is_null())?;
-    let placement = decoder.resolve_ref(placement_attr).ok()??;
-
-    // Find top-level placement (parent is null)
-    let top_level_placement = find_top_level_placement(&placement, decoder);
-
-    // Extract rotation from top-level placement's RefDirection
-    extract_rotation_from_placement(&top_level_placement, decoder)
+    let matrix = router
+        .resolve_scaled_placement(&site_entity, decoder)
+        .ok()?;
+    ifc_lite_geometry::rotation_angle_about_z(&matrix)
 }
 
-/// Extract building rotation from IfcSite's top-level placement (scans file).
-/// Used by the synchronous parse_meshes path.
-pub(crate) fn extract_building_rotation(
-    content: &str,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<f64> {
-    use ifc_lite_core::EntityScanner;
+#[cfg(test)]
+mod resolve_element_color_tests {
+    //! Locks in `resolve_element_color`'s precedence: direct
+    //! `IfcStyledItem`-on-geometry-item wins over the element-keyed
+    //! material-chain fallback that the streaming prepass folds into
+    //! `geometry_styles`. The fallback exists so files that author colour
+    //! **only** via the material chain (schependomlaan.ifc and most
+    //! ArchiCAD/Revit IFC2x3 exports) stop rendering as default grey.
+    use super::resolve_element_color;
+    use ifc_lite_core::{build_entity_index, EntityDecoder};
+    use rustc_hash::FxHashMap;
 
-    let mut scanner = EntityScanner::new(content);
+    /// Minimal IFC4 wall whose body is a single `IfcExtrudedAreaSolid`.
+    /// Express IDs:
+    ///   #1 wall, #2 product-def-shape, #3 shape-rep, #5 extrusion.
+    /// Tests put colours under #1 (element-keyed material chain) and/or
+    /// #5 (direct geometry-item) to exercise each resolution path.
+    const WALL_IFC: &str = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('Test'),'2;1');
+FILE_NAME('test','2026-05-27',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCWALL('w',$,'Wall',$,$,$,#2,$,.NOTDEFINED.);
+#2=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));
+#3=IFCSHAPEREPRESENTATION(#4,'Body','SweptSolid',(#5));
+#4=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#6,$);
+#5=IFCEXTRUDEDAREASOLID(#7,#6,#8,3000.);
+#6=IFCAXIS2PLACEMENT3D(#9,$,$);
+#7=IFCRECTANGLEPROFILEDEF(.AREA.,$,$,200.,4000.);
+#8=IFCDIRECTION((0.,0.,1.));
+#9=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#;
 
-    while let Some((site_id, type_name, start, end)) = scanner.next_entity() {
-        if type_name != "IFCSITE" {
-            continue;
-        }
-        if let Ok(site_entity) = decoder.decode_at_with_id(site_id, start, end) {
-            let placement_attr = match site_entity.get(5) {
-                Some(attr) if !attr.is_null() => attr,
-                _ => continue,
-            };
-            let placement = match decoder.resolve_ref(placement_attr) {
-                Ok(Some(p)) => p,
-                _ => continue,
-            };
-            let top_level_placement = find_top_level_placement(&placement, decoder);
-            if let Some(rotation) = extract_rotation_from_placement(&top_level_placement, decoder) {
-                return Some(rotation);
-            }
-        }
+    fn decode_wall() -> (EntityDecoder<'static>, ifc_lite_core::DecodedEntity) {
+        // Leak the content so the decoder can hold a 'static borrow — only
+        // safe inside `#[cfg(test)]` and keeps the call sites tidy.
+        let content: &'static str = Box::leak(WALL_IFC.to_string().into_boxed_str());
+        let idx = build_entity_index(content);
+        let mut decoder = EntityDecoder::with_index(content, idx);
+        let wall = decoder.decode_by_id(1).expect("decode wall #1");
+        (decoder, wall)
     }
 
-    None
-}
-
-/// Find the top-level placement (one with null parent)
-fn find_top_level_placement(
-    placement: &ifc_lite_core::DecodedEntity,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> ifc_lite_core::DecodedEntity {
-    use ifc_lite_core::IfcType;
-
-    // Check if this is a local placement
-    if placement.ifc_type != IfcType::IfcLocalPlacement {
-        return placement.clone();
+    #[test]
+    fn empty_geometry_styles_returns_none() {
+        let (mut decoder, wall) = decode_wall();
+        let styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+        assert_eq!(resolve_element_color(&wall, &styles, &mut decoder), None);
     }
 
-    // Check parent (attribute 0: PlacementRelTo)
-    let parent_attr = match placement.get(0) {
-        Some(attr) if !attr.is_null() => attr,
-        _ => return placement.clone(), // No parent - this is top-level
-    };
-
-    // Resolve parent and recurse
-    if let Ok(Some(parent)) = decoder.resolve_ref(parent_attr) {
-        find_top_level_placement(&parent, decoder)
-    } else {
-        placement.clone() // Parent resolution failed - return current
-    }
-}
-
-/// Extract rotation angle from IfcAxis2Placement3D's RefDirection
-/// Returns rotation angle in radians (atan2 of RefDirection Y/X components)
-fn extract_rotation_from_placement(
-    placement: &ifc_lite_core::DecodedEntity,
-    decoder: &mut ifc_lite_core::EntityDecoder,
-) -> Option<f64> {
-    use ifc_lite_core::IfcType;
-
-    // Get RelativePlacement (attribute 1: IfcAxis2Placement3D)
-    let rel_attr = match placement.get(1) {
-        Some(attr) if !attr.is_null() => attr,
-        _ => return None,
-    };
-
-    let axis_placement = match decoder.resolve_ref(rel_attr) {
-        Ok(Some(p)) => p,
-        _ => return None,
-    };
-
-    // Check if it's IfcAxis2Placement3D
-    if axis_placement.ifc_type != IfcType::IfcAxis2Placement3D {
-        return None;
+    #[test]
+    fn direct_geometry_item_color_resolves_via_rep_walk() {
+        let (mut decoder, wall) = decode_wall();
+        let mut styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+        // Colour keyed on the extrusion #5 — direct IfcStyledItem path.
+        styles.insert(5, [0.1, 0.8, 0.2, 1.0]);
+        assert_eq!(
+            resolve_element_color(&wall, &styles, &mut decoder),
+            Some([0.1, 0.8, 0.2, 1.0]),
+        );
     }
 
-    // Get RefDirection (attribute 2: IfcDirection)
-    let ref_dir_attr = match axis_placement.get(2) {
-        Some(attr) if !attr.is_null() => attr,
-        _ => return None,
-    };
-
-    let ref_dir = match decoder.resolve_ref(ref_dir_attr) {
-        Ok(Some(d)) => d,
-        _ => return None,
-    };
-
-    if ref_dir.ifc_type != IfcType::IfcDirection {
-        return None;
+    #[test]
+    fn element_id_keyed_material_color_resolves_via_fallback() {
+        let (mut decoder, wall) = decode_wall();
+        let mut styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+        // Colour keyed on the wall itself — material-chain fallback path
+        // (prepass folds element_material_styles into geometry_styles
+        // keyed by element express ID).
+        styles.insert(1, [0.8, 0.2, 0.1, 1.0]);
+        assert_eq!(
+            resolve_element_color(&wall, &styles, &mut decoder),
+            Some([0.8, 0.2, 0.1, 1.0]),
+        );
     }
 
-    // Get direction ratios (attribute 0: list of floats)
-    let ratios_attr = match ref_dir.get(0) {
-        Some(attr) => attr,
-        _ => return None,
-    };
-
-    let ratios = match ratios_attr.as_list() {
-        Some(list) => list,
-        _ => return None,
-    };
-
-    // Extract X and Y components (Z is up in IFC)
-    let dx = ratios.first().and_then(|v| v.as_float()).unwrap_or(0.0);
-    let dy = ratios.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
-
-    // Calculate rotation angle: atan2(dy, dx)
-    // This gives the angle of the building's X-axis relative to world X-axis
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-10 {
-        return None; // Zero-length direction
+    #[test]
+    fn direct_color_wins_over_material_fallback() {
+        let (mut decoder, wall) = decode_wall();
+        let mut styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+        // Both present — the IfcStyledItem on the extrusion must win per
+        // IFC precedence. Inverting this order was the bug in the first
+        // attempt at the fix (PR-reverted) and would silently override
+        // direct authoring with material defaults.
+        styles.insert(1, [0.8, 0.2, 0.1, 1.0]); // material → red
+        styles.insert(5, [0.1, 0.8, 0.2, 1.0]); // direct  → green
+        assert_eq!(
+            resolve_element_color(&wall, &styles, &mut decoder),
+            Some([0.1, 0.8, 0.2, 1.0]),
+            "direct geometry-item colour must win over material fallback",
+        );
     }
 
-    let rotation = dy.atan2(dx);
-    Some(rotation)
+    #[test]
+    fn unrelated_colors_yield_none() {
+        let (mut decoder, wall) = decode_wall();
+        let mut styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+        // Unrelated express ID — neither the wall nor any item in its rep.
+        styles.insert(999, [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(resolve_element_color(&wall, &styles, &mut decoder), None);
+    }
 }

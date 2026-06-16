@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::GeometryRouter;
+use crate::diagnostics::{BoolFailure, BoolFailureReason, BoolOp};
 use ifc_lite_core::EntityDecoder;
 
 #[test]
@@ -10,6 +11,92 @@ fn test_router_creation() {
     let router = GeometryRouter::new();
     // Router registers default processors on creation
     assert!(!router.processors.is_empty());
+}
+
+#[test]
+fn router_records_and_drains_csg_failures_with_product_id() {
+    let router = GeometryRouter::new();
+    assert_eq!(router.csg_failure_total(), 0);
+    assert_eq!(router.csg_failure_product_count(), 0);
+
+    let f1 = BoolFailure::new(
+        BoolOp::Difference,
+        BoolFailureReason::OperandTooLarge {
+            polys_a: 36,
+            polys_b: 12,
+        },
+    );
+    let f2 = BoolFailure::new(BoolOp::Difference, BoolFailureReason::NoBoundsOverlap);
+    router.record_csg_failures(/* product_id */ 1234, vec![f1, f2]);
+
+    let f3 = BoolFailure::new(
+        BoolOp::Union,
+        BoolFailureReason::KernelError("boom".into()),
+    );
+    router.record_csg_failures(5678, vec![f3]);
+
+    assert_eq!(router.csg_failure_total(), 3);
+    assert_eq!(router.csg_failure_product_count(), 2);
+
+    let drained = router.take_csg_failures();
+    assert_eq!(drained.len(), 2);
+    let p1 = drained.get(&1234).expect("product 1234 has failures");
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p1[0].product_id, Some(1234), "product_id attached on drain");
+    assert_eq!(p1[0].op, BoolOp::Difference);
+    assert!(matches!(
+        p1[0].reason,
+        BoolFailureReason::OperandTooLarge { .. }
+    ));
+    assert_eq!(p1[1].product_id, Some(1234));
+
+    let p2 = drained.get(&5678).expect("product 5678 has failures");
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].product_id, Some(5678));
+    assert_eq!(p2[0].op, BoolOp::Union);
+
+    // Drain must clear the log.
+    assert_eq!(router.csg_failure_total(), 0);
+    assert!(router.take_csg_failures().is_empty());
+}
+
+#[test]
+fn router_record_csg_failures_with_empty_vec_is_noop() {
+    let router = GeometryRouter::new();
+    router.record_csg_failures(42, Vec::new());
+    assert_eq!(router.csg_failure_total(), 0);
+    assert_eq!(router.csg_failure_product_count(), 0);
+}
+
+#[test]
+fn router_csg_failures_append_under_same_product() {
+    let router = GeometryRouter::new();
+    router.record_csg_failures(
+        7,
+        vec![BoolFailure::new(
+            BoolOp::Difference,
+            BoolFailureReason::EmptyOperand,
+        )],
+    );
+    router.record_csg_failures(
+        7,
+        vec![BoolFailure::new(
+            BoolOp::Difference,
+            BoolFailureReason::DegenerateOperand,
+        )],
+    );
+
+    assert_eq!(router.csg_failure_product_count(), 1);
+    assert_eq!(router.csg_failure_total(), 2);
+
+    let drained = router.take_csg_failures();
+    let entries = drained.get(&7).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(entries[0].reason, BoolFailureReason::EmptyOperand));
+    assert!(matches!(
+        entries[1].reason,
+        BoolFailureReason::DegenerateOperand
+    ));
 }
 
 #[test]
@@ -299,8 +386,18 @@ mod wall_profile_research {
         let final_vertex_count = result.vertex_count();
         let final_triangle_count = result.triangle_count();
 
-        // Verify opening was cut
-        assert!(final_vertex_count > initial_vertex_count);
+        // Verify the cut actually changed the geometry. Both kernels add
+        // new geometry at the cut boundary, but Manifold deduplicates
+        // shared vertices so its final vertex count can be ≤ the legacy
+        // BSP path's raw count. The triangle count is the safer signal
+        // because each cut box introduces extra side / cap triangles
+        // either way.
+        assert!(
+            final_triangle_count > initial_triangle_count,
+            "subtract_box must add boundary triangles ({} → {})",
+            initial_triangle_count,
+            final_triangle_count,
+        );
 
         // Verify chamfers are preserved (mesh should still span full length)
         let (_min, max) = result.bounds();
@@ -543,7 +640,7 @@ mod wall_profile_research {
 /// (e.g. GDA2020 MGA56: X ~280 000, Y ~6 214 000) directly in Brep geometry
 /// vertices while keeping IfcLocalPlacement at origin (0, 0, 0).
 ///
-/// Regression test for <https://github.com/louistrue/ifc-lite/issues/335>.
+/// Regression test for <https://github.com/LTplus-AG/ifc-lite/issues/335>.
 mod infra_rtc_detection {
     use super::*;
 
@@ -629,6 +726,43 @@ END-ISO-10303-21;
         .to_string()
     }
 
+    /// Ordinary model pattern: vertices are local and the large coordinate comes
+    /// from IfcLocalPlacement. The placement is rotated to catch regressions
+    /// where RTC is subtracted from local Brep coordinates before placement.
+    fn rotated_placement_model_ifc() -> String {
+        r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition[CoordinationView]'),'2;1');
+FILE_NAME('rotated.ifc','2026-04-13T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('3A_FOM1U13fh337NmQeVRd',$,'TestProject','',$,$,$,(#12),#7);
+#7=IFCUNITASSIGNMENT((#8));
+#8=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#12=IFCGEOMETRICREPRESENTATIONCONTEXT('3D','Model',3,1.E-6,#14,$);
+#13=IFCLOCALPLACEMENT($,#14);
+#14=IFCAXIS2PLACEMENT3D(#15,#16,#17);
+#15=IFCCARTESIANPOINT((280000.,6214000.,0.));
+#16=IFCDIRECTION((0.,0.,1.));
+#17=IFCDIRECTION((0.,1.,0.));
+#42=IFCBUILDINGELEMENTPROXY('2JJeX0xY93XxwyMxv0upiL',$,'LocalBrep','LocalBrep','LocalBrep',#13,#43,$,.USERDEFINED.);
+#43=IFCPRODUCTDEFINITIONSHAPE($,$,(#44));
+#44=IFCSHAPEREPRESENTATION(#12,'Body','Brep',(#100));
+#100=IFCFACETEDBREP(#101);
+#101=IFCCLOSEDSHELL((#102));
+#102=IFCFACE((#103));
+#103=IFCFACEOUTERBOUND(#104,.T.);
+#104=IFCPOLYLOOP((#110,#111,#112));
+#110=IFCCARTESIANPOINT((0.,0.,0.));
+#111=IFCCARTESIANPOINT((1.,0.,0.));
+#112=IFCCARTESIANPOINT((0.,1.,0.));
+ENDSEC;
+END-ISO-10303-21;
+"#
+        .to_string()
+    }
+
     /// RTC detection must work when placement is at origin but geometry vertices
     /// contain large world coordinates (the infrastructure model pattern).
     #[test]
@@ -682,6 +816,30 @@ END-ISO-10303-21;
             assert!(
                 chunk[0].abs() < 10000.0 && chunk[1].abs() < 10000.0 && chunk[2].abs() < 10000.0,
                 "Vertex ({}, {}, {}) still has large coordinates after RTC",
+                chunk[0],
+                chunk[1],
+                chunk[2]
+            );
+        }
+    }
+
+    #[test]
+    fn rtc_is_applied_after_rotated_object_placement_for_local_vertices() {
+        let content = rotated_placement_model_ifc();
+        let entity_index = ifc_lite_core::build_entity_index(&content);
+        let mut decoder = EntityDecoder::with_index(&content, entity_index);
+        let mut router = GeometryRouter::with_units(&content, &mut decoder);
+
+        let offset = router.detect_rtc_offset_from_first_element(&content, &mut decoder);
+        router.set_rtc_offset(offset);
+
+        let entity = decoder.decode_by_id(42).unwrap();
+        let mesh = router.process_element(&entity, &mut decoder).unwrap();
+
+        for chunk in mesh.positions.chunks_exact(3) {
+            assert!(
+                chunk[0].abs() < 10.0 && chunk[1].abs() < 10.0 && chunk[2].abs() < 10.0,
+                "Local Brep vertex ({}, {}, {}) was shifted before final placement",
                 chunk[0],
                 chunk[1],
                 chunk[2]

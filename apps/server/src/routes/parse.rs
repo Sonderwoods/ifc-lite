@@ -5,6 +5,7 @@
 //! Parse endpoints for IFC file processing.
 
 use crate::error::ApiError;
+use crate::services::streaming::detect_schema_version;
 use crate::services::{
     cache::DiskCache, extract_data_model, process_geometry_filtered, process_streaming,
     serialize_data_model_to_parquet, serialize_to_parquet,
@@ -26,6 +27,10 @@ use axum::{
 use flate2::read::GzDecoder;
 use futures::stream::StreamExt;
 use ifc_lite_core::EntityScanner;
+use ifc_lite_processing::{
+    extract_symbolic_data, process_geometry_filtered_with_quality, SymbolicData,
+    TessellationQuality,
+};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::io::Read;
@@ -36,21 +41,145 @@ pub struct ParseQuery {
     /// Opening filter mode: "default", "ignore_all", or "ignore_opaque".
     #[serde(default)]
     pub opening_filter: OpeningFilterMode,
+    /// Tessellation detail level (#976): "lowest" | "low" | "medium" | "high"
+    /// | "highest". Omitted = "medium" (byte-identical to the historical
+    /// output — and to what the wasm path produces without
+    /// `setTessellationQuality`, keeping client and server meshes in parity).
+    #[serde(default)]
+    pub tessellation_quality: Option<String>,
 }
 
-fn reject_unsupported_streaming_opening_filter(query: &ParseQuery) -> Result<(), ApiError> {
-    if query.opening_filter == OpeningFilterMode::Default {
-        return Ok(());
+impl ParseQuery {
+    /// Resolve and validate the requested tessellation level.
+    fn resolved_tessellation_quality(&self) -> Result<TessellationQuality, ApiError> {
+        match self.tessellation_quality.as_deref() {
+            None => Ok(TessellationQuality::default()),
+            Some(s) => TessellationQuality::parse_label(s).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Unknown tessellation_quality '{s}' — expected lowest | low | medium | high | highest"
+                ))
+            }),
+        }
     }
+}
 
-    Err(ApiError::BadRequest(
-        "opening_filter is not yet supported for streaming endpoints; use /api/v1/parse or /api/v1/parse/parquet instead".into(),
-    ))
+/// Cache-key segment for a tessellation level. Empty for the default level so
+/// every pre-existing cache entry (all written at implicit `medium`) stays
+/// valid; non-default levels get distinct entries.
+fn quality_cache_suffix(quality: TessellationQuality) -> String {
+    if quality == TessellationQuality::default() {
+        String::new()
+    } else {
+        format!("-q{}", quality.label())
+    }
+}
+
+/// Request-level cache key: file hash + opening-filter suffix + quality suffix.
+fn request_cache_key(data: &[u8], query: &ParseQuery, quality: TessellationQuality) -> String {
+    format!(
+        "{}-{}{}",
+        DiskCache::generate_key(data),
+        query.opening_filter.cache_key_suffix(),
+        quality_cache_suffix(quality)
+    )
+}
+
+/// Build the parquet geometry cache key for a given file hash and opening filter.
+///
+/// Must stay in sync with the writer in `parse_parquet` / `parse_parquet_stream`,
+/// which derives the same suffix from `OpeningFilterMode::cache_key_suffix()`.
+///
+/// Version bumped `v2` → `v3` with issue #900 (symbolic sidecar), and `v3` → `v4`
+/// with the alignment audit: the server default path switched to per-item
+/// sub-meshes, streamed geometry now comes from the canonical pipeline
+/// (material chain + indexed colours + aggregate void propagation), and
+/// native builds compute normals — entries cached by the old pipelines
+/// would serve visibly different meshes.
+fn parquet_cache_key(
+    hash: &str,
+    opening_filter: OpeningFilterMode,
+    quality: TessellationQuality,
+) -> String {
+    format!(
+        "{}-{}{}-parquet-v4",
+        hash,
+        opening_filter.cache_key_suffix(),
+        quality_cache_suffix(quality)
+    )
+}
+
+/// Build the parquet metadata cache key for a given file hash and opening filter.
+fn parquet_metadata_cache_key(
+    hash: &str,
+    opening_filter: OpeningFilterMode,
+    quality: TessellationQuality,
+) -> String {
+    format!(
+        "{}-{}{}-parquet-metadata-v4",
+        hash,
+        opening_filter.cache_key_suffix(),
+        quality_cache_suffix(quality)
+    )
+}
+
+/// Build the symbolic-data cache key for a given file cache key.
+///
+/// The 2D symbol stream (`IfcAnnotation` + `IfcGrid`) is cached separately
+/// from geometry so binary-transport endpoints (Parquet, optimized Parquet,
+/// cached geometry) can expose it via `GET /api/v1/parse/symbolic/{cache_key}`,
+/// mirroring how the data model is cached and fetched (issue #900). `cache_key`
+/// is the full `{hash}-{opening_filter}` key, matching the value embedded in
+/// each response's metadata header.
+fn symbolic_cache_key(cache_key: &str) -> String {
+    format!("{}-symbolic-v1", cache_key)
+}
+
+/// Serialize symbolic data and write it to the cache under `{cache_key}-symbolic-v1`.
+///
+/// Always stores the JSON (even when empty) so the fetch endpoint can return a
+/// definitive `200` with empty arrays rather than looping on `202`.
+async fn cache_symbolic_data(cache: &DiskCache, cache_key: &str, symbolic: &SymbolicData) {
+    match serde_json::to_vec(symbolic) {
+        Ok(bytes) => {
+            let key = symbolic_cache_key(cache_key);
+            if let Err(e) = cache.set_bytes(&key, &bytes).await {
+                tracing::error!(error = %e, cache_key = %cache_key, "Failed to cache symbolic data");
+            } else {
+                tracing::debug!(cache_key = %key, size = bytes.len(), "Symbolic data cached");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to serialize symbolic data for caching");
+        }
+    }
+}
+
+/// Load cached symbolic data for `cache_key`, defaulting to empty when the
+/// entry is absent or unreadable.
+async fn load_cached_symbolic(cache: &DiskCache, cache_key: &str) -> SymbolicData {
+    let key = symbolic_cache_key(cache_key);
+    match cache.get_bytes(&key).await {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::error!(error = %e, cache_key = %cache_key, "Failed to parse cached symbolic data");
+            SymbolicData::default()
+        }),
+        Ok(None) => SymbolicData::default(),
+        Err(e) => {
+            tracing::error!(error = %e, cache_key = %cache_key, "Failed to read cached symbolic data");
+            SymbolicData::default()
+        }
+    }
 }
 
 /// Extract file data from multipart request.
-/// Automatically decompresses gzip-compressed files.
-async fn extract_file(multipart: &mut Multipart) -> Result<Vec<u8>, ApiError> {
+/// Automatically decompresses gzip-compressed files, refusing inputs whose
+/// decompressed size would exceed `max_file_size_mb`.
+async fn extract_file(
+    multipart: &mut Multipart,
+    max_file_size_mb: usize,
+) -> Result<Vec<u8>, ApiError> {
+    let max_bytes = max_file_size_mb.saturating_mul(1024 * 1024);
+
     while let Some(field) = multipart.next_field().await? {
         let field_name = field.name().unwrap_or_default();
         tracing::debug!(field_name = %field_name, "Processing multipart field");
@@ -65,11 +194,19 @@ async fn extract_file(multipart: &mut Multipart) -> Result<Vec<u8>, ApiError> {
 
             if is_gzipped {
                 tracing::debug!("Detected gzip compression, decompressing...");
-                let mut decoder = GzDecoder::new(bytes.as_ref());
+                // Bound the decompressed stream: read at most max_bytes + 1.
+                // If the cap is hit, treat as oversized rather than allocating
+                // unbounded output for a small compressed input.
+                let mut decoder = GzDecoder::new(bytes.as_ref()).take(max_bytes as u64 + 1);
                 let mut decompressed = Vec::new();
                 decoder
                     .read_to_end(&mut decompressed)
                     .map_err(|e| ApiError::Internal(format!("Failed to decompress gzip: {}", e)))?;
+                if decompressed.len() > max_bytes {
+                    return Err(ApiError::FileTooLarge {
+                        max_mb: max_file_size_mb,
+                    });
+                }
                 tracing::info!(
                     original_size = original_size,
                     decompressed_size = decompressed.len(),
@@ -79,6 +216,11 @@ async fn extract_file(multipart: &mut Multipart) -> Result<Vec<u8>, ApiError> {
                 );
                 return Ok(decompressed);
             } else {
+                if bytes.len() > max_bytes {
+                    return Err(ApiError::FileTooLarge {
+                        max_mb: max_file_size_mb,
+                    });
+                }
                 return Ok(bytes.to_vec());
             }
         }
@@ -95,21 +237,11 @@ pub async fn parse_full(
     mut multipart: Multipart,
 ) -> Result<Json<ParseResponse>, ApiError> {
     // Extract file from multipart
-    let data = extract_file(&mut multipart).await?;
-
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key (include opening filter so different modes get different cache entries)
-    let cache_key = format!(
-        "{}-{}",
-        DiskCache::generate_key(&data),
-        query.opening_filter.cache_key_suffix()
-    );
+    let tessellation_quality = query.resolved_tessellation_quality()?;
+    let cache_key = request_cache_key(&data, &query, tessellation_quality);
 
     // Check cache first
     if let Some(mut cached) = state.cache.get::<ParseResponse>(&cache_key).await? {
@@ -121,13 +253,20 @@ pub async fn parse_full(
     tracing::info!(cache_key = %cache_key, size = data.len(), "Cache MISS - processing");
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
     let opening_filter = query.opening_filter;
 
-    // Process on blocking thread pool (CPU-intensive)
-    let result =
-        tokio::task::spawn_blocking(move || process_geometry_filtered(&content, opening_filter))
-            .await?;
+    // Process on blocking thread pool (CPU-intensive). Bundle the 3D
+    // geometry with the 2D symbolic-data extraction (issue #843) so
+    // callers can render IfcGrid axes and IfcAnnotation polylines from
+    // the same response without re-uploading the file.
+    let (result, symbolic_data) = tokio::task::spawn_blocking(move || {
+        let result =
+            process_geometry_filtered_with_quality(&content, opening_filter, tessellation_quality);
+        let symbolic = ifc_lite_processing::extract_symbolic_data(&content);
+        (result, symbolic)
+    })
+    .await?;
 
     let response = ParseResponse {
         cache_key: cache_key.clone(),
@@ -137,12 +276,17 @@ pub async fn parse_full(
         building_transform: result.building_transform,
         metadata: result.metadata,
         stats: result.stats,
+        symbolic_data,
     };
 
-    // Cache result (background)
+    // Cache result (background). Also mirror the symbolic stream into the
+    // dedicated `{cache_key}-symbolic-v1` entry so it's reachable through
+    // `GET /api/v1/parse/symbolic/{cache_key}` regardless of which endpoint
+    // first processed the file (issue #900).
     let cache = state.cache.clone();
     let response_clone = response.clone();
     tokio::spawn(async move {
+        cache_symbolic_data(&cache, &cache_key, &response_clone.symbolic_data).await;
         if let Err(e) = cache.set(&cache_key, &response_clone).await {
             tracing::error!(error = %e, "Failed to cache result");
         }
@@ -156,36 +300,38 @@ pub async fn parse_stream(
     State(state): State<AppState>,
     Query(query): Query<ParseQuery>,
     mut multipart: Multipart,
-) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    reject_unsupported_streaming_opening_filter(&query)?;
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let tessellation_quality = query.resolved_tessellation_quality()?;
 
     // Extract file
-    let data = extract_file(&mut multipart).await?;
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
-
-    let content = String::from_utf8(data)?;
+    let content = data;
     let initial_batch_size = state.config.initial_batch_size;
     let max_batch_size = state.config.max_batch_size;
 
     // Create streaming response with dynamic batch sizing
-    let stream =
-        process_streaming(content, initial_batch_size, max_batch_size).map(|event: StreamEvent| {
+    let stream = process_streaming(
+        content,
+        initial_batch_size,
+        max_batch_size,
+        query.opening_filter,
+        tessellation_quality,
+    )
+    .map(|event: StreamEvent| {
             let json = serde_json::to_string(&event).unwrap_or_else(|e| {
                 serde_json::to_string(&StreamEvent::Error {
                     message: e.to_string(),
                 })
                 .unwrap()
             });
-            Ok(Event::default().data(json))
+            Ok::<_, Infallible>(Event::default().data(json))
         });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 /// SSE event types for Parquet streaming.
@@ -212,6 +358,10 @@ pub enum ParquetStreamEvent {
     Complete {
         stats: ProcessingStats,
         metadata: ModelMetadata,
+        /// 2D symbol data extracted from `IfcAnnotation` and `IfcGrid`
+        /// entities — parity with `POST /api/v1/parse` (issue #900).
+        #[serde(default, skip_serializing_if = "SymbolicData::is_empty")]
+        symbolic_data: SymbolicData,
     },
     /// Error occurred.
     Error { message: String },
@@ -234,40 +384,26 @@ pub async fn parse_parquet_stream(
     State(state): State<AppState>,
     Query(query): Query<ParseQuery>,
     mut multipart: Multipart,
-) -> Result<
-    Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>>>,
-    ApiError,
-> {
+) -> Result<axum::response::Response, ApiError> {
     use crate::services::serialize_to_parquet;
     use crate::types::MeshData;
+    use axum::response::IntoResponse;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
 
-    reject_unsupported_streaming_opening_filter(&query)?;
-
     // Extract file
-    let data = extract_file(&mut multipart).await?;
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
-
-    // Generate cache key before processing (include opening filter)
-    let cache_key = format!(
-        "{}-{}",
-        DiskCache::generate_key(&data),
-        query.opening_filter.cache_key_suffix()
-    );
+    // Generate cache key before processing (include opening filter + quality)
+    let tessellation_quality = query.resolved_tessellation_quality()?;
+    let cache_key = request_cache_key(&data, &query, tessellation_quality);
     let cache_key_clone = cache_key.clone();
 
     // OPTIMIZATION: Check cache first and fast-path return if available
     // This avoids re-processing files that are already cached
-    let parquet_cache_key = format!("{}-parquet-v2", cache_key);
-    let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key);
+    let parquet_cache_key = format!("{}-parquet-v4", cache_key);
+    let metadata_cache_key = format!("{}-parquet-metadata-v4", cache_key);
 
     if let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
@@ -282,6 +418,10 @@ pub async fn parse_parquet_stream(
         // Parse cached metadata
         let metadata_header: ParquetMetadataHeader = serde_json::from_slice(&cached_metadata_json)
             .map_err(|e| ApiError::Internal(format!("Failed to parse cached metadata: {}", e)))?;
+
+        // Load the cached symbolic stream so the Complete event reaches parity
+        // even on the cache fast-path (issue #900).
+        let symbolic_data = load_cached_symbolic(&state.cache, &cache_key).await;
 
         // Extract geometry length from combined parquet (first 4 bytes)
         let geometry_len = u32::from_le_bytes(cached_parquet[0..4].try_into().unwrap()) as usize;
@@ -316,12 +456,15 @@ pub async fn parse_parquet_stream(
                 serde_json::to_string(&ParquetStreamEvent::Complete {
                     stats: metadata_header.stats,
                     metadata: metadata_header.metadata,
+                    symbolic_data,
                 })
                 .unwrap(),
             )),
         ]));
 
-        return Ok(Sse::new(fast_stream).keep_alive(KeepAlive::default()));
+        return Ok(Sse::new(fast_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response());
     }
 
     tracing::info!(
@@ -330,7 +473,7 @@ pub async fn parse_parquet_stream(
         "Streaming cache MISS - processing file"
     );
 
-    let content = String::from_utf8(data)?;
+    let content = data;
     let initial_batch_size = state.config.initial_batch_size;
     let max_batch_size = state.config.max_batch_size;
     let cache = state.cache.clone();
@@ -343,7 +486,14 @@ pub async fn parse_parquet_stream(
     let cache_key_for_geometry = cache_key.clone();
 
     // Create streaming response that yields Parquet batches
-    let stream = process_streaming(content.clone(), initial_batch_size, max_batch_size).map(move |event: StreamEvent| {
+    let stream = process_streaming(
+        content.clone(),
+        initial_batch_size,
+        max_batch_size,
+        query.opening_filter,
+        tessellation_quality,
+    )
+    .map(move |event: StreamEvent| {
         let sse_event = match event {
             StreamEvent::Start { total_estimate } => {
                 ParquetStreamEvent::Start {
@@ -377,7 +527,20 @@ pub async fn parse_parquet_stream(
                     }
                 }
             }
-            StreamEvent::Complete { stats, metadata, mesh_coordinate_space, site_transform, building_transform, .. } => {
+            StreamEvent::Complete { stats, metadata, mesh_coordinate_space, site_transform, building_transform, symbolic_data, .. } => {
+                // Cache the symbolic stream so the cached-geometry fast-path and
+                // `GET /api/v1/parse/symbolic/{cache_key}` reach parity (issue #900).
+                // Reuses the value already computed inside `process_streaming` —
+                // no re-extraction.
+                {
+                    let cache = cache_for_geometry.clone();
+                    let key = cache_key_for_geometry.clone();
+                    let symbolic_for_cache = symbolic_data.clone();
+                    tokio::spawn(async move {
+                        cache_symbolic_data(&cache, &key, &symbolic_for_cache).await;
+                    });
+                }
+
                 // OPTIMIZATION: Use accumulated meshes instead of re-processing
                 // This eliminates duplicate geometry extraction (~1100ms savings for large files)
                 let cache = cache_for_geometry.clone();
@@ -425,7 +588,7 @@ pub async fn parse_parquet_stream(
                         combined_parquet.extend_from_slice(&0u32.to_le_bytes()); // data_model_len = 0
 
                         // Cache geometry (same format as non-streaming)
-                        let parquet_cache_key = format!("{}-parquet-v2", key);
+                        let parquet_cache_key = format!("{}-parquet-v4", key);
                         if let Err(e) = cache.set_bytes(&parquet_cache_key, &combined_parquet).await {
                             tracing::error!(error = %e, "Failed to cache geometry from stream");
                         } else {
@@ -447,7 +610,7 @@ pub async fn parse_parquet_stream(
                             data_model_stats: None, // Data model cached separately via data model endpoint
                         };
                         if let Ok(metadata_json) = serde_json::to_vec(&metadata_header) {
-                            let metadata_cache_key = format!("{}-parquet-metadata-v2", key);
+                            let metadata_cache_key = format!("{}-parquet-metadata-v4", key);
                             if let Err(e) = cache.set_bytes(&metadata_cache_key, &metadata_json).await {
                                 tracing::error!(error = %e, "Failed to cache metadata from stream");
                             } else {
@@ -459,7 +622,7 @@ pub async fn parse_parquet_stream(
                     }
                 });
 
-                ParquetStreamEvent::Complete { stats, metadata }
+                ParquetStreamEvent::Complete { stats, metadata, symbolic_data }
             }
             StreamEvent::Error { message } => {
                 ParquetStreamEvent::Error { message }
@@ -504,7 +667,9 @@ pub async fn parse_parquet_stream(
     let boxed_stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<Event, Infallible>> + Send>,
     > = Box::pin(stream);
-    Ok(Sse::new(boxed_stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(boxed_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 /// POST /api/v1/parse/metadata - Quick metadata only (no geometry).
@@ -513,17 +678,10 @@ pub async fn parse_metadata(
     mut multipart: Multipart,
 ) -> Result<Json<MetadataResponse>, ApiError> {
     // Extract file
-    let data = extract_file(&mut multipart).await?;
-
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     let file_size = data.len();
-    let content = String::from_utf8(data)?;
+    let content = data;
 
     // Fast path - just scan entities, no geometry processing
     let result = tokio::task::spawn_blocking(move || {
@@ -538,14 +696,7 @@ pub async fn parse_metadata(
             }
         }
 
-        // Detect schema version
-        let schema_version = if content.contains("IFC4X3") {
-            "IFC4X3"
-        } else if content.contains("IFC4") {
-            "IFC4"
-        } else {
-            "IFC2X3"
-        };
+        let schema_version = detect_schema_version(&content);
 
         MetadataResponse {
             entity_count,
@@ -598,25 +749,15 @@ pub async fn parse_parquet(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     // Extract file from multipart
-    let data = extract_file(&mut multipart).await?;
-
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key (include opening filter so different modes get different cache entries)
-    let cache_key = format!(
-        "{}-{}",
-        DiskCache::generate_key(&data),
-        query.opening_filter.cache_key_suffix()
-    );
+    let tessellation_quality = query.resolved_tessellation_quality()?;
+    let cache_key = request_cache_key(&data, &query, tessellation_quality);
 
     // Check cache first (before any processing)
-    let parquet_cache_key = format!("{}-parquet-v2", cache_key);
-    let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key);
+    let parquet_cache_key = format!("{}-parquet-v4", cache_key);
+    let metadata_cache_key = format!("{}-parquet-metadata-v4", cache_key);
 
     if let (Some(cached_parquet), Some(cached_metadata_json)) = (
         state.cache.get_bytes(&parquet_cache_key).await?,
@@ -632,7 +773,11 @@ pub async fn parse_parquet(
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-parquet-geometry")
-            .header("X-IFC-Metadata", String::from_utf8(cached_metadata_json)?)
+            .header(
+                "X-IFC-Metadata",
+                String::from_utf8(cached_metadata_json)
+                    .map_err(|error| ApiError::Internal(error.to_string()))?,
+            )
             .header(header::CONTENT_LENGTH, cached_parquet.len())
             .body(Body::from(cached_parquet))
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -647,19 +792,29 @@ pub async fn parse_parquet(
     );
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
 
     // Process geometry and data model extraction + serialization ALL in parallel
     // rayon::join works correctly here because rayon has its own thread pool
     // that's independent of tokio's blocking thread pool
     let serialize_start = tokio::time::Instant::now();
     let opening_filter = query.opening_filter;
-    let ((geometry_result, geometry_parquet), (data_model_stats, data_model_parquet)) =
-        tokio::task::spawn_blocking(move || {
-            // First: extract geometry and data model in parallel
-            let (geometry_result, data_model) = rayon::join(
-                || process_geometry_filtered(&content, opening_filter),
-                || extract_data_model(&content),
+    let (
+        (geometry_result, geometry_parquet),
+        (data_model_stats, data_model_parquet),
+        symbolic_data,
+    ) = tokio::task::spawn_blocking(move || {
+            // First: extract geometry, data model, and the 2D symbol stream
+            // (IfcAnnotation + IfcGrid) all in parallel. Symbolic extraction is
+            // added here for endpoint parity (issue #900).
+            let ((geometry_result, data_model), symbolic_data) = rayon::join(
+                || {
+                    rayon::join(
+                        || process_geometry_filtered_with_quality(&content, opening_filter, tessellation_quality),
+                        || extract_data_model(&content),
+                    )
+                },
+                || extract_symbolic_data(&content),
             );
 
             // Capture stats before moving data_model
@@ -677,7 +832,11 @@ pub async fn parse_parquet(
                 || serialize_data_model_to_parquet(&data_model),
             );
 
-            ((geometry_result, geo_parquet), (dm_stats, dm_parquet))
+            (
+                (geometry_result, geo_parquet),
+                (dm_stats, dm_parquet),
+                symbolic_data,
+            )
         })
         .await?;
 
@@ -710,6 +869,10 @@ pub async fn parse_parquet(
         );
     }
 
+    // Cache the symbolic stream immediately so it's ready when the client
+    // fetches `GET /api/v1/parse/symbolic/{cache_key}` (issue #900).
+    cache_symbolic_data(&state.cache, &cache_key, &symbolic_data).await;
+
     // Build geometry-only response (data model available via separate endpoint)
     let mut combined_parquet = Vec::new();
     combined_parquet.extend_from_slice(&(geometry_parquet.len() as u32).to_le_bytes());
@@ -732,8 +895,8 @@ pub async fn parse_parquet(
     let metadata_json = serde_json::to_string(&metadata_header)?;
 
     // Cache the results for future requests
-    let parquet_cache_key = format!("{}-parquet-v2", cache_key_clone);
-    let metadata_cache_key = format!("{}-parquet-metadata-v2", cache_key_clone);
+    let parquet_cache_key = format!("{}-parquet-v4", cache_key_clone);
+    let metadata_cache_key = format!("{}-parquet-metadata-v4", cache_key_clone);
     let combined_parquet_clone = combined_parquet.clone();
     let metadata_json_clone = metadata_json.clone();
     let cache = state.cache.clone();
@@ -806,21 +969,11 @@ pub async fn parse_parquet_optimized(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     // Extract file from multipart
-    let data = extract_file(&mut multipart).await?;
-
-    // Check file size
-    if data.len() > state.config.max_file_size_mb * 1024 * 1024 {
-        return Err(ApiError::FileTooLarge {
-            max_mb: state.config.max_file_size_mb,
-        });
-    }
+    let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     // Generate cache key (include opening filter so different modes get different cache entries)
-    let cache_key = format!(
-        "{}-{}",
-        DiskCache::generate_key(&data),
-        query.opening_filter.cache_key_suffix()
-    );
+    let tessellation_quality = query.resolved_tessellation_quality()?;
+    let cache_key = request_cache_key(&data, &query, tessellation_quality);
 
     tracing::info!(
         cache_key = %cache_key,
@@ -829,13 +982,23 @@ pub async fn parse_parquet_optimized(
     );
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
     let opening_filter = query.opening_filter;
 
-    // Process on blocking thread pool (CPU-intensive)
-    let result =
-        tokio::task::spawn_blocking(move || process_geometry_filtered(&content, opening_filter))
-            .await?;
+    // Process on blocking thread pool (CPU-intensive). Extract the 2D symbol
+    // stream (IfcAnnotation + IfcGrid) alongside geometry for endpoint parity
+    // (issue #900) — it's cached and served via the symbolic fetch endpoint.
+    let (result, symbolic_data) = tokio::task::spawn_blocking(move || {
+        rayon::join(
+            || process_geometry_filtered_with_quality(&content, opening_filter, tessellation_quality),
+            || extract_symbolic_data(&content),
+        )
+    })
+    .await?;
+
+    // Cache the symbolic stream so the client can fetch it via
+    // `GET /api/v1/parse/symbolic/{cache_key}`.
+    cache_symbolic_data(&state.cache, &cache_key, &symbolic_data).await;
 
     // Serialize to optimized Parquet (with deduplication, quantization, etc.)
     // Don't include normals by default - client can compute them
@@ -927,23 +1090,84 @@ pub async fn get_data_model(
     }
 }
 
+/// GET /api/v1/parse/symbolic/:cache_key
+///
+/// Fetch the 2D symbol stream (`IfcAnnotation` + `IfcGrid`) for a previously
+/// parsed file as JSON. This brings the binary-transport endpoints (Parquet,
+/// optimized Parquet, cached geometry) to parity with the inline `symbolic_data`
+/// field on `POST /api/v1/parse` (issue #900). Symbol data is cached separately
+/// from geometry — exactly like the data model — so it's fetched the same way,
+/// keyed by the `cache_key` carried in each response's metadata header.
+///
+/// `cache_key` is the full `{hash}-{opening_filter}` value (e.g. `<hash>-default`).
+///
+/// Response:
+/// - 200: `SymbolicData` JSON (may have empty arrays when the model has no 2D symbols)
+/// - 202: Not yet available — streaming caches symbolic data in the background; retry
+pub async fn get_symbolic(
+    State(state): State<AppState>,
+    axum::extract::Path(cache_key): axum::extract::Path<String>,
+) -> Result<Response, ApiError> {
+    let key = symbolic_cache_key(&cache_key);
+
+    match state.cache.get_bytes(&key).await? {
+        Some(symbolic_json) => {
+            tracing::info!(
+                cache_key = %cache_key,
+                size = symbolic_json.len(),
+                "Symbolic data cache HIT"
+            );
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, symbolic_json.len())
+                .body(Body::from(symbolic_json))
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+            Ok(response)
+        }
+        None => {
+            tracing::debug!(cache_key = %cache_key, "Symbolic data not yet available");
+
+            // Return 202 Accepted to indicate processing (mirrors get_data_model);
+            // the streaming endpoints cache symbolic data in a background task.
+            let response = Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"status":"processing","message":"Symbolic data is still being processed. Retry in a moment."}"#))
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+            Ok(response)
+        }
+    }
+}
+
 /// GET /api/v1/cache/check/:hash
 ///
 /// Check if a file hash is already cached.
 /// Allows client to skip upload if file is already processed.
+///
+/// The optional `opening_filter` query parameter must match the value used when
+/// the file was uploaded — different filter modes produce distinct cache entries.
 ///
 /// Response:
 /// - 200: File is cached (geometry available)
 /// - 404: File not cached (needs upload)
 pub async fn check_cache(
     State(state): State<AppState>,
+    Query(query): Query<ParseQuery>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
-    let parquet_cache_key = format!("{}-parquet-v2", hash);
+    let parquet_cache_key = parquet_cache_key(
+        &hash,
+        query.opening_filter,
+        query.resolved_tessellation_quality()?,
+    );
 
     match state.cache.get_bytes(&parquet_cache_key).await? {
         Some(_) => {
-            tracing::debug!(hash = %hash, "Cache check HIT");
+            tracing::debug!(hash = %hash, cache_key = %parquet_cache_key, "Cache check HIT");
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .body(Body::empty())
@@ -951,7 +1175,7 @@ pub async fn check_cache(
             Ok(response)
         }
         None => {
-            tracing::debug!(hash = %hash, "Cache check MISS");
+            tracing::debug!(hash = %hash, cache_key = %parquet_cache_key, "Cache check MISS");
             let response = Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty())
@@ -966,15 +1190,27 @@ pub async fn check_cache(
 /// Fetch cached Parquet geometry directly without uploading the file.
 /// Used when client-side hash check confirms file is already cached.
 ///
+/// The optional `opening_filter` query parameter must match the value used when
+/// the file was uploaded — different filter modes produce distinct cache entries.
+///
 /// Response:
 /// - 200: Cached Parquet geometry with metadata header
 /// - 404: Cache entry not found
 pub async fn get_cached_geometry(
     State(state): State<AppState>,
+    Query(query): Query<ParseQuery>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Response, ApiError> {
-    let parquet_cache_key = format!("{}-parquet-v2", hash);
-    let metadata_cache_key = format!("{}-parquet-metadata-v2", hash);
+    let parquet_cache_key = parquet_cache_key(
+        &hash,
+        query.opening_filter,
+        query.resolved_tessellation_quality()?,
+    );
+    let metadata_cache_key = parquet_metadata_cache_key(
+        &hash,
+        query.opening_filter,
+        query.resolved_tessellation_quality()?,
+    );
 
     match (
         state.cache.get_bytes(&parquet_cache_key).await?,
@@ -990,7 +1226,11 @@ pub async fn get_cached_geometry(
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/x-parquet-geometry")
-                .header("X-IFC-Metadata", String::from_utf8(metadata)?)
+                .header(
+                    "X-IFC-Metadata",
+                    String::from_utf8(metadata)
+                        .map_err(|error| ApiError::Internal(error.to_string()))?,
+                )
                 .header(header::CONTENT_LENGTH, parquet.len())
                 .body(Body::from(parquet))
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -1004,5 +1244,96 @@ pub async fn get_cached_geometry(
                 hash
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for #587: the reader (`check_cache`) used to look up
+    /// `{hash}-parquet-v4`, while the writer (`parse_parquet`) stored
+    /// `{hash}-{opening_filter}-parquet-v4`, so the check always returned 404.
+    /// The shared helper must produce the same key the writer stores under.
+    #[test]
+    fn parquet_cache_key_matches_writer_format() {
+        let hash = "0ab20f4e4014";
+
+        // The writer composes `cache_key = format!("{hash}-{suffix}")` and then
+        // `format!("{cache_key}-parquet-v4")`. The helper must produce the same string.
+        for mode in [
+            OpeningFilterMode::Default,
+            OpeningFilterMode::IgnoreAll,
+            OpeningFilterMode::IgnoreOpaque,
+        ] {
+            for quality in [
+                TessellationQuality::Medium,
+                TessellationQuality::Low,
+                TessellationQuality::Highest,
+            ] {
+                let writer_cache_key = format!(
+                    "{}-{}{}",
+                    hash,
+                    mode.cache_key_suffix(),
+                    quality_cache_suffix(quality)
+                );
+                let writer_parquet_key = format!("{}-parquet-v4", writer_cache_key);
+                let writer_metadata_key = format!("{}-parquet-metadata-v4", writer_cache_key);
+
+                assert_eq!(parquet_cache_key(hash, mode, quality), writer_parquet_key);
+                assert_eq!(
+                    parquet_metadata_cache_key(hash, mode, quality),
+                    writer_metadata_key
+                );
+            }
+        }
+    }
+
+    /// The default (medium) level maps to the LEGACY key shape — pre-existing
+    /// cache entries written before the quality knob stay valid.
+    #[test]
+    fn parquet_cache_key_default_filter_uses_default_suffix() {
+        let key = parquet_cache_key("abc", OpeningFilterMode::Default, TessellationQuality::Medium);
+        assert_eq!(key, "abc-default-parquet-v4");
+        let key = parquet_cache_key("abc", OpeningFilterMode::Default, TessellationQuality::High);
+        assert_eq!(key, "abc-default-qhigh-parquet-v4");
+    }
+
+    /// The symbolic cache key (issue #900) is derived from the full
+    /// `{hash}-{opening_filter}` cache key the writers store under, and the
+    /// `get_symbolic` reader composes the same string from the path param.
+    #[test]
+    fn symbolic_cache_key_matches_writer_format() {
+        let hash = "0ab20f4e4014";
+        for mode in [
+            OpeningFilterMode::Default,
+            OpeningFilterMode::IgnoreAll,
+            OpeningFilterMode::IgnoreOpaque,
+        ] {
+            let writer_cache_key = format!("{}-{}", hash, mode.cache_key_suffix());
+            assert_eq!(
+                symbolic_cache_key(&writer_cache_key),
+                format!("{}-symbolic-v1", writer_cache_key)
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_cache_key_default_filter() {
+        let key = symbolic_cache_key("abc-default");
+        assert_eq!(key, "abc-default-symbolic-v1");
+    }
+
+    #[test]
+    fn schema_detection_uses_file_schema_declaration_only() {
+        let content = b"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCDOCUMENTINFORMATION('IFC4X3',$,$,$,$,$,$,$,$,$,$,$,$,$,$,$,$);
+ENDSEC;";
+
+        assert_eq!(detect_schema_version(content), "IFC2X3");
     }
 }

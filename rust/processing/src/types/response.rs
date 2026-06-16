@@ -5,6 +5,8 @@
 //! Shared response types for the IFC processing API.
 
 use super::mesh::MeshData;
+use crate::georeferencing::Georeferencing;
+use crate::symbolic::SymbolicData;
 use serde::{Deserialize, Serialize};
 
 /// Full parse response with all meshes.
@@ -14,9 +16,11 @@ pub struct ParseResponse {
     pub cache_key: String,
     /// All meshes extracted from the IFC file.
     pub meshes: Vec<MeshData>,
-    /// Declares the coordinate space used by serialized mesh vertices.
-    /// `site_local` means clients should bake meshes directly and only apply
-    /// placement transforms on the block instance.
+    /// Declares the coordinate space used by serialized mesh vertices:
+    /// * `site_local` — vertices are relative to the IfcSite placement
+    ///   translation (small floats in a meaningful, relatable frame).
+    /// * `model_rtc`  — a model-level detected RTC anchor was subtracted.
+    /// * `raw_ifc`    — no RTC anchor was applied; vertices are in raw IFC space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
@@ -31,6 +35,11 @@ pub struct ParseResponse {
     pub metadata: ModelMetadata,
     /// Processing statistics.
     pub stats: ProcessingStats,
+    /// 2D symbol data extracted from `IfcAnnotation` and `IfcGrid`
+    /// entities. Always emitted (potentially empty); see issue #843 for
+    /// the parity rationale with the browser-side parser.
+    #[serde(default, skip_serializing_if = "SymbolicData::is_empty")]
+    pub symbolic_data: SymbolicData,
 }
 
 /// Model metadata extracted from the IFC file.
@@ -44,6 +53,17 @@ pub struct ModelMetadata {
     pub geometry_entity_count: usize,
     /// Coordinate system information.
     pub coordinate_info: CoordinateInfo,
+    /// Length unit scale to convert model length values to metres (e.g. `0.001`
+    /// for millimetres). `None` when not yet computed; consumers treat it as
+    /// `1.0`. Brings the server to parity with the browser parser's
+    /// `extractLengthUnitScale` (issue #900).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length_unit_scale: Option<f64>,
+    /// Georeferencing (`IfcMapConversion` + `IfcProjectedCRS`). `None` when the
+    /// model carries no map-conversion data. Mirrors the browser parser's
+    /// `extractGeoreferencing` (issue #900).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub georeferencing: Option<Georeferencing>,
 }
 
 /// Coordinate system information.
@@ -109,4 +129,11 @@ pub struct ProcessingStats {
     pub total_time_ms: u64,
     /// Whether result was from cache.
     pub from_cache: bool,
+    /// Total CSG boolean failures recorded during geometry extraction
+    /// (mirrors the browser console diagnostics — see `BoolFailureReason`).
+    #[serde(default)]
+    pub total_csg_failures: u64,
+    /// Number of distinct products with at least one CSG failure.
+    #[serde(default)]
+    pub products_with_failures: u64,
 }

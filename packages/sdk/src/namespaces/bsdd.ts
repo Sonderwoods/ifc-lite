@@ -75,6 +75,11 @@ export interface BsddOptions {
   apiBase?: string;
   /** Cache TTL in milliseconds. Default: 600000 (10 minutes) */
   cacheTtlMs?: number;
+  /**
+   * Maximum number of class entries to retain in the cache. When exceeded,
+   * the least-recently-used entry is evicted. Default: 500.
+   */
+  maxCacheEntries?: number;
 }
 
 // ============================================================================
@@ -88,20 +93,77 @@ const IFC_DICTIONARY_URI =
 
 function getCached(cache: Map<string, { data: BsddClassInfo; ts: number }>, key: string, ttl: number): BsddClassInfo | null {
   const entry = cache.get(key);
-  if (entry && Date.now() - entry.ts < ttl) return entry.data;
+  if (entry && Date.now() - entry.ts < ttl) {
+    // Re-insert to mark as most-recently-used (Map preserves insertion order).
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry.data;
+  }
   if (entry) cache.delete(key);
   return null;
 }
 
-function setCache(cache: Map<string, { data: BsddClassInfo; ts: number }>, key: string, data: BsddClassInfo): void {
+function setCache(
+  cache: Map<string, { data: BsddClassInfo; ts: number }>,
+  key: string,
+  data: BsddClassInfo,
+  maxEntries: number,
+): void {
+  // Re-insert moves an existing key to the most-recently-used position.
+  cache.delete(key);
+  // Evict the oldest (least-recently-used) entries until under the cap.
+  while (cache.size >= maxEntries) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
   cache.set(key, { data, ts: Date.now() });
+}
+
+/**
+ * HTTP error thrown by the bSDD client. Carries the status code so callers
+ * can distinguish "missing class" (404) from "rate-limited" (429) from
+ * unexpected upstream failures.
+ */
+export class BsddHttpError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+  readonly url: string;
+  readonly retryAfterSeconds?: number;
+  constructor(status: number, statusText: string, url: string, retryAfterSeconds?: number) {
+    super(`bSDD API ${status}: ${statusText}`);
+    this.name = 'BsddHttpError';
+    this.status = status;
+    this.statusText = statusText;
+    this.url = url;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function parseRetryAfter(headerValue: string | null): number | undefined {
+  if (!headerValue) return undefined;
+  const seconds = Number(headerValue);
+  // Clamp to a non-negative whole-second value. Malformed headers can
+  // serve fractional or negative numbers; passing those upstream poisons
+  // any retry-scheduling logic that expects a sane delay.
+  if (Number.isFinite(seconds)) return Math.max(0, Math.ceil(seconds));
+  const dateMs = Date.parse(headerValue);
+  if (Number.isFinite(dateMs)) return Math.max(0, Math.round((dateMs - Date.now()) / 1000));
+  return undefined;
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, {
     headers: { Accept: 'application/json' },
   });
-  if (!res.ok) throw new Error(`bSDD API ${res.status}: ${res.statusText}`);
+  if (!res.ok) {
+    throw new BsddHttpError(
+      res.status,
+      res.statusText,
+      url,
+      parseRetryAfter(res.headers.get('retry-after')),
+    );
+  }
   return res.json() as Promise<T>;
 }
 
@@ -160,10 +222,15 @@ export class BsddNamespace {
   private apiBase: string;
   private cache = new Map<string, { data: BsddClassInfo; ts: number }>();
   private cacheTtl: number;
+  private maxCacheEntries: number;
 
   constructor(options?: BsddOptions) {
     this.apiBase = options?.apiBase ?? 'https://api.bsdd.buildingsmart.org';
     this.cacheTtl = options?.cacheTtlMs ?? 10 * 60 * 1000;
+    // Clamp to a positive integer: 0/negative/NaN would break the bounded
+    // eviction loop in setCache (and silently disable the LRU cap).
+    const rawMax = options?.maxCacheEntries ?? 500;
+    this.maxCacheEntries = Number.isFinite(rawMax) ? Math.max(1, Math.floor(rawMax)) : 500;
   }
 
   // --------------------------------------------------------------------------
@@ -188,39 +255,46 @@ export class BsddNamespace {
    * Fetch full class info (including properties) for an IFC entity type.
    *
    * Results are cached for 10 minutes (configurable).
-   * Returns null if the bSDD has no data for this type.
+   * Returns null if bSDD has no data for this type (HTTP 404). Other HTTP
+   * failures — most importantly 429 rate-limits — are re-thrown as
+   * `BsddHttpError` so callers can react instead of silently treating them
+   * as "missing".
    */
   async fetchClassInfo(ifcType: string): Promise<BsddClassInfo | null> {
     const uri = this.ifcClassUri(ifcType);
     const cached = getCached(this.cache, uri, this.cacheTtl);
     if (cached) return cached;
 
+    let raw: Record<string, unknown>;
     try {
-      const raw = await fetchJson<Record<string, unknown>>(
+      raw = await fetchJson<Record<string, unknown>>(
         `${this.apiBase}/api/Class/v1?Uri=${encodeURIComponent(uri)}&IncludeClassProperties=true&IncludeClassRelations=true`,
       );
+    } catch (err) {
+      if (err instanceof BsddHttpError && err.status === 404) return null;
+      throw err;
+    }
 
-      let info = mapClassResponse(raw, true);
+    let info = mapClassResponse(raw, true);
 
-      // Fallback: if inline classProperties came back empty, try paginated endpoint
-      if (info.classProperties.length === 0) {
+    // Fallback: if inline classProperties came back empty, try paginated endpoint.
+    // Network failures on the fallback are non-fatal — keep the partial result.
+    if (info.classProperties.length === 0) {
+      try {
         const propsRaw = await fetchJson<Record<string, unknown>>(
           `${this.apiBase}/api/Class/Properties/v1?ClassUri=${encodeURIComponent(uri)}`,
-        ).catch(() => null);
-
-        if (propsRaw) {
-          const propsList = propsRaw.classProperties as Array<Record<string, unknown>> | undefined;
-          if (propsList && propsList.length > 0) {
-            info = { ...info, classProperties: propsList.map((p) => mapProperty(p, true)) };
-          }
+        );
+        const propsList = propsRaw.classProperties as Array<Record<string, unknown>> | undefined;
+        if (propsList && propsList.length > 0) {
+          info = { ...info, classProperties: propsList.map((p) => mapProperty(p, true)) };
         }
+      } catch {
+        // ignore — primary call already succeeded
       }
-
-      setCache(this.cache, uri, info);
-      return info;
-    } catch {
-      return null;
     }
+
+    setCache(this.cache, uri, info, this.maxCacheEntries);
+    return info;
   }
 
   /**
@@ -236,10 +310,11 @@ export class BsddNamespace {
         `${this.apiBase}/api/Class/v1?Uri=${encodeURIComponent(classUri)}&IncludeClassProperties=true`,
       );
       const info = mapClassResponse(raw, false);
-      setCache(this.cache, classUri, info);
+      setCache(this.cache, classUri, info, this.maxCacheEntries);
       return info;
-    } catch {
-      return null;
+    } catch (err) {
+      if (err instanceof BsddHttpError && err.status === 404) return null;
+      throw err;
     }
   }
 
@@ -265,8 +340,9 @@ export class BsddNamespace {
         definition: c.definition ? String(c.definition) : null,
         dictionaryUri: String(c.dictionaryUri ?? ''),
       }));
-    } catch {
-      return [];
+    } catch (err) {
+      if (err instanceof BsddHttpError && err.status === 404) return [];
+      throw err;
     }
   }
 
@@ -285,8 +361,9 @@ export class BsddNamespace {
         definition: c.definition ? String(c.definition) : null,
         dictionaryUri: String(c.dictionaryUri ?? ''),
       }));
-    } catch {
-      return [];
+    } catch (err) {
+      if (err instanceof BsddHttpError && err.status === 404) return [];
+      throw err;
     }
   }
 

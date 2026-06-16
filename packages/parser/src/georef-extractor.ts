@@ -18,8 +18,9 @@
  * - Multi-model coordination (ensuring models align in real-world space)
  */
 
-import type { IfcEntity } from './entity-extractor';
+import type { IfcEntity } from './entity-extractor.js';
 import { getString, getNumber, getReference } from './attribute-helpers.js';
+import { getAttributeNames } from './ifc-schema.js';
 
 export interface MapConversion {
   id: number;
@@ -58,12 +59,19 @@ export interface ProjectedCRS {
   mapProjection?: string;     // e.g., "UTM Zone 10N"
   mapZone?: string;           // e.g., "10N"
   mapUnit?: string;           // e.g., "METRE"
+  /**
+   * Scale factor to convert MapConversion values to metres.
+   * Derived from IfcProjectedCRS.MapUnit (e.g. 0.001 for mm, 1 for m).
+   * If undefined, the project's length unit applies (IFC spec default).
+   */
+  mapUnitScale?: number;
 }
 
 export interface GeoreferenceInfo {
   hasGeoreference: boolean;
   mapConversion?: MapConversion;
   projectedCRS?: ProjectedCRS;
+  source?: 'mapConversion' | 'ePSetMapConversion' | 'siteLocation';
   // Computed transformation matrix (4x4) from local to world coordinates
   transformMatrix?: number[];
 }
@@ -94,17 +102,164 @@ export function extractGeoreferencing(
   if (projectedCRSIds.length > 0) {
     const entity = entities.get(projectedCRSIds[0]);
     if (entity) {
-      info.projectedCRS = extractProjectedCRS(entity);
+      info.projectedCRS = extractProjectedCRS(entity, (id) => entities.get(id));
       info.hasGeoreference = true;
     }
   }
 
   // Compute transformation matrix if we have map conversion
   if (info.mapConversion) {
+    info.source = 'mapConversion';
     info.transformMatrix = computeTransformMatrix(info.mapConversion);
   }
 
+  if (!info.hasGeoreference) {
+    // IFC2x3 ePSet_MapConversion fallback BEFORE the legacy site fallback —
+    // same precedence as the Rust extractor (ifc_lite_core::GeoRefExtractor),
+    // which previously found these models georeferenced while the browser
+    // reported none (alignment audit).
+    const epset = extractEPSetMapConversion(entities, entitiesByType);
+    if (epset) {
+      return epset;
+    }
+    const legacySite = extractLegacySiteGeoreference(entities, entitiesByType);
+    if (legacySite) {
+      return legacySite;
+    }
+  }
+
   return info;
+}
+
+/**
+ * IFC2x3 fallback: a property set named `ePSet_MapConversion` /
+ * `EPset_MapConversion` carrying Eastings/Northings/OrthogonalHeight (+
+ * optional XAxisAbscissa/XAxisOrdinate/Scale) as IfcPropertySingleValue
+ * entries. Mirrors `GeoRefExtractor::parse_pset_map_conversion` in
+ * rust/core/src/georef.rs.
+ */
+function extractEPSetMapConversion(
+  entities: Map<number, IfcEntity>,
+  entitiesByType: Map<string, number[]>,
+): GeoreferenceInfo | null {
+  const psetIds = entitiesByType.get('IfcPropertySet') || [];
+  for (const psetId of psetIds) {
+    const pset = entities.get(psetId);
+    if (!pset) continue;
+    // IfcPropertySet: GlobalId (0), OwnerHistory (1), Name (2), Description (3), HasProperties (4)
+    const name = getString(pset.attributes[2]);
+    if (name !== 'ePSet_MapConversion' && name !== 'EPset_MapConversion') continue;
+
+    const values: Record<string, number> = {};
+    const props = pset.attributes[4];
+    if (Array.isArray(props)) {
+      for (const propRef of props) {
+        const propId = getReference(propRef);
+        if (!propId) continue;
+        const prop = entities.get(propId);
+        if (!prop) continue;
+        // IfcPropertySingleValue: Name (0), Description (1), NominalValue (2)
+        const propName = getString(prop.attributes[0]);
+        const value = getNumber(prop.attributes[2]);
+        if (propName && value !== undefined) {
+          values[propName] = value;
+        }
+      }
+    }
+
+    const eastings = values['Eastings'] ?? 0;
+    const northings = values['Northings'] ?? 0;
+    const orthogonalHeight = values['OrthogonalHeight'] ?? 0;
+    if (eastings === 0 && northings === 0 && orthogonalHeight === 0) continue;
+
+    const mapConversion: MapConversion = {
+      id: pset.expressId,
+      sourceCRS: 0,
+      targetCRS: 0,
+      eastings,
+      northings,
+      orthogonalHeight,
+      xAxisAbscissa: values['XAxisAbscissa'],
+      xAxisOrdinate: values['XAxisOrdinate'],
+      scale: values['Scale'],
+    };
+    return {
+      hasGeoreference: true,
+      source: 'ePSetMapConversion',
+      mapConversion,
+      transformMatrix: computeTransformMatrix(mapConversion),
+    };
+  }
+  return null;
+}
+
+function getAttributeValueByName(entity: IfcEntity, attributeName: string): unknown {
+  const attributeNames = getAttributeNames(entity.type);
+  const index = attributeNames.indexOf(attributeName);
+  if (index < 0) return undefined;
+  return entity.attributes[index];
+}
+
+function compoundPlaneAngleToDecimalDegrees(value: unknown): number | undefined {
+  if (!Array.isArray(value) || value.length < 3) return undefined;
+  const numbers = value
+    .map((entry) => getNumber(entry))
+    .filter((entry): entry is number => entry !== undefined);
+  if (numbers.length < 3) return undefined;
+
+  const [degreesRaw, minutesRaw, secondsRaw, millionthsRaw = 0] = numbers;
+  const sign = degreesRaw < 0 || minutesRaw < 0 || secondsRaw < 0 || millionthsRaw < 0 ? -1 : 1;
+  const degrees = Math.abs(degreesRaw);
+  const minutes = Math.abs(minutesRaw);
+  const seconds = Math.abs(secondsRaw);
+  const millionths = Math.abs(millionthsRaw);
+
+  return sign * (degrees + (minutes / 60) + ((seconds + (millionths / 1_000_000)) / 3600));
+}
+
+function extractLegacySiteGeoreference(
+  entities: Map<number, IfcEntity>,
+  entitiesByType: Map<string, number[]>,
+): GeoreferenceInfo | null {
+  const siteIds = entitiesByType.get('IfcSite') || [];
+  for (const siteId of siteIds) {
+    const site = entities.get(siteId);
+    if (!site) continue;
+
+    const latitude = compoundPlaneAngleToDecimalDegrees(
+      getAttributeValueByName(site, 'RefLatitude'),
+    );
+    const longitude = compoundPlaneAngleToDecimalDegrees(
+      getAttributeValueByName(site, 'RefLongitude'),
+    );
+    const elevation = getNumber(getAttributeValueByName(site, 'RefElevation')) ?? 0;
+
+    if (latitude === undefined || longitude === undefined) continue;
+
+    return {
+      hasGeoreference: true,
+      source: 'siteLocation',
+      projectedCRS: {
+        id: site.expressId,
+        name: 'EPSG:4326',
+        description: 'Legacy IfcSite geolocation',
+        geodeticDatum: 'WGS84',
+        mapProjection: 'Geographic',
+        mapUnit: 'DEGREE',
+      },
+      mapConversion: {
+        id: site.expressId,
+        sourceCRS: 0,
+        targetCRS: site.expressId,
+        eastings: longitude,
+        northings: latitude,
+        orthogonalHeight: elevation,
+        scale: 1,
+      },
+    };
+  }
+
+  return null;
 }
 
 function extractMapConversion(entity: IfcEntity): MapConversion {
@@ -131,7 +286,15 @@ function extractMapConversion(entity: IfcEntity): MapConversion {
   };
 }
 
-function extractProjectedCRS(entity: IfcEntity): ProjectedCRS {
+/** SI prefix → scale factor */
+const SI_PREFIX_SCALE: Record<string, number> = {
+  'MILLI': 0.001, 'CENTI': 0.01, 'DECI': 0.1, 'KILO': 1000,
+};
+
+function extractProjectedCRS(
+  entity: IfcEntity,
+  resolveEntity?: (id: number) => IfcEntity | undefined,
+): ProjectedCRS {
   // IfcProjectedCRS attributes (IFC4):
   // [0] Name (IfcLabel)
   // [1] Description (OPTIONAL IfcText)
@@ -141,13 +304,32 @@ function extractProjectedCRS(entity: IfcEntity): ProjectedCRS {
   // [5] MapZone (OPTIONAL IfcIdentifier)
   // [6] MapUnit (OPTIONAL IfcNamedUnit)
 
-  // Parse MapUnit if it's a reference
+  // Resolve MapUnit reference to determine actual unit + scale
   let mapUnit: string | undefined;
+  let mapUnitScale: number | undefined;
   const mapUnitRef = getReference(entity.attributes[6]);
   if (mapUnitRef) {
-    // Would need to resolve the IfcNamedUnit entity
-    mapUnit = 'METRE'; // Default assumption
+    mapUnit = 'METRE'; // default if we can't resolve
+    mapUnitScale = 1;
+    if (resolveEntity) {
+      const unitEntity = resolveEntity(mapUnitRef);
+      if (unitEntity) {
+        // IFCSIUNIT: [0] Dimensions, [1] UnitType, [2] Prefix, [3] Name
+        const prefix = unitEntity.attributes?.[2];
+        if (prefix != null && prefix !== '$' && typeof prefix === 'string') {
+          const prefixStr = prefix.replace(/\./g, '').toUpperCase();
+          const prefixScale = SI_PREFIX_SCALE[prefixStr];
+          if (prefixScale !== undefined) {
+            mapUnitScale = prefixScale;
+            mapUnit = prefixStr === 'MILLI' ? 'MILLIMETRE' : prefixStr + 'METRE';
+          }
+        }
+        // No prefix → base METRE → scale = 1
+      }
+    }
   }
+  // If mapUnitRef is absent → mapUnit stays undefined, mapUnitScale stays undefined
+  // → per IFC spec, MapConversion uses the project's length unit
 
   return {
     id: entity.expressId,
@@ -158,6 +340,7 @@ function extractProjectedCRS(entity: IfcEntity): ProjectedCRS {
     mapProjection: getString(entity.attributes[4]),
     mapZone: getString(entity.attributes[5]),
     mapUnit,
+    mapUnitScale,
   };
 }
 
@@ -179,16 +362,17 @@ function computeTransformMatrix(mapConversion: MapConversion): number[] {
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);
 
-  // Build 4x4 transformation matrix:
-  // [scale*cos  -scale*sin  0  eastings  ]
-  // [scale*sin   scale*cos  0  northings ]
-  // [0           0          1  height    ]
-  // [0           0          0  1         ]
+  // Build 4x4 transformation matrix (IfcMapConversion applies the one
+  // Scale equally to x, y AND z, then rotates about z, then translates):
+  // [scale*cos  -scale*sin  0      eastings  ]
+  // [scale*sin   scale*cos  0      northings ]
+  // [0           0          scale  height    ]
+  // [0           0          0      1         ]
 
   return [
     s * cos,  s * sin,  0,  0,
     -s * sin, s * cos,  0,  0,
-    0,        0,        1,  0,
+    0,        0,        s,  0,
     eastings, northings, orthogonalHeight, 1,
   ];
 }
@@ -245,7 +429,8 @@ export function transformToLocal(
   // Apply inverse rotation and scale
   const x = invScale * (cos * xTrans - sin * yTrans);
   const y = invScale * (sin * xTrans + cos * yTrans);
-  const z = zTrans;
+  // Scale applies to z too (IfcMapConversion scales all three axes).
+  const z = invScale * zTrans;
 
   return [x, y, z];
 }
@@ -272,7 +457,8 @@ export function getCoordinateSystemDescription(georef: GeoreferenceInfo): string
 
   if (georef.mapConversion) {
     const { eastings, northings, orthogonalHeight } = georef.mapConversion;
-    parts.push(`Origin: (${eastings.toFixed(2)}, ${northings.toFixed(2)}, ${orthogonalHeight.toFixed(2)})`);
+    const originLabel = georef.source === 'siteLocation' ? 'Site' : 'Origin';
+    parts.push(`${originLabel}: (${eastings.toFixed(2)}, ${northings.toFixed(2)}, ${orthogonalHeight.toFixed(2)})`);
   }
 
   return parts.join(' ');

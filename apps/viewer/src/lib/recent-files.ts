@@ -26,6 +26,11 @@ export interface RecentFileEntry {
   timestamp: number;
 }
 
+export type RecentFileInput = {
+  name: string;
+  size: number;
+};
+
 // ── localStorage (metadata) ─────────────────────────────────────────────
 
 export function getRecentFiles(): RecentFileEntry[] {
@@ -33,17 +38,26 @@ export function getRecentFiles(): RecentFileEntry[] {
   catch { return []; }
 }
 
-export function recordRecentFiles(files: { name: string; size: number }[]) {
+// Browser uploads don't expose filesystem paths, so the file name is the
+// dedup key.
+function recentKey(f: { name: string }): string {
+  return `name:${f.name}`;
+}
+
+export function recordRecentFiles(files: RecentFileInput[]) {
   try {
-    const names = new Set(files.map(f => f.name));
-    const existing = getRecentFiles().filter(f => !names.has(f.name));
+    const incomingKeys = new Set(files.map(recentKey));
+    const existing = getRecentFiles().filter(f => !incomingKeys.has(recentKey(f)));
     const entries: RecentFileEntry[] = files.map(f => ({
       name: f.name,
       size: f.size,
       timestamp: Date.now(),
     }));
     localStorage.setItem(KEY, JSON.stringify([...entries, ...existing].slice(0, 10)));
-  } catch { /* noop */ }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[recent-files] failed to persist recent files metadata', err);
+  }
 }
 
 /** Format bytes into human-readable size */

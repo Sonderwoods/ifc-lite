@@ -16,6 +16,7 @@ import { extractLengthUnitScale } from './unit-extractor.js';
 import { getAttributeNames, getInheritanceChain } from './ifc-schema.js';
 import { parsePropertyValue } from './on-demand-extractors.js';
 import { buildCompactEntityIndexAsync } from './compact-entity-index.js';
+import { yieldToEventLoop } from './yield-to-event-loop.js';
 import {
     StringTable,
     EntityTableBuilder,
@@ -25,7 +26,8 @@ import {
     RelationshipType,
     QuantityType,
 } from '@ifc-lite/data';
-import type { SpatialHierarchy, QuantityTable, PropertyValue } from '@ifc-lite/data';
+import type { SpatialHierarchy, QuantityTable, PropertyValue, PropertySet, QuantitySet, IfcStoreBase, IfcEntity, IfcAttributeValue } from '@ifc-lite/data';
+import { BufferEntitySource } from './entity-source.js';
 import { batchExtractGlobalIdAndName } from './columnar-parser-attributes.js';
 import {
     GEOMETRY_TYPES,
@@ -41,16 +43,14 @@ import {
     isIfcTypeLikeEntity,
 } from './columnar-parser-indexes.js';
 import { extractRelFast, extractPropertyRelFast } from './columnar-parser-relationships.js';
+import { safeUtf8Decode } from '@ifc-lite/data';
 
 import type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
 // Re-export interfaces/types from extracted modules for public API compatibility
 export type { SpatialIndex, EntityByIdIndex } from './columnar-parser-indexes.js';
 
-export interface IfcDataStore {
-    fileSize: number;
-    schemaVersion: 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
-    entityCount: number;
+export interface IfcDataStore extends IfcStoreBase {
     parseTime: number;
 
     source: Uint8Array;
@@ -62,9 +62,6 @@ export interface IfcDataStore {
     properties: ReturnType<PropertyTableBuilder['build']>;
     quantities: QuantityTable;
     relationships: ReturnType<RelationshipGraphBuilder['build']>;
-
-    spatialHierarchy?: SpatialHierarchy;
-    spatialIndex?: SpatialIndex;
 
     /**
      * On-demand property lookup: entityId -> array of property set expressIds
@@ -98,12 +95,21 @@ export interface IfcDataStore {
      * Built from IfcRelAssociatesDocument relationships during parsing.
      */
     onDemandDocumentMap?: Map<number, number[]>;
+
+    /**
+     * Project-level length unit scale to convert raw IFC numeric measure
+     * values into base SI metres. `1.0` for metres, `0.001` for milli,
+     * `0.0254` for inches, etc. Surfaced on the store so consumers
+     * (notably the IDS validator, where IDS literals are always in
+     * base SI units) can convert without re-parsing the unit graph.
+     */
+    lengthUnitScale?: number;
 }
 
 
 function detectSchemaVersion(buffer: Uint8Array): IfcDataStore['schemaVersion'] {
     const headerEnd = Math.min(buffer.length, 2000);
-    const headerText = new TextDecoder().decode(buffer.subarray(0, headerEnd)).toUpperCase();
+    const headerText = safeUtf8Decode(buffer, 0, headerEnd).toUpperCase();
 
     if (headerText.includes('IFC5')) return 'IFC5';
     if (headerText.includes('IFC4X3')) return 'IFC4X3';
@@ -111,20 +117,6 @@ function detectSchemaVersion(buffer: Uint8Array): IfcDataStore['schemaVersion'] 
     if (headerText.includes('IFC2X3')) return 'IFC2X3';
 
     return 'IFC4'; // Default fallback
-}
-
-function yieldToEventLoop(): Promise<void> {
-    const maybeScheduler = (globalThis as typeof globalThis & {
-        scheduler?: { yield?: () => Promise<void> };
-    }).scheduler;
-    if (typeof maybeScheduler?.yield === 'function') {
-        return maybeScheduler.yield();
-    }
-    return new Promise<void>((resolve) => {
-        const channel = new MessageChannel();
-        channel.port1.onmessage = () => resolve();
-        channel.port2.postMessage(null);
-    });
 }
 
 export class ColumnarParser {
@@ -136,7 +128,7 @@ export class ColumnarParser {
      * This provides instant UI responsiveness even for very large files.
      */
     async parseLite(
-        buffer: ArrayBuffer,
+        buffer: ArrayBuffer | SharedArrayBuffer,
         entityRefs: EntityRef[],
         options: {
             onProgress?: (progress: { phase: string; percent: number }) => void;
@@ -191,16 +183,13 @@ export class ColumnarParser {
             return upper;
         };
 
-        const RELEVANT_ENTITY_PREFIXES = new Set([
-            'IFCWALL', 'IFCSLAB', 'IFCBEAM', 'IFCCOLUMN', 'IFCPLATE', 'IFCDOOR', 'IFCWINDOW',
-            'IFCROOF', 'IFCSTAIR', 'IFCRAILING', 'IFCRAMP', 'IFCFOOTING', 'IFCPILE',
-            'IFCMEMBER', 'IFCCURTAINWALL', 'IFCBUILDINGELEMENTPROXY', 'IFCFURNISHINGELEMENT',
-            'IFCFLOWSEGMENT', 'IFCFLOWTERMINAL', 'IFCFLOWCONTROLLER', 'IFCFLOWFITTING',
-            'IFCSPACE', 'IFCOPENINGELEMENT', 'IFCSITE', 'IFCBUILDING', 'IFCBUILDINGSTOREY',
-            'IFCPROJECT', 'IFCCOVERING', 'IFCANNOTATION', 'IFCGRID',
-            // Infrastructure entities needed by on-demand extraction and StepExporter.
-            // Without these, findPreferredGeometricRepresentationContextId() and
-            // findLengthUnitReference() fail because the entities are not in byId.
+        // Non-product helper entities that on-demand extraction / StepExporter
+        // need addressable in `byId`. These are not IfcProduct subtypes so the
+        // schema-driven IFCPRODUCT subtype check below cannot capture them.
+        // Without them, findPreferredGeometricRepresentationContextId() and
+        // findLengthUnitReference() fail because the entities are missing from
+        // the compact entity index.
+        const RELEVANT_NON_PRODUCT_HELPERS = new Set([
             'IFCGEOMETRICREPRESENTATIONCONTEXT', 'IFCGEOMETRICREPRESENTATIONSUBCONTEXT',
             'IFCUNITASSIGNMENT', 'IFCSIUNIT', 'IFCCONVERSIONBASEDUNIT',
             'IFCDERIVEDUNIT', 'IFCDERIVEDUNITELEMENT', 'IFCMEASUREWITHUNIT',
@@ -212,6 +201,15 @@ export class ColumnarParser {
             'IFCCLASSIFICATION', 'IFCCLASSIFICATIONREFERENCE',
             'IFCDOCUMENTINFORMATION', 'IFCDOCUMENTREFERENCE',
         ]);
+
+        // Schema-driven inclusion: every IfcProduct subtype belongs in the
+        // EntityTable. The previous hardcoded enumeration of IFC4 building-
+        // element leaves (IFCWALL, IFCSLAB, …) and IFC4x3 infrastructure
+        // leaves (IFCREFERENT, IFCSIGNAL, IFCALIGNMENT, IFCPAVEMENT, …) drifted
+        // with every schema bump — new entities silently became CAT_SKIP and
+        // disappeared from the hierarchy panel. The generated schema registry
+        // already knows the full inheritance chain, so use it.
+        const RELEVANT_PRODUCT_ROOTS = new Set(['IFCPRODUCT']);
 
         // Category constants for the lookup cache
         const CAT_SKIP = 0, CAT_SPATIAL = 1, CAT_GEOMETRY = 2, CAT_HIERARCHY_REL = 3,
@@ -238,7 +236,11 @@ export class ColumnarParser {
             else if (PROPERTY_ENTITY_TYPES.has(upper)) cat = CAT_PROPERTY_ENTITY;
             else if (ASSOCIATION_REL_TYPES.has(upper)) cat = CAT_ASSOCIATION_REL;
             else if (isIfcTypeLikeEntity(upper)) cat = CAT_TYPE_OBJECT;
-            else if (RELEVANT_ENTITY_PREFIXES.has(upper) || upper.startsWith('IFCREL')) cat = CAT_RELEVANT;
+            else if (
+                RELEVANT_NON_PRODUCT_HELPERS.has(upper)
+                || isSubtypeOfAny(upper, RELEVANT_PRODUCT_ROOTS)
+                || upper.startsWith('IFCREL')
+            ) cat = CAT_RELEVANT;
             else cat = CAT_SKIP;
             typeCategoryCache.set(type, cat);
             return cat;
@@ -282,8 +284,16 @@ export class ColumnarParser {
             const includeInPrimaryIndex =
                 !deferPropertyAtomIndex || cat !== CAT_PROPERTY_ENTITY || PROPERTY_CONTAINER_TYPES.has(typeUpper);
             if (includeInPrimaryIndex) {
-                let typeList = byType.get(ref.type);
-                if (!typeList) { typeList = []; byType.set(ref.type, typeList); }
+                // STEP convention is uppercase entity type names and every
+                // downstream consumer (schedule-extractor, property readers,
+                // test helpers) keys on uppercase. The tokenizer preserves
+                // original case though, so if a STEP writer ever emits
+                // mixed-case or lowercase types the index would miss on
+                // canonical lookups. Normalise once here — `getTypeUpper`
+                // is already cached by type name so the cost is ~0.
+                const typeKey = getTypeUpper(ref.type);
+                let typeList = byType.get(typeKey);
+                if (!typeList) { typeList = []; byType.set(typeKey, typeList); }
                 typeList.push(ref.expressId);
             }
             if (cat === CAT_SPATIAL) spatialRefs.push(ref);
@@ -485,6 +495,7 @@ export class ColumnarParser {
         // The hierarchy panel can render immediately while property/association
         // parsing continues. This lets the panel appear at the same time as
         // geometry streaming completes.
+        const entitySource = new BufferEntitySource(uint8Buffer, entityIndex);
         const earlyStore: IfcDataStore = {
             fileSize: buffer.byteLength,
             schemaVersion,
@@ -498,6 +509,11 @@ export class ColumnarParser {
             quantities: quantityTable,
             relationships: hierarchyRelGraph,
             spatialHierarchy,
+            lengthUnitScale,
+            getEntity(expressId) { return entitySource.getEntity(expressId); },
+            getEntitiesByType(typeName) { return entitySource.getEntitiesByType(typeName); },
+            getProperties(expressId) { return this.properties.getForEntity(expressId); },
+            getQuantities(expressId) { return this.quantities.getForEntity(expressId); },
         };
         options.onSpatialReady?.(earlyStore);
 
@@ -609,7 +625,7 @@ export class ColumnarParser {
         const parseTime = performance.now() - startTime;
         options.onProgress?.({ phase: 'complete', percent: 100 });
 
-        return {
+        const finalStore: IfcDataStore = {
             ...earlyStore,
             parseTime,
             relationships: fullRelationshipGraph,
@@ -619,7 +635,19 @@ export class ColumnarParser {
             onDemandClassificationMap,
             onDemandMaterialMap,
             onDemandDocumentMap,
+            lengthUnitScale,
+            getEntity(expressId) { return entitySource.getEntity(expressId); },
+            getEntitiesByType(typeName) { return entitySource.getEntitiesByType(typeName); },
+            getProperties(expressId) {
+                if (onDemandPropertyMap.size > 0) return extractPropertiesOnDemand(this as IfcDataStore, expressId) as PropertySet[];
+                return this.properties.getForEntity(expressId);
+            },
+            getQuantities(expressId) {
+                if (onDemandQuantityMap.size > 0) return extractQuantitiesOnDemand(this as IfcDataStore, expressId) as QuantitySet[];
+                return this.quantities.getForEntity(expressId);
+            },
         };
+        return finalStore;
     }
 
     /**
@@ -629,7 +657,7 @@ export class ColumnarParser {
     extractPropertiesOnDemand(
         store: IfcDataStore,
         entityId: number
-    ): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> {
+    ): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> {
         // Use on-demand extraction if map is available (preferred for single-entity access)
         if (!store.onDemandPropertyMap || !store.source?.length) {
             // Fallback to pre-computed property table (e.g., server-parsed data)
@@ -642,7 +670,7 @@ export class ColumnarParser {
         }
 
         const extractor = new EntityExtractor(store.source);
-        const result: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> = [];
+        const result: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> = [];
 
         for (const psetId of psetIds) {
             const psetRef = getEntityRefFromStore(store, psetId);
@@ -656,7 +684,7 @@ export class ColumnarParser {
             const psetName = typeof psetAttrs[2] === 'string' ? psetAttrs[2] : `PropertySet #${psetId}`;
             const hasProperties = psetAttrs[4];
 
-            const properties: Array<{ name: string; type: number; value: PropertyValue }> = [];
+            const properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> = [];
 
             if (Array.isArray(hasProperties)) {
                 for (const propRef of hasProperties) {
@@ -673,7 +701,14 @@ export class ColumnarParser {
                     if (!propName) continue;
 
                     const parsed = parsePropertyValue(propEntity);
-                    properties.push({ name: propName, type: parsed.type, value: parsed.value });
+                    const entry: { name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string } = {
+                        name: propName,
+                        type: parsed.type,
+                        value: parsed.value,
+                    };
+                    if (parsed.values) entry.values = parsed.values;
+                    if (parsed.dataType) entry.dataType = parsed.dataType;
+                    properties.push(entry);
                 }
             }
 
@@ -761,7 +796,7 @@ export class ColumnarParser {
 export function extractPropertiesOnDemand(
     store: IfcDataStore,
     entityId: number
-): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> {
+): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[] }> }> {
     const parser = new ColumnarParser();
     return parser.extractPropertiesOnDemand(store, entityId);
 }
@@ -783,8 +818,10 @@ function getEntityRefFromStore(store: IfcDataStore, expressId: number): EntityRe
 }
 
 /**
- * Extract entity attributes on-demand from source buffer
- * Returns globalId, name, description, objectType, tag for any IfcRoot-derived entity.
+ * Extract entity attributes on-demand from source buffer.
+ * Returns globalId, name, description, objectType, tag mapped by schema name
+ * (see {@link extractRootAttributesFromEntity}), so the result stays correct
+ * for entity types whose attribute order differs from the IfcElement layout.
  * This is used for entities that weren't fully parsed during initial load.
  */
 export function extractEntityAttributesOnDemand(
@@ -802,18 +839,7 @@ export function extractEntityAttributesOnDemand(
         return { globalId: '', name: '', description: '', objectType: '', tag: '' };
     }
 
-    const attrs = entity.attributes || [];
-    // IfcRoot attributes: [GlobalId, OwnerHistory, Name, Description]
-    // IfcObject adds: [ObjectType] at index 4
-    // IfcProduct adds: [ObjectPlacement, Representation] at indices 5-6
-    // IfcElement adds: [Tag] at index 7
-    const globalId = typeof attrs[0] === 'string' ? attrs[0] : '';
-    const name = typeof attrs[2] === 'string' ? attrs[2] : '';
-    const description = typeof attrs[3] === 'string' ? attrs[3] : '';
-    const objectType = typeof attrs[4] === 'string' ? attrs[4] : '';
-    const tag = typeof attrs[7] === 'string' ? attrs[7] : '';
-
-    return { globalId, name, description, objectType, tag };
+    return extractRootAttributesFromEntity(entity);
 }
 
 /**
@@ -824,7 +850,7 @@ export function extractEntityAttributesOnDemand(
 export function extractAllEntityAttributes(
     store: IfcDataStore,
     entityId: number
-): Array<{ name: string; value: string }> {
+): Array<{ name: string; value: string | number | boolean }> {
     const ref = store.entityIndex.byId.get(entityId);
     if (!ref) return [];
 
@@ -835,37 +861,182 @@ export function extractAllEntityAttributes(
     const attrs = entity.attributes || [];
     // Use properly-cased type name from entity table (IfcTypeEnumToString)
     // instead of ref.type which is UPPERCASE from STEP (e.g., IFCWALLSTANDARDCASE)
-    // and breaks multi-word type normalization in getAttributeNames
-    const typeName = store.entities.getTypeName(entityId);
-    const attrNames = getAttributeNames(typeName || ref.type);
+    // and breaks multi-word type normalization in getAttributeNames.
+    // For resource-level entities (IfcTask, IfcTaskTime, IfcMaterial,
+    // IfcClassification, ...) the entity table returns 'Unknown';
+    // fall back to ref.type so the schema-driven attribute-name
+    // resolution still works for those types.
+    const tableName = store.entities.getTypeName(entityId);
+    const typeName = tableName && tableName !== 'Unknown' ? tableName : ref.type;
+    const attrNames = getAttributeNames(typeName);
 
-    const result: Array<{ name: string; value: string }> = [];
+    const result: Array<{ name: string; value: string | number | boolean }> = [];
     const len = Math.min(attrs.length, attrNames.length);
     for (let i = 0; i < len; i++) {
         const attrName = attrNames[i];
         if (SKIP_DISPLAY_ATTRS.has(attrName)) continue;
 
         const raw = attrs[i];
-        if (typeof raw === 'string' && raw) {
-            // Clean enum values: .NOTDEFINED. -> NOTDEFINED
+        // STEP `$` (unset) and `*` (derived) deserialize as null /
+        // undefined and must be skipped. Strings are emitted with
+        // `.ENUM.` markers stripped. Empty strings are preserved so
+        // IDS optional-attribute checks can distinguish "slot truly
+        // absent" from "slot explicitly empty". Numbers and booleans
+        // pass through unchanged so e.g. `CountValue = 0` reads as
+        // present.
+        if (typeof raw === 'string') {
+            // STEP logical-unknown markers (`.U.`, `.X.`) read as
+            // "no value" per IDS spec — they fail any attribute
+            // check, including a bare existence check, so don't
+            // surface them as if the slot were populated.
+            if (raw === '.U.' || raw === '.X.') continue;
+            // Bare boolean tokens (`.T.` / `.F.`) on a schema-typed
+            // IfcBoolean attribute slot — resolve to JS boolean so
+            // IDS checks comparing against `true` / `false` literals
+            // pass without case-sensitive string contortions.
+            if (raw === '.T.') {
+                result.push({ name: attrName, value: true });
+                continue;
+            }
+            if (raw === '.F.') {
+                result.push({ name: attrName, value: false });
+                continue;
+            }
             const display = raw.startsWith('.') && raw.endsWith('.')
                 ? raw.slice(1, -1)
                 : raw;
             result.push({ name: attrName, value: display });
+        } else if (typeof raw === 'number' || typeof raw === 'boolean') {
+            result.push({ name: attrName, value: raw });
+        } else if (Array.isArray(raw) && raw.length === 2) {
+            // Typed STEP values like IFCREAL(0.0), IFCBOOLEAN(.T.) —
+            // return the underlying primitive so attribute existence
+            // and value checks can compare it directly.
+            const inner = raw[1];
+            const tag = String(raw[0]).toUpperCase();
+            if (tag.includes('BOOLEAN')) {
+                result.push({ name: attrName, value: inner === '.T.' || inner === true });
+            } else if (tag.includes('LOGICAL')) {
+                if (inner === '.U.' || inner === '.X.') {
+                    // UNKNOWN logical → don't surface (treated as absent)
+                    continue;
+                }
+                result.push({ name: attrName, value: inner === '.T.' || inner === true });
+            } else if (typeof inner === 'number' || typeof inner === 'boolean') {
+                result.push({ name: attrName, value: inner });
+            } else if (typeof inner === 'string' && inner) {
+                const display = inner.startsWith('.') && inner.endsWith('.')
+                    ? inner.slice(1, -1)
+                    : inner;
+                result.push({ name: attrName, value: display });
+            }
         }
     }
 
     return result;
 }
 
+/**
+ * Returns named raw attribute pairs for an entity, filtered to display-relevant attributes.
+ * Skips structural/reference attributes using the IFC schema. Used by query layer for coercion.
+ */
+export function getRawNamedAttributes(
+    entity: IfcEntity
+): Array<{ name: string; raw: IfcAttributeValue }> {
+    const attrs = entity.attributes || [];
+    const attrNames = getAttributeNames(entity.type);
+
+    const result: Array<{ name: string; raw: IfcAttributeValue }> = [];
+    const len = Math.min(attrs.length, attrNames.length);
+    for (let i = 0; i < len; i++) {
+        const attrName = attrNames[i];
+        if (SKIP_DISPLAY_ATTRS.has(attrName)) continue;
+        result.push({ name: attrName, raw: attrs[i] });
+    }
+    return result;
+}
+
+interface RootAttrIndices {
+    known: boolean;
+    globalId: number;
+    name: number;
+    description: number;
+    objectType: number;
+    tag: number;
+}
+
+// getAttributeNames() walks the schema registry (an O(types) scan for the
+// UPPERCASE STEP names entities carry), so memoise the per-type index lookup.
+// There are only a few hundred distinct types but potentially millions of
+// entities, keeping the on-demand path cheap even when called per entity.
+const rootAttrIndexCache = new Map<string, RootAttrIndices>();
+
+function getRootAttrIndices(type: string): RootAttrIndices {
+    let idx = rootAttrIndexCache.get(type);
+    if (!idx) {
+        const names = getAttributeNames(type);
+        idx = {
+            known: names.length > 0,
+            globalId: names.indexOf('GlobalId'),
+            name: names.indexOf('Name'),
+            description: names.indexOf('Description'),
+            objectType: names.indexOf('ObjectType'),
+            tag: names.indexOf('Tag'),
+        };
+        rootAttrIndexCache.set(type, idx);
+    }
+    return idx;
+}
+
+/**
+ * Resolve the common IfcRoot-family display attributes (GlobalId, Name,
+ * Description, ObjectType, Tag) from an entity's raw attribute array.
+ *
+ * These are mapped by schema-derived attribute *name*, not fixed index. The
+ * fixed indices `[0],[2],[3],[4],[7]` only hold for the IfcElement layout: for
+ * a spatial element `attrs[7]` is LongName (not Tag), and for a resource entity
+ * like IfcMaterial `attrs[0]` is Name (not GlobalId). Name-mapping keeps all of
+ * these correct for every entity type, returning '' for attributes the type
+ * does not declare.
+ *
+ * For types the schema registry does not recognise (e.g. an IFC4x3 infra leaf
+ * outside the codegen pin, or a vendor extension) we fall back to the canonical
+ * IfcRoot/IfcElement positions so we never regress vs. the old fixed-index path.
+ */
+export function extractRootAttributesFromEntity(
+    entity: IfcEntity
+): { globalId: string; name: string; description: string; objectType: string; tag: string } {
+    const attrs = entity.attributes || [];
+    const idx = getRootAttrIndices(entity.type);
+    const pick = (schemaIndex: number, fallbackIndex: number): string => {
+        const i = idx.known ? schemaIndex : fallbackIndex;
+        const raw = i >= 0 ? attrs[i] : undefined;
+        return typeof raw === 'string' ? raw : '';
+    };
+    return {
+        globalId: pick(idx.globalId, 0),
+        name: pick(idx.name, 2),
+        description: pick(idx.description, 3),
+        objectType: pick(idx.objectType, 4),
+        tag: pick(idx.tag, 7),
+    };
+}
+
 // Re-export on-demand extraction functions from focused module
 export {
     extractClassificationsOnDemand,
     extractMaterialsOnDemand,
+    extractMaterialPropertiesOnDemand,
+    extractMaterialPropertiesForMaterialId,
+    resolveMaterialDefId,
+    collectMaterialLeaves,
+    buildMaterialUsageIndex,
+    getMaterialDisplay,
     extractTypePropertiesOnDemand,
     extractTypeEntityOwnProperties,
     extractDocumentsOnDemand,
     extractRelationshipsOnDemand,
+    extractGroupMembersOnDemand,
     extractGeoreferencingOnDemand,
     parsePropertyValue,
     extractPsetsFromIds,
@@ -877,8 +1048,12 @@ export type {
     MaterialLayerInfo,
     MaterialProfileInfo,
     MaterialConstituentInfo,
+    MaterialPsetGroup,
+    MaterialLeaf,
+    MaterialUsage,
     TypePropertyInfo,
     DocumentInfo,
     EntityRelationships,
+    GroupMember,
     GeorefInfo,
 } from './on-demand-extractors.js';

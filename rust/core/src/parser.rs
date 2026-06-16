@@ -19,23 +19,27 @@ use nom::{
 use crate::error::{Error, Result};
 use crate::generated::IfcType;
 
-/// STEP/IFC Token
+/// STEP/IFC token.
+///
+/// String-like tokens borrow their original bytes. Decode them only at a
+/// user-facing boundary so malformed real-world encodings cannot invalidate
+/// the structural parser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token<'a> {
     /// Entity reference: #123
     EntityRef(u32),
     /// String literal: 'text'
-    String(&'a str),
+    String(&'a [u8]),
     /// Integer: 42
     Integer(i64),
     /// Float: 3.14
     Float(f64),
     /// Enum: .TRUE., .FALSE., .UNKNOWN.
-    Enum(&'a str),
+    Enum(&'a [u8]),
     /// List: (1, 2, 3)
     List(Vec<Token<'a>>),
     /// Typed value: IFCPARAMETERVALUE(0.), IFCBOOLEAN(.T.)
-    TypedValue(&'a str, Vec<Token<'a>>),
+    TypedValue(&'a [u8], Vec<Token<'a>>),
     /// Null value: $
     Null,
     /// Asterisk (derived value): *
@@ -43,9 +47,9 @@ pub enum Token<'a> {
 }
 
 /// Parse entity reference: #123
-fn entity_ref(input: &str) -> IResult<&str, Token<'_>> {
+fn entity_ref(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map(
-        preceded(char('#'), map_res(digit1, |s: &str| s.parse::<u32>())),
+        preceded(char('#'), map_res(digit1, lexical_core::parse::<u32>)),
         Token::EntityRef,
     )(input)
 }
@@ -53,11 +57,11 @@ fn entity_ref(input: &str) -> IResult<&str, Token<'_>> {
 /// Parse string literal: 'text' or "text"
 /// IFC uses '' to escape a single quote within a string
 /// Uses memchr for SIMD-accelerated quote searching
-fn string_literal(input: &str) -> IResult<&str, Token<'_>> {
+fn string_literal(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     // Helper to parse string content with escaped quotes - SIMD optimized
     #[inline]
-    fn parse_string_content(input: &str, quote_byte: u8) -> IResult<&str, &str> {
-        let bytes = input.as_bytes();
+    fn parse_string_content(input: &[u8], quote_byte: u8) -> IResult<&[u8], &[u8]> {
+        let bytes = input;
         let mut pos = 0;
 
         // Use memchr for SIMD-accelerated searching
@@ -94,9 +98,9 @@ fn string_literal(input: &str) -> IResult<&str, Token<'_>> {
 /// Parse integer: 42, -42
 /// Uses lexical-core for 10x faster parsing
 #[inline]
-fn integer(input: &str) -> IResult<&str, Token<'_>> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
-        lexical_core::parse::<i64>(s.as_bytes())
+fn integer(input: &[u8]) -> IResult<&[u8], Token<'_>> {
+    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &[u8]| {
+        lexical_core::parse::<i64>(s)
             .map(Token::Integer)
             .map_err(|_| "parse error")
     })(input)
@@ -106,7 +110,7 @@ fn integer(input: &str) -> IResult<&str, Token<'_>> {
 /// IFC allows floats like "0." without decimal digits
 /// Uses lexical-core for 10x faster parsing
 #[inline]
-fn float(input: &str) -> IResult<&str, Token<'_>> {
+fn float(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map_res(
         recognize(tuple((
             opt(char('-')),
@@ -115,8 +119,8 @@ fn float(input: &str) -> IResult<&str, Token<'_>> {
             opt(digit1), // Made optional to support "0." format
             opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
         ))),
-        |s: &str| {
-            lexical_core::parse::<f64>(s.as_bytes())
+        |s: &[u8]| {
+            lexical_core::parse::<f64>(s)
                 .map(Token::Float)
                 .map_err(|_| "parse error")
         },
@@ -124,11 +128,11 @@ fn float(input: &str) -> IResult<&str, Token<'_>> {
 }
 
 /// Parse enum: .TRUE., .FALSE., .UNKNOWN., .ELEMENT.
-fn enum_value(input: &str) -> IResult<&str, Token<'_>> {
+fn enum_value(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map(
         delimited(
             char('.'),
-            take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+            take_while1(|c: u8| c.is_ascii_alphanumeric() || c == b'_'),
             char('.'),
         ),
         Token::Enum,
@@ -136,25 +140,34 @@ fn enum_value(input: &str) -> IResult<&str, Token<'_>> {
 }
 
 /// Parse null: $
-fn null(input: &str) -> IResult<&str, Token<'_>> {
+fn null(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map(char('$'), |_| Token::Null)(input)
 }
 
 /// Parse derived: *
-fn derived(input: &str) -> IResult<&str, Token<'_>> {
+fn derived(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map(char('*'), |_| Token::Derived)(input)
 }
 
+/// Maximum nesting depth for token recursion (list and typed-value bodies).
+///
+/// Each `(` in the input bumps depth by one. Real-world IFC entities rarely
+/// nest beyond 5-10 levels; 256 leaves comfortable headroom while keeping
+/// the stack bounded against pathological inputs.
+const MAX_NESTING_DEPTH: u32 = 256;
+
 /// Parse typed value: IFCPARAMETERVALUE(0.), IFCBOOLEAN(.T.)
-fn typed_value(input: &str) -> IResult<&str, Token<'_>> {
+fn typed_value_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
     map(
         pair(
             // Type name (all caps with optional numbers/underscores)
-            take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+            take_while1(|c: u8| c.is_ascii_alphanumeric() || c == b'_'),
             // Arguments
             delimited(
                 char('('),
-                separated_list0(delimited(ws, char(','), ws), token),
+                separated_list0(delimited(ws, char(','), ws), move |i| {
+                    token_at_depth(i, depth)
+                }),
                 char(')'),
             ),
         ),
@@ -163,13 +176,23 @@ fn typed_value(input: &str) -> IResult<&str, Token<'_>> {
 }
 
 /// Skip whitespace
-fn ws(input: &str) -> IResult<&str, ()> {
-    map(take_while(|c: char| c.is_whitespace()), |_| ())(input)
+fn ws(input: &[u8]) -> IResult<&[u8], ()> {
+    map(take_while(|c: u8| c.is_ascii_whitespace()), |_| ())(input)
 }
 
 /// Parse a token with optional surrounding whitespace
 /// Optimized ordering: test cheapest patterns first (single-char markers)
-fn token(input: &str) -> IResult<&str, Token<'_>> {
+fn token(input: &[u8]) -> IResult<&[u8], Token<'_>> {
+    token_at_depth(input, 0)
+}
+
+fn token_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::TooLarge,
+        )));
+    }
     delimited(
         ws,
         alt((
@@ -180,36 +203,49 @@ fn token(input: &str) -> IResult<&str, Token<'_>> {
             // Then by complexity
             enum_value,     // .XXX.
             string_literal, // 'xxx'
-            list,           // (...)
+            move |i| list_at_depth(i, depth + 1), // (...)
             // Numbers: float before integer since float includes '.'
             float,
             integer,
-            typed_value, // IFCPARAMETERVALUE(0.) - most expensive, last
+            // IFCPARAMETERVALUE(0.) - most expensive, last
+            move |i| typed_value_at_depth(i, depth + 1),
         )),
         ws,
     )(input)
 }
 
 /// Parse list: (1, 2, 3) or nested lists
-fn list(input: &str) -> IResult<&str, Token<'_>> {
+/// Test-only wrapper for the depth-0 entry into list.
+#[cfg(test)]
+fn list(input: &[u8]) -> IResult<&[u8], Token<'_>> {
+    list_at_depth(input, 0)
+}
+
+fn list_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
     map(
         delimited(
             char('('),
-            separated_list0(delimited(ws, char(','), ws), token),
+            separated_list0(delimited(ws, char(','), ws), move |i| {
+                token_at_depth(i, depth)
+            }),
             char(')'),
         ),
         Token::List,
     )(input)
 }
 
-/// Parse a complete entity line
+/// Parse a complete entity line from raw IFC bytes.
 /// Example: #123=IFCWALL('guid','owner',$,$,'name',$,$,$);
-pub fn parse_entity(input: &str) -> Result<(u32, IfcType, Vec<Token<'_>>)> {
-    let result: IResult<&str, (u32, &str, Vec<Token>)> = tuple((
+pub fn parse_entity<'a, T>(input: &'a T) -> Result<(u32, IfcType, Vec<Token<'a>>)>
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    let input = input.as_ref();
+    let result: IResult<&[u8], (u32, &[u8], Vec<Token>)> = tuple((
         // Entity ID: #123
         delimited(
             ws,
-            preceded(char('#'), map_res(digit1, |s: &str| s.parse::<u32>())),
+            preceded(char('#'), map_res(digit1, lexical_core::parse::<u32>)),
             ws,
         ),
         // Equals sign
@@ -218,7 +254,7 @@ pub fn parse_entity(input: &str) -> Result<(u32, IfcType, Vec<Token<'_>>)> {
             // Entity type: IFCWALL
             delimited(
                 ws,
-                take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+                take_while1(|c: u8| c.is_ascii_alphanumeric() || c == b'_'),
                 ws,
             ),
         ),
@@ -232,6 +268,8 @@ pub fn parse_entity(input: &str) -> Result<(u32, IfcType, Vec<Token<'_>>)> {
 
     match result {
         Ok((_, (id, type_str, args))) => {
+            let type_str = std::str::from_utf8(type_str)
+                .map_err(|_| Error::parse(0, "Entity type is not ASCII/UTF-8"))?;
             let ifc_type = IfcType::from_str(type_str);
             Ok((id, ifc_type, args))
         }
@@ -239,50 +277,158 @@ pub fn parse_entity(input: &str) -> Result<(u32, IfcType, Vec<Token<'_>>)> {
     }
 }
 
-/// Fast entity scanner - scans file without full parsing
+/// Fast entity scanner over raw IFC bytes without full parsing.
 /// O(n) performance for finding entities by type
 /// Uses memchr for SIMD-accelerated byte searching
 pub struct EntityScanner<'a> {
-    #[allow(dead_code)]
-    content: &'a str,
     bytes: &'a [u8],
     position: usize,
 }
 
 impl<'a> EntityScanner<'a> {
-    /// Create a new scanner
-    pub fn new(content: &'a str) -> Self {
+    /// Create a new scanner.
+    ///
+    /// Positions past the STEP HEADER section when one is present so that a
+    /// stray `#` inside a header string (e.g. a CATIA `FILE_NAME` like
+    /// `'…\X0\2#.ifc'`) can't be mistaken for an entity start and corrupt
+    /// quote-parity for the rest of the file (issue #654).
+    pub fn new<T>(content: &'a T) -> Self
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let bytes = content.as_ref();
         Self {
-            content,
-            bytes: content.as_bytes(),
-            position: 0,
+            bytes,
+            position: data_section_start(bytes),
         }
+    }
+
+    /// Create a scanner positioned at a specific byte offset.
+    ///
+    /// Used by the sharded-scan pre-pass: each shard scans the full file
+    /// (so byte offsets returned are GLOBAL, not relative to the shard's
+    /// range) but starts walking at its assigned start offset. Callers are
+    /// expected to rewind `position` to a known entity boundary (typically
+    /// the byte after a `;\n` terminator) before calling `next_entity`.
+    ///
+    /// Does NOT auto-skip the HEADER section — that's the caller's
+    /// responsibility, since shards expect the exact offset they were given.
+    pub fn new_at<T>(content: &'a T, position: usize) -> Self
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let bytes = content.as_ref();
+        let clamped = position.min(bytes.len());
+        Self {
+            bytes,
+            position: clamped,
+        }
+    }
+
+    /// Current byte offset of the scanner (start of the next entity to scan).
+    pub fn position(&self) -> usize {
+        self.position
     }
 
     /// Scan for the next entity
     /// Returns (entity_id, type_name, line_start, line_end)
     #[inline]
     pub fn next_entity(&mut self) -> Option<(u32, &'a str, usize, usize)> {
-        let remaining = &self.bytes[self.position..];
+        // Find a '#' that actually starts an entity. A '#' is legal inside
+        // STEP-encoded quoted strings (e.g. CATIA writes filenames like
+        // `'…\X0\2#.ifc'` into the HEADER's FILE_NAME) AND inside STEP
+        // `/* … */` comments. Two layered guards:
+        //
+        //   1. Skip past `/* … */` comment regions entirely so an inner
+        //      `#N=…` token can't be mistaken for an entity (PR #865 follow-
+        //      up — `/* previous #12= IFCWALL */` was the canonical example
+        //      where the original `#N=` shape check still false-positived).
+        //   2. After comment-skipping locates a candidate '#', validate it
+        //      starts a real `#<digits>[ws]*=` pattern. Catches embedded
+        //      references inside STEP strings (CATIA `'…\X0\2#.ifc'`) AND
+        //      any comment-shaped tokens the comment skipper missed (mostly
+        //      a fallback now — true `/* */` regions never reach this check).
+        //
+        // Both checks together keep `next_entity` aligned with
+        // `build_entity_index` which is comment-blind today; if a stray
+        // comment-bound entity slips past the scanner, the index also
+        // ignores it, so the entity decoder + scanner stay consistent.
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let (line_start, id_end_validated) = loop {
+            // Step (1): jump past any `/* … */` comment that starts at or
+            // before the next candidate '#'. Use memchr2 so we look for
+            // '#' and '/' in one SIMD pass — whichever comes first
+            // decides the next move.
+            let remaining = &bytes[self.position..];
+            let next = memchr::memchr2(b'#', b'/', remaining)?;
+            let candidate = self.position + next;
+            let candidate_byte = bytes[candidate];
 
-        // Find next '#' that starts an entity using SIMD-accelerated search
-        let start_offset = memchr::memchr(b'#', remaining)?;
-        let line_start = self.position + start_offset;
+            if candidate_byte == b'/' {
+                // '/' might begin a STEP `/* … */` comment. If yes, jump
+                // past `*/`; if not, it's a STEP arithmetic '/' inside a
+                // value list (rare; just step past it).
+                if candidate + 1 < len && bytes[candidate + 1] == b'*' {
+                    let mut p = candidate + 2;
+                    while p + 1 < len {
+                        // Find next '*'; check if followed by '/'.
+                        let from = p;
+                        let star = match memchr::memchr(b'*', &bytes[from..]) {
+                            Some(off) => from + off,
+                            None => return None, // unterminated comment
+                        };
+                        if star + 1 < len && bytes[star + 1] == b'/' {
+                            self.position = star + 2;
+                            break;
+                        }
+                        p = star + 1;
+                    }
+                    if self.position <= candidate {
+                        // Comment never closed — refuse to scan further.
+                        return None;
+                    }
+                    continue;
+                }
+                // Lone '/' — not a comment. Skip past.
+                self.position = candidate + 1;
+                continue;
+            }
+
+            // candidate_byte == b'#'. Step (2): validate `#<digits>[ws]*=`.
+            let after = candidate + 1;
+            if after >= len || !bytes[after].is_ascii_digit() {
+                self.position = after;
+                continue;
+            }
+            // Walk the digit run.
+            let mut digit_end = after;
+            while digit_end < len && bytes[digit_end].is_ascii_digit() {
+                digit_end += 1;
+            }
+            // Skip optional whitespace and verify the next byte is '='.
+            let mut probe = digit_end;
+            while probe < len && bytes[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+            if probe < len && bytes[probe] == b'=' {
+                break (candidate, digit_end);
+            }
+            // '#<digits>' not followed by '=' — this is a comment or string
+            // reference, not an entity definition. Skip past the digits and
+            // keep searching.
+            self.position = digit_end;
+        };
 
         // Find the end of the entity (semicolon) while respecting quoted strings
         // IFC strings use single quotes and can contain semicolons
-        let line_content = &self.bytes[line_start..];
+        let line_content = &bytes[line_start..];
         let end_offset = self.find_entity_end(line_content)?;
         let line_end = line_start + end_offset + 1;
 
-        // Parse entity ID (inline for speed)
+        // Parse entity ID — digit range already validated in the candidate loop.
         let id_start = line_start + 1;
-        let mut id_end = id_start;
-        while id_end < line_end && self.bytes[id_end].is_ascii_digit() {
-            id_end += 1;
-        }
-
-        // Fast integer parsing without allocation
+        let id_end = id_end_validated;
         let id = self.parse_u32_fast(id_start, id_end)?;
 
         // Find '=' after ID using SIMD
@@ -396,9 +542,9 @@ impl<'a> EntityScanner<'a> {
         counts
     }
 
-    /// Reset scanner to beginning
+    /// Reset scanner to beginning (re-applies the HEADER skip).
     pub fn reset(&mut self) {
-        self.position = 0;
+        self.position = data_section_start(self.bytes);
     }
 
     /// Fast check if attribute at given index is non-null (not '$')
@@ -498,50 +644,99 @@ impl<'a> EntityScanner<'a> {
     }
 }
 
+/// Locate the byte offset of the first character after `DATA;` (skipping the
+/// STEP HEADER section). Returns 0 if the marker isn't found — partial files
+/// without a HEADER still scan from the top.
+///
+/// Scanning the HEADER for entities is unsafe: the HEADER is a free-form
+/// STEP record that legally contains arbitrary characters inside quoted
+/// strings (filenames, descriptions). CATIA emits `FILE_NAME('…\X0\2#.ifc'…)`,
+/// and a tokenizer that anchors on `#` will latch onto the in-string `#`,
+/// flip `find_entity_end`'s quote parity, and drop the rest of the file.
+/// See issue #654.
+///
+/// Quote-aware: the marker is only matched outside `'…'` strings, since a
+/// HEADER field could legally contain the literal text `DATA;` in a
+/// description or filename. Escaped single quotes (`''`) are treated as a
+/// pair of in-string characters per ISO 10303-21.
+fn data_section_start(bytes: &[u8]) -> usize {
+    const MARKER: &[u8] = b"DATA;";
+    let len = bytes.len();
+    if len < MARKER.len() {
+        return 0;
+    }
+    // Cap the header scan. Real-world headers are <2 KB; an unbounded scan
+    // here would defeat the point of an O(1)-up-front fix on giant files
+    // that legitimately lack a HEADER section.
+    let limit = len.min(1 << 18); // 256 KB
+    let mut pos = 0;
+    let mut in_string = false;
+    while pos < limit {
+        let b = bytes[pos];
+        if in_string {
+            if b == b'\'' {
+                if pos + 1 < limit && bytes[pos + 1] == b'\'' {
+                    pos += 2; // escaped quote
+                    continue;
+                }
+                in_string = false;
+            }
+            pos += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_string = true;
+            pos += 1;
+            continue;
+        }
+        if b == b'D' && pos + MARKER.len() <= len && &bytes[pos..pos + MARKER.len()] == MARKER {
+            return pos + MARKER.len();
+        }
+        pos += 1;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_entity_ref() {
-        assert_eq!(entity_ref("#123"), Ok(("", Token::EntityRef(123))));
-        assert_eq!(entity_ref("#0"), Ok(("", Token::EntityRef(0))));
-    }
-
-    #[test]
-    fn test_string_literal() {
-        assert_eq!(string_literal("'hello'"), Ok(("", Token::String("hello"))));
-        assert_eq!(
-            string_literal("'with spaces'"),
-            Ok(("", Token::String("with spaces")))
-        );
-    }
-
-    #[test]
-    fn test_integer() {
-        assert_eq!(integer("42"), Ok(("", Token::Integer(42))));
-        assert_eq!(integer("-42"), Ok(("", Token::Integer(-42))));
-        assert_eq!(integer("0"), Ok(("", Token::Integer(0))));
-    }
-
+    /// Table-driven basic token parsing: (parser, input, expected token).
     #[test]
     #[allow(clippy::approx_constant)]
-    fn test_float() {
-        assert_eq!(float("3.14"), Ok(("", Token::Float(3.14))));
-        assert_eq!(float("-3.14"), Ok(("", Token::Float(-3.14))));
-        assert_eq!(float("1.5E-10"), Ok(("", Token::Float(1.5e-10))));
-    }
-
-    #[test]
-    fn test_enum() {
-        assert_eq!(enum_value(".TRUE."), Ok(("", Token::Enum("TRUE"))));
-        assert_eq!(enum_value(".FALSE."), Ok(("", Token::Enum("FALSE"))));
-        assert_eq!(enum_value(".ELEMENT."), Ok(("", Token::Enum("ELEMENT"))));
+    fn test_basic_tokens() {
+        type Parser = for<'a> fn(&'a [u8]) -> IResult<&'a [u8], Token<'a>>;
+        let cases: &[(Parser, &[u8], Token)] = &[
+            (entity_ref, b"#123", Token::EntityRef(123)),
+            (entity_ref, b"#0", Token::EntityRef(0)),
+            (string_literal, b"'hello'", Token::String(b"hello")),
+            (
+                string_literal,
+                b"'with spaces'",
+                Token::String(b"with spaces"),
+            ),
+            (integer, b"42", Token::Integer(42)),
+            (integer, b"-42", Token::Integer(-42)),
+            (integer, b"0", Token::Integer(0)),
+            (float, b"3.14", Token::Float(3.14)),
+            (float, b"-3.14", Token::Float(-3.14)),
+            (float, b"1.5E-10", Token::Float(1.5e-10)),
+            (enum_value, b".TRUE.", Token::Enum(b"TRUE")),
+            (enum_value, b".FALSE.", Token::Enum(b"FALSE")),
+            (enum_value, b".ELEMENT.", Token::Enum(b"ELEMENT")),
+        ];
+        for (parse, input, expected) in cases {
+            assert_eq!(
+                parse(input),
+                Ok((&b""[..], expected.clone())),
+                "tokenizing {input:?}"
+            );
+        }
     }
 
     #[test]
     fn test_list() {
-        let result = list("(1,2,3)");
+        let result = list(b"(1,2,3)");
         assert!(result.is_ok());
         let (_, token) = result.unwrap();
         match token {
@@ -557,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_nested_list() {
-        let result = list("(1,(2,3),4)");
+        let result = list(b"(1,(2,3),4)");
         assert!(result.is_ok());
         let (_, token) = result.unwrap();
         match token {
@@ -594,7 +789,7 @@ mod tests {
         // First test: simple list (should work)
         let simple = "(0.,0.,1.)";
         println!("Testing simple list: {}", simple);
-        let simple_result = list(simple);
+        let simple_result = list(simple.as_bytes());
         println!("Simple list result: {:?}", simple_result);
 
         // Second test: nested in entity (what's failing)
@@ -608,7 +803,7 @@ mod tests {
             // Try parsing just the arguments part
             println!("\nTrying to parse just arguments: ((0.,0.,1.))");
             let args_input = "((0.,0.,1.))";
-            let args_result = list(args_input);
+            let args_result = list(args_input.as_bytes());
             println!("Args list result: {:?}", args_result);
         }
 
@@ -653,5 +848,135 @@ mod tests {
         assert_eq!(counts.get("IFCPROJECT"), Some(&1));
         assert_eq!(counts.get("IFCWALL"), Some(&2));
         assert_eq!(counts.get("IFCDOOR"), Some(&1));
+    }
+
+    /// Regression for issue #654: CATIA exports a FILE_NAME whose first
+    /// argument contains a literal `#` inside the quoted string (the encoded
+    /// filename `'…\X0\2#.ifc'`). The scanner used to latch onto that `#`,
+    /// flip `find_entity_end`'s quote parity at the closing `'`, and silently
+    /// drop every entity in the file.
+    #[test]
+    fn test_entity_scanner_hash_in_header_filename() {
+        let content = "ISO-10303-21;\nHEADER;\n\
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('26-IFC\\X2\\00B1\\X0\\2#.ifc','2026-04-29T18:21:27',$,$,'CATIA','CATIA',$);\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
+DATA;\n\
+#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\n\
+#2=IFCWALL('guid2',$,$,$,$,$,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+        let mut scanner = EntityScanner::new(content);
+        let counts = scanner.count_by_type();
+        assert_eq!(counts.get("IFCPROJECT"), Some(&1));
+        assert_eq!(counts.get("IFCWALL"), Some(&1));
+    }
+
+    /// Files without a DATA; marker (partial fragments, test fixtures) must
+    /// still scan from offset 0 — the HEADER-skip is best-effort.
+    #[test]
+    fn test_entity_scanner_no_header() {
+        let content = "#1=IFCWALL('guid',$,$,$,$,$,$,$);\n";
+        let mut scanner = EntityScanner::new(content);
+        let (id, type_name, _, _) = scanner.next_entity().unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(type_name, "IFCWALL");
+    }
+
+    /// HEADER fields are free-form strings — a description, comment, or
+    /// embedded filename could legally contain the literal text `DATA;`.
+    /// The seek must ignore matches inside quoted strings and land on the
+    /// real section marker.
+    #[test]
+    fn test_entity_scanner_data_marker_inside_header_string() {
+        let content = "ISO-10303-21;\nHEADER;\n\
+FILE_DESCRIPTION(('section DATA; in description'),'2;1');\n\
+FILE_NAME('weird DATA; name.ifc','2026-04-29T18:21:27',$,$,'a','b',$);\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
+DATA;\n\
+#1=IFCWALL('guid',$,$,$,$,$,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+        let mut scanner = EntityScanner::new(content);
+        let counts = scanner.count_by_type();
+        assert_eq!(counts.get("IFCWALL"), Some(&1));
+        // Confirm we landed at the real DATA;, not the one in the description.
+        let pos = scanner.position();
+        assert!(pos == content.len() || pos > content.find("ENDSEC;").unwrap());
+    }
+
+    /// Escaped single quotes (`''`) keep the string open per ISO 10303-21.
+    #[test]
+    fn test_entity_scanner_escaped_quote_in_header() {
+        let content = "ISO-10303-21;\nHEADER;\n\
+FILE_DESCRIPTION(('it''s fine: DATA; inside'),'2;1');\n\
+FILE_NAME('a','b',$,$,'c','d',$);\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
+DATA;\n\
+#7=IFCDOOR('guid',$,$,$,$,$,$,$);\n\
+ENDSEC;\n";
+
+        let mut scanner = EntityScanner::new(content);
+        let counts = scanner.count_by_type();
+        assert_eq!(counts.get("IFCDOOR"), Some(&1));
+    }
+
+    /// Deeply nested list arguments must return an error rather than
+    /// recursing through the stack until it overflows.
+    #[test]
+    fn test_parse_entity_rejects_excessive_nesting() {
+        let n = (MAX_NESTING_DEPTH as usize) + 64;
+        let mut s = String::from("#1=IFCWALL(");
+        for _ in 0..n {
+            s.push('(');
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push(')');
+        }
+        s.push_str(");");
+        // Must not panic / overflow; must return Err.
+        assert!(parse_entity(&s).is_err());
+    }
+
+    /// Moderate nesting still parses successfully.
+    #[test]
+    fn test_parse_entity_accepts_moderate_nesting() {
+        let n = 32;
+        let mut s = String::from("#1=IFCWALL(");
+        for _ in 0..n {
+            s.push('(');
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push(')');
+        }
+        s.push_str(");");
+        assert!(parse_entity(&s).is_ok());
+    }
+
+    fn nested(n: usize) -> String {
+        let mut s = String::from("#1=IFCWALL(");
+        for _ in 0..n {
+            s.push('(');
+        }
+        s.push('1');
+        for _ in 0..n {
+            s.push(')');
+        }
+        s.push_str(");");
+        s
+    }
+
+    /// Boundary: parsing succeeds exactly at MAX_NESTING_DEPTH.
+    #[test]
+    fn test_parse_entity_accepts_exactly_max_nesting() {
+        assert!(parse_entity(&nested(MAX_NESTING_DEPTH as usize)).is_ok());
+    }
+
+    /// Boundary: parsing fails at MAX_NESTING_DEPTH + 1.
+    #[test]
+    fn test_parse_entity_rejects_one_over_max_nesting() {
+        assert!(parse_entity(&nested(MAX_NESTING_DEPTH as usize + 1)).is_err());
     }
 }

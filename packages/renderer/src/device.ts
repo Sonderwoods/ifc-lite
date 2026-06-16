@@ -16,6 +16,9 @@ export class WebGPUDevice {
   private lastHeight: number = 0;
   private contextConfigured: boolean = false;
   private frameCount: number = 0;
+  /** Async GPU validation errors (not caught by try-catch) */
+  _uncapturedErrorCount: number = 0;
+  _lastUncapturedError: string = '';
 
   /**
    * Initialize WebGPU device and canvas context
@@ -38,6 +41,14 @@ export class WebGPUDevice {
     if (!this.context) {
       throw new Error('Failed to get WebGPU context');
     }
+
+    // Capture async GPU errors (validation errors from submit() are async)
+    this.device.onuncapturederror = (event) => {
+      const msg = event.error?.message ?? String(event);
+      console.error('[WebGPU] Uncaptured error:', msg);
+      this._lastUncapturedError = msg;
+      this._uncapturedErrorCount++;
+    };
 
     // Handle device lost - mark context as needing reconfiguration
     // Use type assertion as 'lost' may not be in all WebGPU type definitions
@@ -132,6 +143,15 @@ export class WebGPUDevice {
       throw new Error('Device not initialized');
     }
     return this.device;
+  }
+
+  /**
+   * Max 2D texture dimension reported by the GPU adapter. WebGPU's spec floor is 8192;
+   * iGPUs and most desktop GPUs report 8192 or 16384. Render targets / depth textures
+   * must not exceed this in either axis or the device fails validation.
+   */
+  getMaxTextureDimension(): number {
+    return this.device?.limits?.maxTextureDimension2D ?? 8192;
   }
 
   getContext(): GPUCanvasContext {

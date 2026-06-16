@@ -19,7 +19,7 @@ import { useIfc } from '@/hooks/useIfc';
 import { useWebGPU } from '@/hooks/useWebGPU';
 import { useViewerStore } from '@/store';
 import { toGlobalIdFromModels } from '@/store/globalId';
-import { parseUrlParams } from '../bridge/urlParams.js';
+import { parseUrlParams, assertFetchableUrl } from '../bridge/urlParams.js';
 import { initBridge, destroyBridge, emitEvent } from '../bridge/handler.js';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
 
@@ -38,9 +38,11 @@ export function EmbedViewer() {
   const bridgeInitialized = useRef(false);
   const autoLoadAttempted = useRef(false);
 
-  // Apply URL params on mount
+  // Apply URL params on mount. Embeds default to light unless ?theme=dark
+  // (the surrounding viewer-core store may bootstrap to dark based on system
+  // preference, which is wrong for a third-party iframe with no chrome).
   useEffect(() => {
-    if (urlParams.theme) setTheme(urlParams.theme);
+    setTheme(urlParams.theme === 'dark' ? 'dark' : 'light');
   }, [urlParams.theme, setTheme]);
 
   // Initialize the postMessage bridge
@@ -48,10 +50,27 @@ export function EmbedViewer() {
     if (bridgeInitialized.current) return;
     bridgeInitialized.current = true;
 
+    // Derive the expected parent origin (so content-bearing auto-load events
+    // are not broadcast to '*' before any inbound command arrives): prefer the
+    // explicit ?parentOrigin= param, then fall back to the referrer's origin.
+    let expectedParentOrigin = urlParams.parentOrigin;
+    if (!expectedParentOrigin && document.referrer) {
+      try {
+        expectedParentOrigin = new URL(document.referrer).origin;
+      } catch (error) {
+        // Malformed referrer — leave undefined and rely on the inbound handshake.
+        console.warn('[embed] Failed to derive parent origin from document.referrer', document.referrer, error);
+        expectedParentOrigin = undefined;
+      }
+    }
+
     initBridge({
       getState: () => useViewerStore.getState(),
       loadModelFromUrl: async (url: string) => {
-        const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+        // Enforce the same http(s)-only allowlist as the URL-param path so the
+        // postMessage bridge can't be steered to file:/data:/internal targets.
+        const safeUrl = assertFetchableUrl(url);
+        const response = await fetch(safeUrl, { signal: AbortSignal.timeout(60_000) });
         if (!response.ok) throw new Error(`Failed to fetch model: ${response.statusText}`);
         const buffer = await response.arrayBuffer();
         const filename = url.split('/').pop() || 'model.ifc';
@@ -76,10 +95,13 @@ export function EmbedViewer() {
           vertices: gr?.totalVertices ?? 0,
         };
       },
+    }, {
+      allowedOrigins: urlParams.allowOrigins,
+      expectedParentOrigin,
     });
 
     return () => destroyBridge();
-  }, [loadFile]);
+  }, [loadFile, urlParams.allowOrigins, urlParams.parentOrigin]);
 
   // Auto-load model from URL param
   useEffect(() => {
@@ -116,16 +138,57 @@ export function EmbedViewer() {
     }
   }, [progress]);
 
-  // Emit model loaded event
+  // Emit model loaded event + auto-fit camera on the first model that lands.
+  // Unlike the full viewer (which has toolbar buttons for fit-all and a default
+  // load flow that fits), the embed has no chrome — so without an explicit fit
+  // call the camera stays at its initial position and the model renders off-frame.
+  // We only fit on the *first* successful load so host-driven SET_CAMERA / view
+  // params via the bridge aren't immediately overridden.
+  const autoFittedRef = useRef(false);
   useEffect(() => {
-    if (!loading && geometryResult?.meshes?.length) {
-      emitEvent('MODEL_LOADED', {
-        entities: ifcDataStore?.entities?.count ?? 0,
-        triangles: geometryResult.totalTriangles,
-        vertices: geometryResult.totalVertices,
-      });
-    }
-  }, [loading, geometryResult, ifcDataStore]);
+    if (loading) return;
+    const meshes = geometryResult?.meshes;
+    if (!meshes || meshes.length === 0) return;
+
+    emitEvent('MODEL_LOADED', {
+      entities: ifcDataStore?.entities?.count ?? 0,
+      triangles: geometryResult.totalTriangles,
+      vertices: geometryResult.totalVertices,
+    });
+
+    if (autoFittedRef.current) return;
+
+    // Viewport registers cameraCallbacks AFTER renderer.init() resolves (async).
+    // On a fast network + small model, geometry can land before that happens.
+    // Poll for up to ~2 s, checking each frame, then bail out so we never leak.
+    autoFittedRef.current = true;
+    const deadline = performance.now() + 2000;
+    let rafId = 0;
+    const tryFit = () => {
+      const cbs = useViewerStore.getState().cameraCallbacks;
+      const ready = Boolean(cbs.home || cbs.fitAll || cbs.setPresetView);
+      if (!ready) {
+        if (performance.now() < deadline) {
+          rafId = requestAnimationFrame(tryFit);
+        } else {
+          console.warn('[embed] auto-fit gave up — cameraCallbacks never registered');
+        }
+        return;
+      }
+      // Honour ?view= / ?camera= URL params first; only auto-fit if neither was set.
+      if (urlParams.view) {
+        cbs.setPresetView?.(urlParams.view);
+      } else if (urlParams.camera) {
+        // ?camera= is handled elsewhere — nothing to do here.
+      } else if (cbs.home) {
+        cbs.home();
+      } else if (cbs.fitAll) {
+        cbs.fitAll();
+      }
+    };
+    rafId = requestAnimationFrame(tryFit);
+    return () => cancelAnimationFrame(rafId);
+  }, [loading, geometryResult, ifcDataStore, urlParams.view, urlParams.camera]);
 
   // Emit selection events to parent
   const selectedEntityId = useViewerStore((s) => s.selectedEntityId);

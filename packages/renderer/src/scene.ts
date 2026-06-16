@@ -6,7 +6,7 @@
  * Scene graph and mesh management
  */
 
-import type { Mesh, InstancedMesh, BatchedMesh, Vec3 } from './types.js';
+import type { Mesh, BatchedMesh, Vec3 } from './types.js';
 import type { MeshData } from '@ifc-lite/geometry';
 import type { RenderPipeline } from './pipeline.js';
 import { BATCH_CONSTANTS } from './constants.js';
@@ -27,14 +27,50 @@ interface BatchBucket {
   vertexBytes: number;              // accumulated vertex buffer bytes
 }
 
+/**
+ * Release the GPU resources owned by a batch / mesh. Every
+ * BatchedMesh and Mesh shares the same {vertex, index, optional
+ * uniform} buffer layout, and forgetting any one of the three is a
+ * GPU memory leak that won't surface until the user spends ten
+ * minutes inside the viewer. Centralised here so callers don't
+ * have to remember the cleanup sequence.
+ *
+ * Accepts the structural shape so it works for both BatchedMesh and
+ * Mesh — they each carry the same buffer trio.
+ */
+/** A surface-textured mesh (#961): its own interleaved vertex buffer (with a UV
+ *  lane), index buffer, per-mesh uniform buffer, GPU texture + sampler, and a
+ *  bindGroup wiring all three. Drawn per-mesh in a dedicated sub-pass. */
+export interface TexturedMesh {
+  expressId: number;
+  vertexBuffer: GPUBuffer;
+  indexBuffer: GPUBuffer;
+  indexCount: number;
+  uniformBuffer: GPUBuffer;
+  texture: GPUTexture;
+  sampler: GPUSampler;
+  bindGroup: GPUBindGroup;
+  /** Authored tint (multiplies the sampled texel); white = texture passthrough. */
+  color: [number, number, number, number];
+}
+
+function destroyGpuResources(
+  m: { vertexBuffer: GPUBuffer; indexBuffer: GPUBuffer; uniformBuffer?: GPUBuffer },
+): void {
+  m.vertexBuffer.destroy();
+  m.indexBuffer.destroy();
+  if (m.uniformBuffer) m.uniformBuffer.destroy();
+}
+
 export class Scene {
   private meshes: Mesh[] = [];
-  private instancedMeshes: InstancedMesh[] = [];
   private batchedMeshes: BatchedMesh[] = [];                        // flat render array (rebuilt from buckets)
   private buckets: Map<string, BatchBucket> = new Map();            // bucketKey -> consolidated bucket state
   private meshDataBucket: Map<MeshData, BatchBucket> = new Map();   // reverse lookup: MeshData -> owning bucket
   private meshDataMap: Map<number, MeshData[]> = new Map();         // Map expressId -> MeshData[] (for lazy buffer creation, accumulates multiple pieces)
   private boundingBoxes: Map<number, BoundingBox> = new Map();      // Map expressId -> bounding box (computed lazily)
+  private texturedMeshes: TexturedMesh[] = [];                      // #961: IFC surface-textured meshes (own buffers/texture/bindGroup)
+  private texturedDevice?: GPUDevice;                               // #961: cached for textured-mesh re-upload on translate
 
   // Buffer-size-aware bucket splitting: when a single color group's geometry
   // would exceed the GPU maxBufferSize, overflow is directed to a new
@@ -43,6 +79,11 @@ export class Scene {
   private activeBucketKey: Map<string, string> = new Map(); // base colorKey -> current active bucket key
   private nextSplitId: number = 0; // Monotonic counter for sub-bucket keys
   private nextBatchId: number = 0; // Monotonic counter for unique batch identifiers
+  // Shared local-frame origin for ALL batches (set from the first batch's world
+  // bbox centre). Every batch stores positions relative to it and draws with
+  // model = translate(sharedFrameOrigin), so coincident faces across batches
+  // stay bit-coincident (no seam z-fight) while f32 vertex coords stay small.
+  private sharedFrameOrigin: [number, number, number] | null = null;
   private cachedMaxBufferSize: number = 0; // device.limits.maxBufferSize * safety factor (set on first use)
   private static readonly STREAMING_FRAGMENT_MAX_INDICES = 180_000;
   private static readonly STREAMING_FRAGMENT_MAX_VERTEX_BYTES = 8 * 1024 * 1024;
@@ -57,7 +98,9 @@ export class Scene {
   // Overlay batches render on top using depthCompare 'equal', so they only
   // paint where original geometry already wrote depth. Clearing is instant.
   private overrideBatches: BatchedMesh[] = [];
-  private colorOverrides: Map<number, [number, number, number, number]> | null = null;
+  // Defensively-typed: the renderer is the sole writer (via setColorOverrides),
+  // external readers go through getColorOverrides() and get a ReadonlyMap.
+  private colorOverrides: ReadonlyMap<number, readonly [number, number, number, number]> | null = null;
 
   // Streaming optimization: track pending batch rebuilds
   private pendingBatchKeys: Set<string> = new Set();
@@ -87,13 +130,6 @@ export class Scene {
   }
 
   /**
-   * Add instanced mesh to scene
-   */
-  addInstancedMesh(mesh: InstancedMesh): void {
-    this.instancedMeshes.push(mesh);
-  }
-
-  /**
    * Get all meshes
    */
   getMeshes(): Mesh[] {
@@ -101,17 +137,17 @@ export class Scene {
   }
 
   /**
-   * Get all instanced meshes
-   */
-  getInstancedMeshes(): InstancedMesh[] {
-    return this.instancedMeshes;
-  }
-
-  /**
    * Get all batched meshes
    */
   getBatchedMeshes(): BatchedMesh[] {
     return this.batchedMeshes;
+  }
+
+  /** The shared local-frame origin all batches relativize against (null until
+   *  the first batch is built). Per-mesh highlight/picker VBOs replicate the
+   *  batch's exact f32 path against this so they render bit-coincident. */
+  getSharedFrameOrigin(): [number, number, number] | null {
+    return this.sharedFrameOrigin;
   }
 
   /**
@@ -319,6 +355,10 @@ export class Scene {
       normals: outNorm,
       indices: new Uint32Array(tmpIdx),
       color: merged.color,
+      // Extracted vertices are copied verbatim from the merged mesh's local
+      // frame, so carry its origin forward (world = origin + position) — else
+      // raycast/highlight/snap would treat these local coords as world.
+      origin: merged.origin,
     };
   }
 
@@ -334,6 +374,27 @@ export class Scene {
    * Get all MeshData pieces for an expressId (without merging).
    * Optionally filter by modelIndex for multi-model safety.
    */
+  /**
+   * Iterate every CPU-side `MeshData` the scene holds — every piece
+   * for every expressId across every model. Used by the BIM ↔ scan
+   * deviation BVH builder which needs world-space triangle positions
+   * regardless of which IFC ingest path they came from.
+   *
+   * Deduplicates by `MeshData` identity: a colour-merged batch is
+   * stored under every contributor's expressId, and visiting it
+   * multiple times would double-count its triangles in the BVH.
+   */
+  forEachMeshData(visit: (md: MeshData) => void): void {
+    const seen = new Set<MeshData>();
+    for (const pieces of this.meshDataMap.values()) {
+      for (const piece of pieces) {
+        if (seen.has(piece)) continue;
+        seen.add(piece);
+        visit(piece);
+      }
+    }
+  }
+
   getMeshDataPieces(expressId: number, modelIndex?: number): MeshData[] | undefined {
     let pieces = this.meshDataMap.get(expressId);
     if (!pieces || pieces.length === 0) return undefined;
@@ -390,8 +451,26 @@ export class Scene {
 
     const retainStreamingGeometry = !(isStreaming && this.ephemeralStreamingMode);
 
+    // #961: divert meshes carrying an IFC surface texture to the dedicated
+    // textured pipeline. They have no single colour, so they must be kept out
+    // of BOTH the colour buckets AND the streaming-fragment path below —
+    // otherwise a flat-colour copy would be drawn over the texture. Still
+    // register them in meshDataMap (addMeshData) so CPU picking/bbox/frame work.
+    let renderable = meshDataArray;
+    if (meshDataArray.some((m) => m.texture && m.uvs)) {
+      renderable = [];
+      for (const meshData of meshDataArray) {
+        if (meshData.texture && meshData.uvs) {
+          this.createTexturedMesh(meshData, device, pipeline);
+          this.addMeshData(meshData);
+        } else {
+          renderable.push(meshData);
+        }
+      }
+    }
+
     // Route each mesh into a size-aware bucket for its color
-    for (const meshData of meshDataArray) {
+    for (const meshData of renderable) {
       const baseKey = this.colorKey(meshData.color);
       const bucketKey = this.resolveActiveBucket(baseKey, meshData);
 
@@ -423,7 +502,8 @@ export class Scene {
       // STREAMING: Create small fragment batches from ONLY the new meshes.
       // Avoids the O(N²) cost of re-merging all accumulated data every batch.
       // finalizeStreaming() destroys fragments and does one O(N) full merge.
-      this.createStreamingFragments(meshDataArray, device, pipeline);
+      // `renderable` excludes textured meshes (drawn via the textured pipeline).
+      this.createStreamingFragments(renderable, device, pipeline);
       return;
     }
 
@@ -446,11 +526,7 @@ export class Scene {
 
       // Destroy old GPU batch if it exists
       if (bucket?.batchedMesh) {
-        bucket.batchedMesh.vertexBuffer.destroy();
-        bucket.batchedMesh.indexBuffer.destroy();
-        if (bucket.batchedMesh.uniformBuffer) {
-          bucket.batchedMesh.uniformBuffer.destroy();
-        }
+        destroyGpuResources(bucket.batchedMesh);
         bucket.batchedMesh = null;
       }
 
@@ -484,6 +560,227 @@ export class Scene {
     return this.pendingBatchKeys.size > 0;
   }
 
+  /**
+   * Remove every mesh registered for `expressId` from the scene.
+   * Affected buckets are marked for rebuild on the next call to
+   * `rebuildPendingBatches`, so the GPU drops them on the next
+   * frame. Returns `true` when at least one mesh was removed.
+   *
+   * Used by the viewer's authoring actions (split, delete) to
+   * make tombstoned IFC entities disappear from the rendered
+   * scene — the previous v1 workaround was to hide them via
+   * `hiddenIds`, but that left the mesh in GPU memory and inside
+   * raycast bounds. This is the proper removal path.
+   *
+   * Notes:
+   *   - For color-merged meshes (the `entityIds` per-vertex case)
+   *     a single MeshData often hosts many entities. We do NOT
+   *     drop the whole mesh in that case — that would also remove
+   *     the other entities — but we DO clear the bbox + meshDataMap
+   *     for the requested expressId, so picking and selection stop
+   *     finding the removed entity. Re-rendering the merged mesh
+   *     unchanged is the right behaviour because color-merged
+   *     batches are an optimisation: the geometry is still real;
+   *     the IFC tombstone just means we ignore it for queries.
+   */
+  removeMeshesForEntity(expressId: number): boolean {
+    const meshDataList = this.meshDataMap.get(expressId);
+    if (!meshDataList || meshDataList.length === 0) {
+      this.boundingBoxes.delete(expressId);
+      return false;
+    }
+
+    // Track which buckets need re-batching so we don't repeatedly
+    // mark the same key.
+    const affectedKeys = new Set<string>();
+    // Separate "did we remove anything dedicated?" from "did any
+    // bucket need rebatching?" — a dedicated mesh that's mid-stream
+    // and not yet bucketed still counts as a removal for the
+    // caller's bulk-count contract.
+    let removedDedicated = false;
+
+    for (const meshData of meshDataList) {
+      // Color-merged path: shared mesh, keep it but drop our entry.
+      if (meshData.entityIds && meshData.entityIds.length > 0) {
+        continue;
+      }
+      removedDedicated = true;
+
+      // Dedicated mesh — drop from its bucket and decrement the
+      // bucket's vertexBytes counter so subsequent
+      // resolveActiveBucket calls see the updated size and don't
+      // unnecessarily split it.
+      const bucket = this.meshDataBucket.get(meshData);
+      if (bucket) {
+        const idx = bucket.meshData.indexOf(meshData);
+        if (idx >= 0) {
+          bucket.meshData.splice(idx, 1);
+          // Match the byte-accounting `splitMeshForStreaming` uses
+          // (positions + normals). Without this, the bucket's size
+          // estimate stays inflated after removal and
+          // `resolveActiveBucket` may force unnecessary splits on
+          // subsequent inserts.
+          const bytes = meshData.positions.byteLength + meshData.normals.byteLength;
+          bucket.vertexBytes = Math.max(0, bucket.vertexBytes - bytes);
+        }
+        affectedKeys.add(bucket.key);
+      }
+      this.meshDataBucket.delete(meshData);
+    }
+
+    this.meshDataMap.delete(expressId);
+    this.boundingBoxes.delete(expressId);
+
+    // #961: textured meshes own GPU buffers outside the colour buckets, so the
+    // bucket cleanup above never touches them. Destroy + drop them here or a
+    // deleted textured entity keeps rendering (and leaks its GPU texture).
+    for (let i = this.texturedMeshes.length - 1; i >= 0; i--) {
+      const tm = this.texturedMeshes[i];
+      if (tm.expressId !== expressId) continue;
+      tm.vertexBuffer.destroy();
+      tm.indexBuffer.destroy();
+      tm.uniformBuffer.destroy();
+      tm.texture.destroy();
+      this.texturedMeshes.splice(i, 1);
+      removedDedicated = true;
+    }
+
+    for (const key of affectedKeys) {
+      this.pendingBatchKeys.add(key);
+    }
+    // Also drop the entity's standalone selection-highlight meshes — they're not
+    // in the buckets and would otherwise linger after a delete/split (same ghost
+    // class as a move).
+    this.evictHighlightMeshes(expressId);
+    // True when at least one dedicated mesh was removed — covers
+    // the case where a mesh was queued but not yet bucketed.
+    return removedDedicated;
+  }
+
+  /**
+   * Bulk variant of `removeMeshesForEntity`. Avoids re-marking the
+   * same bucket key once per entity in the common "split N walls"
+   * batch. Returns the number of entities that had at least one
+   * dedicated mesh removed.
+   */
+  removeMeshesForEntities(expressIds: Iterable<number>): number {
+    let count = 0;
+    for (const id of expressIds) {
+      if (this.removeMeshesForEntity(id)) count++;
+    }
+    return count;
+  }
+
+  /**
+   * Translate every mesh for `expressId` by `delta` in renderer
+   * world frame (Y-up). Modifies `positions` in place and marks
+   * the affected bucket(s) for re-batch on the next call to
+   * `rebuildPendingBatches`.
+   *
+   * Bounding boxes are cleared for the entity so the next bounds
+   * query recomputes from the new positions; raycast bounds will
+   * therefore lag by exactly one query, which is acceptable for
+   * the drag-end → fresh-pick interaction the gizmo drives.
+   *
+   * Returns `true` when at least one mesh was modified. Used by
+   * the viewer's `translateEntity` action to keep the rendered
+   * mesh in sync with the IFC coords mutation.
+   *
+   * Color-merged meshes (shared by many entities via per-vertex
+   * `entityIds`) cannot be translated for a single entity without
+   * walking the entityIds array vertex by vertex; this helper
+   * skips them and returns `false` so the caller can fall back
+   * to a full reload if needed.
+   */
+  translateMeshesForEntity(expressId: number, delta: [number, number, number]): boolean {
+    const meshDataList = this.meshDataMap.get(expressId);
+    if (!meshDataList || meshDataList.length === 0) return false;
+    const [dx, dy, dz] = delta;
+    if (dx === 0 && dy === 0 && dz === 0) return false;
+
+    const affectedKeys = new Set<string>();
+    let anyMoved = false;
+    for (const meshData of meshDataList) {
+      // Skip a genuinely shared color-merged mesh — one whose vertices belong to
+      // MORE than this entity — because translating it would drag the others too.
+      // An authored single-entity mesh (slab/space/wall added in-session) tags
+      // EVERY vertex with its own id for picking; all-same-id is safe to move, so
+      // only bail when a foreign id is present (was: skip on any entityIds at all,
+      // which froze authored elements under the gizmo even though their placement
+      // and bbox resolved fine).
+      if (meshData.entityIds && meshData.entityIds.length > 0) {
+        let shared = false;
+        for (let i = 0; i < meshData.entityIds.length; i++) {
+          if (meshData.entityIds[i] !== expressId) { shared = true; break; }
+        }
+        if (shared) continue;
+      }
+      const pos = meshData.positions;
+      for (let i = 0; i < pos.length; i += 3) {
+        pos[i] += dx;
+        pos[i + 1] += dy;
+        pos[i + 2] += dz;
+      }
+      const bucket = this.meshDataBucket.get(meshData);
+      if (bucket) affectedKeys.add(bucket.key);
+      anyMoved = true;
+    }
+    if (!anyMoved) return false;
+
+    // #961: a textured mesh's GPU vertex buffer lives outside the colour buckets,
+    // so the in-place position translation above won't reach the GPU on its own —
+    // re-interleave + re-upload the moved textured parts (paired by expressId,
+    // in creation order). Without this a moved textured entity renders stale.
+    if (this.texturedDevice && this.texturedMeshes.length > 0) {
+      const texturedData = meshDataList.filter((md) => md.texture && md.uvs);
+      if (texturedData.length > 0) {
+        const entries = this.texturedMeshes.filter((tm) => tm.expressId === expressId);
+        for (let i = 0; i < entries.length && i < texturedData.length; i++) {
+          const interleaved = this.interleaveTexturedVertices(texturedData[i]);
+          if (interleaved) {
+            this.texturedDevice.queue.writeBuffer(entries[i].vertexBuffer, 0, interleaved);
+          }
+        }
+      }
+    }
+
+    this.boundingBoxes.delete(expressId);
+    // The per-entity selection-highlight meshes in `this.meshes` are frozen
+    // position copies made at selection time and are otherwise only cleared by
+    // clear() — so a moved-while-selected entity (the gizmo holds the selection
+    // through the drag) keeps drawing its highlight at the OLD position: a ghost.
+    // Evict them so the highlight re-extracts from the moved geometry next frame.
+    this.evictHighlightMeshes(expressId);
+    for (const key of affectedKeys) {
+      this.pendingBatchKeys.add(key);
+    }
+    return true;
+  }
+
+  /** Drop the per-entity selection-highlight meshes for `expressId` (frozen
+   *  copies in `this.meshes`) + free their GPU buffers, so the highlight is
+   *  rebuilt from the entity's current geometry on the next render. Used after a
+   *  translate or removal, which mutate the underlying geometry but don't touch
+   *  these standalone highlight meshes. */
+  private evictHighlightMeshes(expressId: number): void {
+    if (this.meshes.length === 0) return;
+    const kept: Mesh[] = [];
+    for (const mesh of this.meshes) {
+      if (mesh.expressId === expressId) destroyGpuResources(mesh);
+      else kept.push(mesh);
+    }
+    this.meshes = kept;
+  }
+
+  /** Bulk variant of `translateMeshesForEntity`. */
+  translateMeshesForEntities(updates: Map<number, [number, number, number]>): number {
+    let count = 0;
+    for (const [id, delta] of updates) {
+      if (this.translateMeshesForEntity(id, delta)) count++;
+    }
+    return count;
+  }
+
   // ─── Mesh command queue ──────────────────────────────────────────────
 
   /**
@@ -505,6 +802,22 @@ export class Scene {
     return this.meshQueueReadIndex < this.meshQueue.length;
   }
 
+  /** True while un-finalised streaming fragments are still being drawn. An
+   *  element appended during streaming (e.g. an authored IfcSpace) renders as
+   *  such a fragment AND accumulates in its colour bucket; once the bucket is
+   *  re-batched (e.g. by a move) the fragment becomes a stale duplicate, so the
+   *  caller should `finalizeStreaming` to merge fragments away. */
+  hasStreamingFragments(): boolean {
+    return this.streamingFragments.length > 0;
+  }
+
+  /** True when streaming runs in ephemeral mode (huge files) — fragments render
+   *  directly from GPU and geometry is NOT retained for re-batch, so callers
+   *  must NOT finalize (there's nothing to rebuild the batches from). */
+  isEphemeralStreaming(): boolean {
+    return this.ephemeralStreamingMode;
+  }
+
   setEphemeralStreamingMode(enabled: boolean): void {
     this.ephemeralStreamingMode = enabled;
   }
@@ -519,28 +832,49 @@ export class Scene {
   flushPending(device: GPUDevice, pipeline: RenderPipeline): boolean {
     if (!this.hasQueuedMeshes()) return false;
 
-    // Drain the queue in moderately sized chunks instead of one mesh at a time.
-    // This preserves the per-frame time budget while cutting appendToBatches()
-    // overhead and front-of-array churn during huge desktop streams.
+    // Drain the queue in chunks bounded by BOTH mesh count AND triangle volume,
+    // yielding the frame back at the TOP of the loop. The mesh-count-only chunker
+    // could merge a 512-mesh chunk of high-poly meshes (e.g. 899 Velux roof
+    // windows at 7624 tris each → ~3.9M tris) in ONE indivisible mergeGeometry +
+    // mappedAtCreation buffer copy — hundreds of ms that parked the main thread
+    // past the 16s stream watchdog. Capping each appendToBatches by index volume
+    // keeps every synchronous slice ≈ one bounded fragment merge (~12-15ms).
     const MAX_MESHES_PER_FLUSH = 4096;
     const MESHES_PER_APPEND = 512;
+    const MAX_INDICES_PER_APPEND = Scene.STREAMING_FRAGMENT_MAX_INDICES;
     const FLUSH_BUDGET_MS = 12;
     const start = performance.now();
     let processed = 0;
 
     while (this.meshQueueReadIndex < this.meshQueue.length && processed < MAX_MESHES_PER_FLUSH) {
-      const chunkSize = Math.min(
-        MESHES_PER_APPEND,
-        MAX_MESHES_PER_FLUSH - processed,
-        this.meshQueue.length - this.meshQueueReadIndex,
-      );
-      const chunk = this.meshQueue.slice(this.meshQueueReadIndex, this.meshQueueReadIndex + chunkSize);
-      this.meshQueueReadIndex += chunkSize;
-      this.appendToBatches(chunk, device, pipeline, true);
-      processed += chunk.length;
-      if (processed >= MESHES_PER_APPEND && performance.now() - start >= FLUSH_BUDGET_MS) {
+      // Yield once the budget is spent (after at least one append) so the main
+      // thread returns to the worker-message pump and the watchdog never trips.
+      if (processed > 0 && performance.now() - start >= FLUSH_BUDGET_MS) {
         break;
       }
+
+      const hardEnd = Math.min(
+        this.meshQueue.length,
+        this.meshQueueReadIndex + MESHES_PER_APPEND,
+        this.meshQueueReadIndex + (MAX_MESHES_PER_FLUSH - processed),
+      );
+      let chunkEnd = this.meshQueueReadIndex;
+      let chunkIndices = 0;
+      while (chunkEnd < hardEnd) {
+        const next = this.meshQueue[chunkEnd].indices.length;
+        // Always take at least one mesh (a single oversize mesh is split upstream
+        // by splitMeshForStreaming); otherwise stop before exceeding the cap.
+        if (chunkEnd > this.meshQueueReadIndex && chunkIndices + next > MAX_INDICES_PER_APPEND) {
+          break;
+        }
+        chunkIndices += next;
+        chunkEnd++;
+      }
+
+      const chunk = this.meshQueue.slice(this.meshQueueReadIndex, chunkEnd);
+      this.meshQueueReadIndex = chunkEnd;
+      this.appendToBatches(chunk, device, pipeline, true);
+      processed += chunk.length;
     }
 
     if (this.meshQueueReadIndex >= this.meshQueue.length) {
@@ -636,6 +970,9 @@ export class Scene {
         normals: new Float32Array(normals),
         indices,
         color: meshData.color,
+        // Fragments are subsets of the same source mesh → same local frame.
+        // Preserve origin so each fragment relativizes/renders in world space.
+        ...(meshData.origin ? { origin: meshData.origin } : {}),
       });
     }
 
@@ -677,13 +1014,7 @@ export class Scene {
     this.activeBucketKey.clear();
     this.pendingBatchKeys.clear();
     // Destroy cached partial batches — their colorKeys are now stale
-    for (const batch of this.partialBatchCache.values()) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) {
-        batch.uniformBuffer.destroy();
-      }
-    }
+    for (const batch of this.partialBatchCache.values()) destroyGpuResources(batch);
     this.partialBatchCache.clear();
     this.partialBatchCacheKeys.clear();
 
@@ -709,21 +1040,9 @@ export class Scene {
     this.rebuildPendingBatches(device, pipeline);
 
     // 5. NOW destroy old fragment/batch GPU resources (new batches are live)
-    for (const fragment of oldFragments) {
-      fragment.vertexBuffer.destroy();
-      fragment.indexBuffer.destroy();
-      if (fragment.uniformBuffer) {
-        fragment.uniformBuffer.destroy();
-      }
-    }
+    for (const fragment of oldFragments) destroyGpuResources(fragment);
     for (const batch of oldBatches) {
-      if (!fragmentSet.has(batch)) {
-        batch.vertexBuffer.destroy();
-        batch.indexBuffer.destroy();
-        if (batch.uniformBuffer) {
-          batch.uniformBuffer.destroy();
-        }
-      }
+      if (!fragmentSet.has(batch)) destroyGpuResources(batch);
     }
   }
 
@@ -767,11 +1086,7 @@ export class Scene {
     this.meshDataBucket = new Map();
     this.activeBucketKey.clear();
     this.pendingBatchKeys.clear();
-    for (const batch of this.partialBatchCache.values()) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) batch.uniformBuffer.destroy();
-    }
+    for (const batch of this.partialBatchCache.values()) destroyGpuResources(batch);
     this.partialBatchCache.clear();
     this.partialBatchCacheKeys.clear();
 
@@ -826,17 +1141,9 @@ export class Scene {
         scene.batchedMeshes = newBatches;
 
         // Destroy old fragment/batch GPU resources
-        for (const fragment of oldFragments) {
-          fragment.vertexBuffer.destroy();
-          fragment.indexBuffer.destroy();
-          if (fragment.uniformBuffer) fragment.uniformBuffer.destroy();
-        }
+        for (const fragment of oldFragments) destroyGpuResources(fragment);
         for (const batch of oldBatches) {
-          if (!fragmentSet.has(batch)) {
-            batch.vertexBuffer.destroy();
-            batch.indexBuffer.destroy();
-            if (batch.uniformBuffer) batch.uniformBuffer.destroy();
-          }
+          if (!fragmentSet.has(batch)) destroyGpuResources(batch);
         }
         resolve();
       }
@@ -861,10 +1168,14 @@ export class Scene {
 
       for (const piece of pieces) {
         const positions = piece.positions;
+        // world = origin + position (per-element local frame); bake WORLD bbox.
+        const ox = piece.origin ? piece.origin[0] : 0;
+        const oy = piece.origin ? piece.origin[1] : 0;
+        const oz = piece.origin ? piece.origin[2] : 0;
         for (let i = 0; i < positions.length; i += 3) {
-          const x = positions[i];
-          const y = positions[i + 1];
-          const z = positions[i + 2];
+          const x = positions[i] + ox;
+          const y = positions[i + 1] + oy;
+          const z = positions[i + 2] + oz;
           if (x < minX) minX = x;
           if (y < minY) minY = y;
           if (z < minZ) minZ = z;
@@ -886,11 +1197,7 @@ export class Scene {
     this.meshDataMap.clear();
     this.activeBucketKey.clear();
     this.pendingBatchKeys.clear();
-    for (const batch of this.partialBatchCache.values()) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) batch.uniformBuffer.destroy();
-    }
+    for (const batch of this.partialBatchCache.values()) destroyGpuResources(batch);
     this.partialBatchCache.clear();
     this.partialBatchCacheKeys.clear();
     this.geometryReleased = true;
@@ -934,10 +1241,14 @@ export class Scene {
 
       for (const piece of pieces) {
         const positions = piece.positions;
+        // world = origin + position (per-element local frame); bake WORLD bbox.
+        const ox = piece.origin ? piece.origin[0] : 0;
+        const oy = piece.origin ? piece.origin[1] : 0;
+        const oz = piece.origin ? piece.origin[2] : 0;
         for (let i = 0; i < positions.length; i += 3) {
-          const x = positions[i];
-          const y = positions[i + 1];
-          const z = positions[i + 2];
+          const x = positions[i] + ox;
+          const y = positions[i + 1] + oy;
+          const z = positions[i + 2] + oz;
           if (x < minX) minX = x;
           if (y < minY) minY = y;
           if (z < minZ) minZ = z;
@@ -964,11 +1275,7 @@ export class Scene {
     this.activeBucketKey.clear();
 
     // 3. Clear partial batch cache (would need mesh data to rebuild)
-    for (const batch of this.partialBatchCache.values()) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) batch.uniformBuffer.destroy();
-    }
+    for (const batch of this.partialBatchCache.values()) destroyGpuResources(batch);
     this.partialBatchCache.clear();
     this.partialBatchCacheKeys.clear();
 
@@ -1104,7 +1411,16 @@ export class Scene {
     pipeline: RenderPipeline,
     bucketKey?: string
   ): BatchedMesh {
-    const merged = this.mergeGeometry(meshDataArray);
+    // Use ONE shared scene origin for every batch (set from the first batch's
+    // world bbox centre). A per-batch origin would make abutting elements in
+    // different colour batches diverge by a few f32 ULP at building-scale world
+    // coords → seam/end-cap z-fighting. A shared origin makes every coincident
+    // world point relativize identically → no seam z-fight, and the model
+    // sits at most ±(model extent) from it (f32-precise at building scale).
+    const merged = this.mergeGeometry(meshDataArray, this.sharedFrameOrigin ?? undefined);
+    if (!this.sharedFrameOrigin && (merged.origin[0] || merged.origin[1] || merged.origin[2])) {
+      this.sharedFrameOrigin = merged.origin;
+    }
     const expressIds = meshDataArray.map(m => m.expressId);
 
     // Create vertex buffer (interleaved positions + normals)
@@ -1155,6 +1471,9 @@ export class Scene {
       bindGroup,
       uniformBuffer,
       bounds: merged.bounds,
+      // Per-batch local frame: positions are stored relative to this; the draw
+      // loop applies model = translate(origin) so they land in world space.
+      origin: merged.origin,
     };
   }
 
@@ -1163,12 +1482,13 @@ export class Scene {
    * Merge multiple mesh geometries into single vertex/index buffers.
    * Delegates to the extracted mergeGeometry() utility.
    */
-  private mergeGeometry(meshDataArray: MeshData[]): {
+  private mergeGeometry(meshDataArray: MeshData[], forcedOrigin?: [number, number, number]): {
     vertexData: Float32Array;
     indices: Uint32Array;
     bounds: { min: [number, number, number]; max: [number, number, number] };
+    origin: [number, number, number];
   } {
-    return mergeGeometry(meshDataArray);
+    return mergeGeometry(meshDataArray, forcedOrigin);
   }
 
   /**
@@ -1271,11 +1591,7 @@ export class Scene {
     if (currentCacheKey && currentCacheKey !== cacheKey) {
       const oldBatch = this.partialBatchCache.get(currentCacheKey);
       if (oldBatch) {
-        oldBatch.vertexBuffer.destroy();
-        oldBatch.indexBuffer.destroy();
-        if (oldBatch.uniformBuffer) {
-          oldBatch.uniformBuffer.destroy();
-        }
+        destroyGpuResources(oldBatch);
         this.partialBatchCache.delete(currentCacheKey);
       }
     }
@@ -1346,7 +1662,11 @@ export class Scene {
       return;
     }
 
-    this.colorOverrides = overrides;
+    // Defensive copy so external callers can mutate or reuse `overrides`
+    // without aliasing the renderer's pipeline-routing state. Tuples are
+    // frozen by the readonly type — we don't deep-clone the inner arrays
+    // because they're treated as immutable by every consumer.
+    this.colorOverrides = new Map(overrides);
 
     // Group expressIds by override color
     const colorGroups = new Map<string, { color: [number, number, number, number]; meshData: MeshData[] }>();
@@ -1396,71 +1716,156 @@ export class Scene {
     return this.overrideBatches.length > 0;
   }
 
-  /** Destroy GPU resources for overlay batches */
-  private destroyOverrideBatches(): void {
-    for (const batch of this.overrideBatches) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) {
-        batch.uniformBuffer.destroy();
-      }
-    }
-    this.overrideBatches = [];
+  /**
+   * Get the active expressId → RGBA override map, or null if none.
+   *
+   * Used by the renderer to promote overridden meshes/batches to the opaque
+   * pipeline so the overlay paint pass (depthCompare 'equal') finds matching
+   * depth. Without this, an override on an entity that defaults to the
+   * transparent pipeline (IfcSpace, IfcOpeningElement, glass, …) silently
+   * fails to paint — the transparent pipeline doesn't write depth, so the
+   * equality test rejects every fragment.
+   *
+   * Returns a `ReadonlyMap` view: the renderer holds the only writeable
+   * reference (via `setColorOverrides`) so routing decisions stay in sync
+   * with the overlay batches we built from the same data.
+   */
+  getColorOverrides(): ReadonlyMap<number, readonly [number, number, number, number]> | null {
+    return this.colorOverrides;
   }
 
-  /**
-   * Clear regular meshes only (used when converting to instanced rendering)
-   */
-  clearRegularMeshes(): void {
-    for (const mesh of this.meshes) {
-      mesh.vertexBuffer.destroy();
-      mesh.indexBuffer.destroy();
-      // Destroy per-mesh uniform buffer if it exists
-      if (mesh.uniformBuffer) {
-        mesh.uniformBuffer.destroy();
-      }
-    }
-    this.meshes = [];
+  /** Destroy GPU resources for overlay batches */
+  private destroyOverrideBatches(): void {
+    for (const batch of this.overrideBatches) destroyGpuResources(batch);
+    this.overrideBatches = [];
   }
 
   /**
    * Clear scene
    */
+  /** Textured meshes (#961) for the renderer's dedicated textured sub-pass. */
+  getTexturedMeshes(): readonly TexturedMesh[] {
+    return this.texturedMeshes;
+  }
+
+  /**
+   * Build a textured mesh (#961): interleave position+normal+entityId+uv into one
+   * vertex buffer, upload the decoded RGBA8 texture, create a sampler honouring
+   * the IFC RepeatS/RepeatT wrap, and wire a bindGroup (uniform+texture+sampler).
+   * The per-frame uniform (viewProj/section/flags + colour tint) is written by
+   * the renderer each frame, mirroring how colour batches are driven.
+   */
+  /**
+   * Interleave a textured mesh's vertices into the stride-36 layout
+   * `[px,py,pz, nx,ny,nz, entityId(u32), u,v]`. Shared by initial upload and
+   * the translate re-upload so the two can't drift. Returns null when the mesh
+   * has no texture/uvs/geometry.
+   */
+  private interleaveTexturedVertices(meshData: MeshData): ArrayBuffer | null {
+    const uvs = meshData.uvs;
+    if (!meshData.texture || !uvs) return null;
+    const positions = meshData.positions;
+    const normals = meshData.normals;
+    const vertexCount = positions.length / 3;
+    if (vertexCount === 0 || meshData.indices.length === 0) return null;
+
+    const interleaved = new ArrayBuffer(vertexCount * 36);
+    const f = new Float32Array(interleaved);
+    const u = new Uint32Array(interleaved);
+    const entityIds = meshData.entityIds;
+    for (let i = 0; i < vertexCount; i++) {
+      const o = i * 9;
+      f[o] = positions[i * 3];
+      f[o + 1] = positions[i * 3 + 1];
+      f[o + 2] = positions[i * 3 + 2];
+      f[o + 3] = normals[i * 3] ?? 0;
+      f[o + 4] = normals[i * 3 + 1] ?? 0;
+      f[o + 5] = normals[i * 3 + 2] ?? 0;
+      u[o + 6] = entityIds ? entityIds[i] : meshData.expressId;
+      f[o + 7] = uvs[i * 2] ?? 0;
+      f[o + 8] = uvs[i * 2 + 1] ?? 0;
+    }
+    return interleaved;
+  }
+
+  private createTexturedMesh(meshData: MeshData, device: GPUDevice, pipeline: RenderPipeline): void {
+    const tex = meshData.texture;
+    const interleaved = this.interleaveTexturedVertices(meshData);
+    if (!tex || !interleaved) return;
+    this.texturedDevice = device; // reused by translateMeshesForEntity re-upload
+
+    const vertexBuffer = device.createBuffer({
+      size: interleaved.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vertexBuffer, 0, interleaved);
+
+    const indexBuffer = device.createBuffer({
+      size: meshData.indices.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(indexBuffer, 0, meshData.indices);
+
+    // Upload the Rust-decoded RGBA8 verbatim — no image decoding in JS.
+    const texture = device.createTexture({
+      size: { width: tex.width, height: tex.height },
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    device.queue.writeTexture(
+      { texture },
+      tex.rgba,
+      { bytesPerRow: tex.width * 4, rowsPerImage: tex.height },
+      { width: tex.width, height: tex.height },
+    );
+
+    const wrap = (repeat: boolean): GPUAddressMode => (repeat ? 'repeat' : 'clamp-to-edge');
+    const sampler = device.createSampler({
+      addressModeU: wrap(tex.repeatS),
+      addressModeV: wrap(tex.repeatT),
+      magFilter: 'linear',
+      minFilter: 'linear',
+      mipmapFilter: 'linear',
+    });
+
+    const uniformBuffer = device.createBuffer({
+      size: pipeline.getUniformBufferSize(),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const bindGroup = pipeline.createTexturedBindGroup(uniformBuffer, texture.createView(), sampler);
+
+    this.texturedMeshes.push({
+      expressId: meshData.expressId,
+      vertexBuffer,
+      indexBuffer,
+      indexCount: meshData.indices.length,
+      uniformBuffer,
+      texture,
+      sampler,
+      bindGroup,
+      color: meshData.color,
+    });
+  }
+
   clear(): void {
-    for (const mesh of this.meshes) {
-      mesh.vertexBuffer.destroy();
-      mesh.indexBuffer.destroy();
-      // Destroy per-mesh uniform buffer if it exists
-      if (mesh.uniformBuffer) {
-        mesh.uniformBuffer.destroy();
-      }
+    for (const mesh of this.meshes) destroyGpuResources(mesh);
+    for (const batch of this.batchedMeshes) destroyGpuResources(batch);
+    for (const tm of this.texturedMeshes) {
+      tm.vertexBuffer.destroy();
+      tm.indexBuffer.destroy();
+      tm.uniformBuffer.destroy();
+      tm.texture.destroy();
     }
-    for (const mesh of this.instancedMeshes) {
-      mesh.vertexBuffer.destroy();
-      mesh.indexBuffer.destroy();
-      mesh.instanceBuffer.destroy();
-    }
-    for (const batch of this.batchedMeshes) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) {
-        batch.uniformBuffer.destroy();
-      }
-    }
+    this.texturedMeshes = [];
     // Clear partial batch cache
-    for (const batch of this.partialBatchCache.values()) {
-      batch.vertexBuffer.destroy();
-      batch.indexBuffer.destroy();
-      if (batch.uniformBuffer) {
-        batch.uniformBuffer.destroy();
-      }
-    }
+    for (const batch of this.partialBatchCache.values()) destroyGpuResources(batch);
     // Destroy streaming fragments (already included in batchedMeshes, but tracked separately)
     this.streamingFragments = [];
     this.destroyOverrideBatches();
     this.colorOverrides = null;
+    // Reset the shared frame origin so the next model picks its own.
+    this.sharedFrameOrigin = null;
     this.meshes = [];
-    this.instancedMeshes = [];
     this.batchedMeshes = [];
     this.buckets.clear();
     this.meshDataBucket = new Map();
@@ -1513,10 +1918,14 @@ export class Scene {
     for (const pieces of this.meshDataMap.values()) {
       for (const piece of pieces) {
         const positions = piece.positions;
+        // world = origin + position (per-element local frame).
+        const ox = piece.origin ? piece.origin[0] : 0;
+        const oy = piece.origin ? piece.origin[1] : 0;
+        const oz = piece.origin ? piece.origin[2] : 0;
         for (let i = 0; i < positions.length; i += 3) {
-          const x = positions[i];
-          const y = positions[i + 1];
-          const z = positions[i + 2];
+          const x = positions[i] + ox;
+          const y = positions[i + 1] + oy;
+          const z = positions[i + 2] + oz;
           if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
             hasValidData = true;
             if (x < minX) minX = x;
@@ -1569,10 +1978,15 @@ export class Scene {
 
     for (const piece of pieces) {
       const positions = piece.positions;
+      // world = origin + position (per-element local frame); origin absent/[0,0,0]
+      // for legacy absolute meshes.
+      const ox = piece.origin ? piece.origin[0] : 0;
+      const oy = piece.origin ? piece.origin[1] : 0;
+      const oz = piece.origin ? piece.origin[2] : 0;
       for (let i = 0; i < positions.length; i += 3) {
-        const x = positions[i];
-        const y = positions[i + 1];
-        const z = positions[i + 2];
+        const x = positions[i] + ox;
+        const y = positions[i + 1] + oy;
+        const z = positions[i + 2] + oz;
         if (x < minX) minX = x;
         if (y < minY) minY = y;
         if (z < minZ) minZ = z;

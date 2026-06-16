@@ -15,7 +15,7 @@
  * - Multi-language support (EN/DE/FR)
  */
 
-import React, { useCallback, useEffect, useState, useMemo, useRef } from 'react';
+import React, { useCallback, useState, useMemo, useRef } from 'react';
 import {
   X,
   Upload,
@@ -72,9 +72,9 @@ import type {
   IDSRequirementResult,
 } from '@ifc-lite/ids';
 import { cn } from '@/lib/utils';
+import { IDSAuditSummary } from './IDSAuditSummary';
 import { IDSExportDialog } from './IDSExportDialog';
 import type { IDSBCFExportSettings, IDSExportProgress } from './IDSExportDialog';
-import { claimNextDesktopPanelAction, subscribeDesktopPanelActions } from '@/services/desktop-panel-actions';
 
 // ============================================================================
 // Types
@@ -452,6 +452,8 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
   const {
     // State
     document,
+    auditReport,
+    auditing,
     report,
     loading,
     progress,
@@ -510,30 +512,6 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
     fileInputRef.current?.click();
   }, [loadIdsFromDialog]);
 
-  const handleDesktopRunValidation = useCallback(async () => {
-    if (!document) {
-      const loaded = await loadIdsFromDialog();
-      if (!loaded) {
-        return;
-      }
-    }
-    await runValidation();
-  }, [document, loadIdsFromDialog, runValidation]);
-
-  useEffect(() => {
-    const drainDesktopActions = () => {
-      if (claimNextDesktopPanelAction('ids-open')) {
-        void loadIdsFromDialog();
-      }
-      if (claimNextDesktopPanelAction('ids-run-validation')) {
-        void handleDesktopRunValidation();
-      }
-    };
-
-    drainDesktopActions();
-    return subscribeDesktopPanelActions(drainDesktopActions);
-  }, [handleDesktopRunValidation, loadIdsFromDialog]);
-
   // Handle entity click
   const handleEntityClick = useCallback((modelId: string, expressId: number) => {
     selectEntity(modelId, expressId);
@@ -543,16 +521,32 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
   const renderProgress = () => {
     if (!progress) return null;
 
+    // Validation of large code-list IDS packs runs for many seconds, and
+    // a few broad specs dominate the time — so a percentage keyed on spec
+    // index sits near 0 for a while. Surface the always-advancing spec
+    // counter (and the per-spec entity count) so the panel visibly moves
+    // throughout, not just in the back half.
+    const specNumber = Math.min(progress.specificationIndex + 1, progress.totalSpecifications);
+    const isComplete = progress.phase === 'complete';
+    const headline = isComplete
+      ? 'Validation complete'
+      : `Validating specification ${specNumber} of ${progress.totalSpecifications}`;
+    const detail =
+      progress.phase === 'validating' && progress.totalEntities > 0
+        ? `Checking ${progress.entitiesProcessed.toLocaleString()} / ${progress.totalEntities.toLocaleString()} entities`
+        : progress.phase === 'filtering' && progress.totalEntities > 0
+          ? `Scanning ${progress.entitiesProcessed.toLocaleString()} / ${progress.totalEntities.toLocaleString()} candidates`
+          : progress.phase === 'filtering'
+            ? 'Finding applicable entities…'
+            : null;
+
     return (
       <div className="p-3 border-b">
-        <div className="flex items-center gap-2 mb-2">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          <span className="text-sm">
-            {progress.phase === 'filtering' && 'Finding applicable entities...'}
-            {progress.phase === 'validating' && `Validating... (${progress.entitiesProcessed}/${progress.totalEntities})`}
-            {progress.phase === 'complete' && 'Complete'}
-          </span>
+        <div className="flex items-center gap-2 mb-1">
+          {!isComplete && <Loader2 className="h-4 w-4 animate-spin shrink-0" />}
+          <span className="text-sm font-medium tabular-nums">{headline}</span>
         </div>
+        {detail && <div className="text-xs text-muted-foreground mb-2 tabular-nums">{detail}</div>}
         <Progress value={progress.percentage} className="h-2" />
       </div>
     );
@@ -562,24 +556,43 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
   const renderEmptyState = () => {
     if (document) return null;
 
+    // When parse failed but the auditor still produced issues, surface
+    // them here. This is the most common path for malformed input —
+    // bare "Invalid XML format" tells the user nothing actionable, but
+    // the audit lists the specific structural problems.
+    const hasAuditIssues =
+      auditReport !== null && auditReport.issues.length > 0;
+
     return (
-      <div className="flex flex-col items-center justify-center h-full p-6 text-center">
-        <FileText className="h-12 w-12 text-muted-foreground mb-4" />
-        <h3 className="font-medium text-sm mb-2">No IDS Loaded</h3>
-        <p className="text-xs text-muted-foreground mb-4">
-          Load an IDS (Information Delivery Specification) file to validate your model
-        </p>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".ids,.xml"
-          className="hidden"
-          onChange={handleFileSelect}
-        />
-        <Button onClick={() => { void handleLoadIdsClick(); }}>
-          <Upload className="h-4 w-4 mr-2" />
-          Load IDS File
-        </Button>
+      <div className="flex flex-col h-full p-6">
+        {hasAuditIssues && (
+          <div className="mb-4">
+            <IDSAuditSummary report={auditReport} auditing={auditing} />
+          </div>
+        )}
+
+        <div className="flex flex-col items-center justify-center flex-1 text-center">
+          <FileText className="h-12 w-12 text-muted-foreground mb-4" />
+          <h3 className="font-medium text-sm mb-2">
+            {hasAuditIssues ? 'IDS Document Has Errors' : 'No IDS Loaded'}
+          </h3>
+          <p className="text-xs text-muted-foreground mb-4">
+            {hasAuditIssues
+              ? 'Fix the issues above and try loading again.'
+              : 'Load an IDS (Information Delivery Specification) file to validate your model'}
+          </p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".ids,.xml"
+            className="hidden"
+            onChange={handleFileSelect}
+          />
+          <Button onClick={() => { void handleLoadIdsClick(); }}>
+            <Upload className="h-4 w-4 mr-2" />
+            {hasAuditIssues ? 'Load Different File' : 'Load IDS File'}
+          </Button>
+        </div>
       </div>
     );
   };
@@ -588,9 +601,15 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
   const renderDocumentLoaded = () => {
     if (!document || report) return null;
 
+    // Only the document-level auditor's `error` verdict gates model
+    // validation — warnings still let the user proceed (they're style
+    // hints, not blockers). The button keeps its primary affordance
+    // unless we genuinely can't validate.
+    const auditHasErrors = auditReport?.status === 'error';
+
     return (
-      <div className="p-4">
-        <div className="rounded-lg border p-4 mb-4">
+      <div className="p-4 space-y-3">
+        <div className="rounded-lg border p-4">
           <h3 className="font-medium text-sm mb-1">{document.info.title}</h3>
           {document.info.description && (
             <p className="text-xs text-muted-foreground mb-2">{document.info.description}</p>
@@ -601,14 +620,32 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
           </div>
         </div>
 
-        <Button className="w-full" onClick={runValidation} disabled={loading}>
-          {loading ? (
-            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-          ) : (
-            <Play className="h-4 w-4 mr-2" />
+        <IDSAuditSummary report={auditReport} auditing={auditing} />
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="block">
+              <Button
+                className="w-full"
+                onClick={runValidation}
+                disabled={loading || auditHasErrors}
+                variant={auditHasErrors ? 'secondary' : 'default'}
+              >
+                {loading ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4 mr-2" />
+                )}
+                Run Validation
+              </Button>
+            </span>
+          </TooltipTrigger>
+          {auditHasErrors && (
+            <TooltipContent>
+              Resolve audit errors before validating against a model.
+            </TooltipContent>
           )}
-          Run Validation
-        </Button>
+        </Tooltip>
       </div>
     );
   };
@@ -619,6 +656,14 @@ export function IDSPanel({ onClose }: IDSPanelProps) {
 
     return (
       <>
+        {/* Audit summary stays visible above the validation report so
+            users can still see authoring issues alongside model results. */}
+        {auditReport && auditReport.status !== 'valid' && (
+          <div className="p-3 border-b">
+            <IDSAuditSummary report={auditReport} auditing={false} />
+          </div>
+        )}
+
         {/* Summary Header */}
         <div className="p-3 border-b bg-muted/30">
           <div className="flex items-center gap-2 mb-2">

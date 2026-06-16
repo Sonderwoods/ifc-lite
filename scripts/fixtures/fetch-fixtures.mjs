@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+// Fetch test fixtures listed in tests/models/manifest.json.
+//
+// Usage:
+//   node scripts/fixtures/fetch-fixtures.mjs            # fetch all
+//   node scripts/fixtures/fetch-fixtures.mjs --check    # verify only, no download
+//   node scripts/fixtures/fetch-fixtures.mjs --list     # print missing/changed paths
+//   node scripts/fixtures/fetch-fixtures.mjs path/to/a.ifc path/to/b.ifc
+//
+// Behaviour:
+//   - For each manifest entry, hash the on-disk file and compare to the
+//     manifest's sha256. If the hash matches, do nothing.
+//   - Otherwise, download <base_url>/<sha256> and verify the hash.
+//   - Idempotent: safe to re-run; skips work it already did.
+//   - Override the base URL with IFC_LITE_FIXTURE_BASE_URL=... (e.g. for a
+//     mirror or a local cache server).
+//   - Concurrency is bounded (default 6, override with FIXTURE_CONCURRENCY).
+//   - No third-party dependencies.
+
+import { createHash } from 'node:crypto';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+const ROOT = resolve(import.meta.dirname, '../..');
+const MODELS_DIR = resolve(ROOT, 'tests/models');
+const MANIFEST_PATH = resolve(MODELS_DIR, 'manifest.json');
+
+const args = process.argv.slice(2);
+const CHECK_ONLY = args.includes('--check');
+const LIST_ONLY = args.includes('--list');
+const ONLY = args.filter((a) => !a.startsWith('--'));
+const parsedConcurrency = Number.parseInt(process.env.FIXTURE_CONCURRENCY || '6', 10);
+const CONCURRENCY = Number.isFinite(parsedConcurrency) && parsedConcurrency > 0 ? parsedConcurrency : 6;
+// 10 attempts with exp-backoff capped at 20s + jitter ≈ ~90s of retry
+// wall-clock per fixture worst-case. History: the 4-attempt / 4s-cap policy
+// lost a Release run to a 502 burst (release #502, run 26371185740); 8/15s
+// then lost a Node-tests run to a ~2-min 504 burst from the GitHub Release
+// CDN on two objects (fetched=158 errors=2, run 27085735943). Bumped to 10/20s
+// to outlast longer transient windows. 4xx (except 408/429) skip retries since
+// they aren't going to recover.
+const parsedRetries = Number.parseInt(process.env.FIXTURE_RETRIES || '10', 10);
+const RETRIES = Number.isFinite(parsedRetries) && parsedRetries > 0 ? parsedRetries : 10;
+const RETRY_BASE_MS = 500;
+const RETRY_MAX_MS = 20_000;
+// Per-attempt request timeout (covers headers AND body). Without it a hung TCP
+// connection blocks a worker until Node's very long default socket timeout,
+// silently burning the retry budget on a single stall and starving the other
+// fixtures of a concurrency slot. 60s is generous for the largest fixtures on
+// a slow CI link while still bounding a true hang; override with
+// FIXTURE_TIMEOUT_MS.
+const parsedTimeout = Number.parseInt(process.env.FIXTURE_TIMEOUT_MS || '60000', 10);
+const TIMEOUT_MS = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 60_000;
+
+if (!existsSync(MANIFEST_PATH)) {
+  console.error(`error: ${MANIFEST_PATH} not found`);
+  process.exit(2);
+}
+
+const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
+if (!manifest || typeof manifest !== 'object') {
+  console.error(`error: ${MANIFEST_PATH} is not a JSON object`);
+  process.exit(2);
+}
+if (manifest.version !== 1) {
+  console.error(`error: unsupported manifest.version ${manifest.version}`);
+  process.exit(2);
+}
+if (!Array.isArray(manifest.files)) {
+  console.error(`error: ${MANIFEST_PATH} is missing a "files" array`);
+  process.exit(2);
+}
+
+const rawBaseUrl = process.env.IFC_LITE_FIXTURE_BASE_URL || manifest.base_url;
+if (typeof rawBaseUrl !== 'string' || rawBaseUrl.length === 0) {
+  console.error('error: manifest.base_url (or IFC_LITE_FIXTURE_BASE_URL) is required');
+  process.exit(2);
+}
+const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+
+/** Resolve a manifest-relative fixture path, refusing anything that would
+ *  escape `tests/models/`. Defends against a tampered manifest that lists
+ *  e.g. `../../etc/passwd`. */
+function resolveFixturePath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) {
+    throw new Error(`invalid manifest entry path: ${JSON.stringify(relPath)}`);
+  }
+  const abs = resolve(MODELS_DIR, relPath);
+  const rel = relative(MODELS_DIR, abs);
+  if (rel === '' || rel.startsWith('..')) {
+    throw new Error(`manifest path escapes tests/models/: ${relPath}`);
+  }
+  return abs;
+}
+
+let entries = manifest.files;
+if (ONLY.length) {
+  const wanted = new Set(ONLY.map((p) => p.replace(/^tests\/models\//, '')));
+  entries = entries.filter((f) => wanted.has(f.path));
+  if (!entries.length) {
+    console.error(`error: none of the requested paths are in the manifest`);
+    process.exit(2);
+  }
+}
+
+async function sha256OfFile(path) {
+  const h = createHash('sha256');
+  await pipeline(createReadStream(path), h);
+  return h.digest('hex');
+}
+
+function classify(entry) {
+  const abs = resolveFixturePath(entry.path);
+  if (!existsSync(abs)) return { state: 'missing', abs };
+  const st = statSync(abs);
+  // LFS pointer files are always small; skip the hash if size mismatches.
+  if (st.size !== entry.size) return { state: 'mismatch', abs };
+  return { state: 'unchecked', abs };
+}
+
+async function fetchOne(entry) {
+  let abs;
+  let state;
+  try {
+    ({ abs, state } = classify(entry));
+  } catch (err) {
+    return { entry, action: 'error', error: err };
+  }
+  if (state === 'unchecked') {
+    const got = await sha256OfFile(abs);
+    if (got === entry.sha256) {
+      return { entry, action: 'skip' };
+    }
+  }
+
+  if (CHECK_ONLY || LIST_ONLY) {
+    return { entry, action: 'needed' };
+  }
+
+  mkdirSync(dirname(abs), { recursive: true });
+  const tmp = abs + '.part';
+
+  let lastErr;
+  let permanent = false;
+  for (let attempt = 1; attempt <= RETRIES; attempt++) {
+    try {
+      // A fresh timeout per attempt — aborts a stalled connection or a
+      // mid-download stall so the retry loop can move on instead of hanging.
+      // AbortError/TimeoutError isn't a 4xx, so it flows through the normal
+      // (retryable) path below.
+      const res = await fetch(`${baseUrl}/${entry.sha256}`, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status} ${res.statusText}`);
+        // 4xx (except 408 Request Timeout and 429 Too Many Requests) is a
+        // permanent failure — retrying won't help and just delays the
+        // overall job. 5xx, network errors, and timeouts get the full
+        // retry budget.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+          permanent = true;
+        }
+        throw err;
+      }
+      if (!res.body) throw new Error('empty response body');
+      await pipeline(res.body, createWriteStream(tmp));
+      const got = await sha256OfFile(tmp);
+      if (got !== entry.sha256) {
+        unlinkSync(tmp);
+        throw new Error(`hash mismatch: expected ${entry.sha256}, got ${got}`);
+      }
+      renameSync(tmp, abs);
+      return { entry, action: 'fetched' };
+    } catch (err) {
+      lastErr = err;
+      // cleanup — best-effort; tmp may not exist if fetch failed before write
+      try { unlinkSync(tmp); } catch { /* ignore */ }
+      if (permanent || attempt >= RETRIES) break;
+      // Exponential backoff capped at RETRY_MAX_MS, plus full-range jitter
+      // (0..wait) so concurrent workers that all 502'd at the same instant
+      // don't synchronously hammer the upstream again on the next tick.
+      const exp = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (attempt - 1));
+      const wait = Math.floor(exp * (0.5 + Math.random() * 0.5));
+      console.error(
+        `retry: ${entry.path}: ${err.message} (attempt ${attempt}/${RETRIES}, waiting ${wait}ms)`,
+      );
+      await sleep(wait);
+    }
+  }
+  return { entry, action: 'error', error: lastErr };
+}
+
+async function runWithConcurrency(items, n, fn) {
+  const results = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      results[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+const start = Date.now();
+const results = await runWithConcurrency(entries, CONCURRENCY, fetchOne);
+
+let fetched = 0;
+let skipped = 0;
+let needed = 0;
+const errors = [];
+for (const r of results) {
+  if (r.action === 'fetched') fetched++;
+  else if (r.action === 'skip') skipped++;
+  else if (r.action === 'needed') needed++;
+  else if (r.action === 'error') errors.push(r);
+}
+
+if (errors.length) {
+  for (const e of errors) {
+    console.error(`error: ${e.entry.path}: ${e.error?.message || e.error}`);
+  }
+}
+
+if (LIST_ONLY) {
+  for (const r of results) {
+    if (r.action === 'needed') console.log(r.entry.path);
+  }
+  process.exit(needed === 0 && errors.length === 0 ? 0 : 1);
+}
+
+if (CHECK_ONLY) {
+  if (needed || errors.length) {
+    if (needed) {
+      console.error(`fixtures missing or out of date: ${needed} of ${entries.length}`);
+      console.error('run: pnpm fixtures');
+    }
+    process.exit(1);
+  }
+  console.error(`all ${entries.length} fixtures present and verified`);
+  process.exit(0);
+}
+
+const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+console.error(
+  `fixtures: fetched=${fetched} skipped=${skipped} errors=${errors.length} in ${elapsed}s`,
+);
+// Per-entry error lines were already printed once near the top of the
+// summary section.
+if (errors.length) {
+  process.exit(1);
+}

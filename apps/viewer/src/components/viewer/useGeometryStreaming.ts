@@ -21,7 +21,13 @@
 import { useEffect, useRef, type MutableRefObject } from 'react';
 import type { Renderer } from '@ifc-lite/renderer';
 import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
-import { logToDesktopTerminal } from '@/services/desktop-logger';
+import { toast } from '../ui/toast.js';
+
+// Session-scoped flag so the linear-infrastructure hint fires at most once
+// per page load (model swaps included). Stored at module scope rather than
+// in component state because federation re-mounts the streaming hook on
+// every model load — a useRef wouldn't survive.
+let linearFitHintShown = false;
 
 export interface UseGeometryStreamingParams {
   rendererRef: MutableRefObject<Renderer | null>;
@@ -30,13 +36,41 @@ export interface UseGeometryStreamingParams {
   /** Monotonic counter — triggers the streaming effect even when the geometry
    *  array reference is stable (incremental filtering reuses the same array). */
   geometryVersion?: number;
+  /**
+   * Monotonic counter that bumps whenever existing mesh data has been mutated
+   * in place (e.g. realignFederation rewrote vertex positions). Length-based
+   * triggers can't detect in-place mutation, so when this bumps we treat the
+   * incoming `geometry` as a fresh replacement and re-upload it to the GPU.
+   */
+  geometryContentVersion?: number;
   coordinateInfo?: CoordinateInfo;
   isStreaming: boolean;
+  /** Number of loaded models. When this increases (a model was added to the
+   *  federation) the camera must refit to the new combined bounds — otherwise
+   *  it stays framed on the first model and the newly-added one is off-screen. */
+  modelCount?: number;
   geometryBoundsRef: MutableRefObject<{ min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } }>;
   pendingMeshColorUpdates: Map<number, [number, number, number, number]> | null;
   pendingColorUpdates: Map<number, [number, number, number, number]> | null;
+  /**
+   * Authoring actions (split, delete) push globalIds here; the
+   * streaming loop drains them via `scene.removeMeshesForEntities`
+   * so tombstoned IFC entities disappear from the rendered scene
+   * (rather than just being hidden via `hiddenIds`). Cleared by
+   * the hook after the drain.
+   */
+  pendingMeshRemovals: Set<number> | null;
+  /**
+   * Per-entity translations queued by authoring actions (gizmo
+   * drag, numeric move). Drained by the streaming hook into
+   * `scene.translateMeshesForEntities` so the visible mesh
+   * follows the IFC coordinate mutation on the next frame.
+   */
+  pendingMeshTranslations: Map<number, [number, number, number]> | null;
   clearPendingMeshColorUpdates: () => void;
   clearPendingColorUpdates: () => void;
+  clearPendingMeshRemovals: () => void;
+  clearPendingMeshTranslations: () => void;
   clearColorRef: MutableRefObject<[number, number, number, number]>;
   releaseGeometryAfterFinalize?: boolean;
   onGeometryReleased?: () => void;
@@ -52,7 +86,6 @@ const MAX_VALID_COORD = 10000;
 
 function traceGeometrySync(message: string): void {
   console.log(`[GeomSync] ${message}`);
-  void logToDesktopTerminal('info', `[GeomSync] ${message}`);
 }
 
 export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
@@ -61,13 +94,19 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     isInitialized,
     geometry,
     geometryVersion,
+    geometryContentVersion,
     coordinateInfo,
     isStreaming,
+    modelCount = 0,
     geometryBoundsRef,
     pendingMeshColorUpdates,
     pendingColorUpdates,
+    pendingMeshRemovals,
+    pendingMeshTranslations,
     clearPendingMeshColorUpdates,
     clearPendingColorUpdates,
+    clearPendingMeshRemovals,
+    clearPendingMeshTranslations,
     clearColorRef,
     releaseGeometryAfterFinalize = false,
     onGeometryReleased,
@@ -80,7 +119,13 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
   const cameraFittedRef = useRef(false);
   const finalBoundsRefittedRef = useRef(false);
   const cameraSnapshotRef = useRef<{ px: number; py: number; pz: number; tx: number; ty: number; tz: number } | null>(null);
+  // Tracks which fit branch the post-load auto-fit took. Linear models get a
+  // one-time status-line hint via the viewer store; the home button can also
+  // mirror the same policy on re-press without re-deriving the bbox shape.
+  const lastFitPolicyKindRef = useRef<'compact' | 'linear' | null>(null);
   const prevIsStreamingRef = useRef(isStreaming);
+  const lastContentVersionRef = useRef(geometryContentVersion ?? 0);
+  const prevModelCountRef = useRef(modelCount);
   const queuePumpTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
 
   // Only activate the timer-based queue pump when the tab is background-throttled
@@ -142,6 +187,40 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
 
     const scene = renderer.getScene();
     const currentLength = geometry.length;
+
+    // In-place mutation detection: when geometryContentVersion bumps, mesh
+    // positions/normals were rewritten in place (e.g. realignFederation).
+    // Length-based classification can't catch this, so force a full reset and
+    // re-process the geometry from scratch so the GPU re-uploads buffers.
+    const contentVersion = geometryContentVersion ?? 0;
+    if (contentVersion !== lastContentVersionRef.current) {
+      lastContentVersionRef.current = contentVersion;
+      if (lastGeometryLengthRef.current > 0) {
+        traceGeometrySync(`geometry content version bumped → ${contentVersion}; re-uploading buffers`);
+        scene.clear();
+        processedMeshIdsRef.current.clear();
+        lastGeometryLengthRef.current = 0;
+        lastGeometryRef.current = null;
+      }
+    }
+
+    // A model was added to the federation — refit the camera to the new
+    // combined bounds. Without this, `cameraFittedRef` stays true from the
+    // first model's fit, so the newly-added model renders off-screen and only
+    // its 2D grid overlay shows. Refit only on an INCREASE (a model added),
+    // and never mid-stream (the streaming first-fit + finalize refit handle
+    // the active model). The combined bounds come from the merged
+    // coordinateInfo (union of all visible models).
+    if (modelCount > prevModelCountRef.current && !isStreaming) {
+      traceGeometrySync(`model added (${prevModelCountRef.current}→${modelCount}) — refitting camera to combined bounds`);
+      cameraFittedRef.current = false;
+      finalBoundsRefittedRef.current = false;
+    }
+    prevModelCountRef.current = modelCount;
+
+    // Read AFTER the optional reset above so the classification below reflects
+    // the post-reset state (otherwise an in-place update gets misclassified as
+    // "no change" and returns early at currentLength === lastLength).
     const lastLength = lastGeometryLengthRef.current;
 
     // ── Classify the change ──
@@ -194,7 +273,24 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
         geometryBoundsRef.current = { ...DEFAULT_BOUNDS };
       }
     } else if (currentLength === lastLength) {
-      return; // No change
+      // No mesh-count change, so the queueMeshes / appendToBatches block
+      // below would be a no-op. But we MUST still reach the camera-fit
+      // block — the streaming-complete re-render (isStreaming flips
+      // false, geometry array length stays at the final mesh count)
+      // arrives here, and that's the FIRST render where path 2
+      // (`computeBounds(geometry)` fallback when shiftedBounds is empty)
+      // is allowed to fire. Pre-fix the early return short-circuited
+      // the camera fit entirely; the user reported 33 meshes streamed
+      // with the viewport stuck at the default ±100 m bounds (issue
+      // #859 / PR #871 deploy preview, `linear-placement-of-signal.ifc`).
+      //
+      // Skip only when the camera is already fitted or there's nothing
+      // to fit to.
+      if (cameraFittedRef.current || currentLength === 0) {
+        return;
+      }
+      // Otherwise fall through so the camera-fit block at the bottom of
+      // the effect gets a chance to run.
     }
 
     // Visibility toggle while NOT streaming — array rebuilt from scratch
@@ -252,31 +348,77 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     lastGeometryLengthRef.current = currentLength;
 
     // ── Fit camera ──
-    if (!cameraFittedRef.current && coordinateInfo?.shiftedBounds) {
-      const sb = coordinateInfo.shiftedBounds;
-      const maxSize = Math.max(sb.max.x - sb.min.x, sb.max.y - sb.min.y, sb.max.z - sb.min.z);
-      if (maxSize > 0 && Number.isFinite(maxSize)) {
-        renderer.getCamera().fitToBounds(sb.min, sb.max);
-        geometryBoundsRef.current = { min: { ...sb.min }, max: { ...sb.max } };
-        cameraFittedRef.current = true;
-        const pos = renderer.getCamera().getPosition();
-        const tgt = renderer.getCamera().getTarget();
-        cameraSnapshotRef.current = { px: pos.x, py: pos.y, pz: pos.z, tx: tgt.x, ty: tgt.y, tz: tgt.z };
+    //
+    // Pre-#871 the branching here was structured as
+    //   if (coordinateInfo?.shiftedBounds) { try to fit }
+    //   else if (geometry.length > 0) { fall back }
+    // but `coordinateInfo.shiftedBounds` is ALWAYS truthy — the wasm
+    // bridge ships a default `{ min: 0, max: 0 }` placeholder before
+    // any real bounds get computed. The outer `if` therefore won
+    // every time, the inner `maxSize > 0` failed, and the `else if`
+    // fallback NEVER fired. Result: the camera stayed at the default
+    // (0, 0, 0) framing while linearly-placed railway geometry sat at
+    // its MGA-territory world coords (~330, 123 after RTC), invisible
+    // to the user. Compute the size first so the branch reflects
+    // whether the data is actually usable, not just whether the
+    // property exists.
+    if (!cameraFittedRef.current) {
+      // The adaptive fit picks an SE-isometric pose for compact models
+      // (today's behaviour) but switches to a side-on-along-the-alignment
+      // pose for high-aspect-ratio bboxes (railway / road corridors).
+      // Without the switch, a 932 × 0.75 × 428 m alignment auto-fits to a
+      // ~1864 m distance where every 1 m signal projects to a sub-pixel
+      // dot — the user sees a blank viewport even though geometry is in
+      // the scene. See packages/renderer/src/camera-fit-policy.ts.
+      let fitted = false;
+      const sb = coordinateInfo?.shiftedBounds;
+      if (sb) {
+        const maxSize = Math.max(sb.max.x - sb.min.x, sb.max.y - sb.min.y, sb.max.z - sb.min.z);
+        if (maxSize > 0 && Number.isFinite(maxSize)) {
+          const canvas = renderer.getCanvas();
+          const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+          const policy = renderer.getCamera().fitBoundsAdaptive(
+            { min: sb.min, max: sb.max },
+            { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
+          );
+          geometryBoundsRef.current = { min: { ...sb.min }, max: { ...sb.max } };
+          lastFitPolicyKindRef.current = policy.kind;
+          fitted = true;
+        }
       }
-    } else if (!cameraFittedRef.current && geometry.length > 0 && !isStreaming) {
-      const bounds = computeBounds(geometry);
-      if (bounds) {
-        renderer.getCamera().fitToBounds(bounds.min, bounds.max);
-        geometryBoundsRef.current = bounds;
+      if (!fitted && geometry.length > 0 && !isStreaming) {
+        const bounds = computeBounds(geometry);
+        if (bounds) {
+          const canvas = renderer.getCanvas();
+          const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+          const policy = renderer.getCamera().fitBoundsAdaptive(
+            bounds,
+            { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
+          );
+          geometryBoundsRef.current = bounds;
+          lastFitPolicyKindRef.current = policy.kind;
+          fitted = true;
+        }
+      }
+      if (fitted) {
         cameraFittedRef.current = true;
         const pos = renderer.getCamera().getPosition();
         const tgt = renderer.getCamera().getTarget();
         cameraSnapshotRef.current = { px: pos.x, py: pos.y, pz: pos.z, tx: tgt.x, ty: tgt.y, tz: tgt.z };
+        // One-time hint for linear-infrastructure models. The side-on auto-fit
+        // shows a slice of the alignment at a useful zoom — but the FULL
+        // alignment is much longer than what fits on screen, so users need
+        // to know to pan / use Frame Selection to inspect remote stations.
+        // Hint is module-scoped so model swaps within one session don't spam.
+        if (lastFitPolicyKindRef.current === 'linear' && !linearFitHintShown) {
+          linearFitHintShown = true;
+          toast.info('Linear infrastructure — pan along the alignment, or select an element and press F to zoom in');
+        }
       }
     }
 
     renderer.requestRender();
-  }, [geometry, geometryVersion, coordinateInfo, isInitialized, isStreaming]);
+  }, [geometry, geometryVersion, geometryContentVersion, coordinateInfo, isInitialized, isStreaming, modelCount]);
 
   useEffect(() => {
     return () => {
@@ -313,14 +455,35 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
             `finalize start geometryLength=${capturedGeometry?.length ?? 0} releaseAfterFinalize=${releaseGeometryAfterFinalize}`
           );
 
-          // Compute exact bounds and refit camera (fast ~15ms scan)
+          // Compute exact bounds and refit camera (fast ~15ms scan). Use
+          // the adaptive policy so linear-infrastructure models keep the
+          // side-on pose chosen by the early-fit branch — without this,
+          // the streaming-complete refit reverts to the legacy
+          // `fitToBounds` (SE isometric at `maxSize * 2`), undoing the
+          // useful close-in framing and putting the camera back at the
+          // sub-pixel distance for railway / road corridors.
           if (cameraFittedRef.current && !finalBoundsRefittedRef.current && capturedGeometry && capturedGeometry.length > 0) {
             const t0 = performance.now();
             const exactBounds = computeBounds(capturedGeometry);
             console.log(`[GeomStream] computeBounds: ${(performance.now() - t0).toFixed(0)}ms`);
             if (exactBounds) {
               if (!userMovedCamera(r, cameraSnapshotRef.current)) {
-                r.getCamera().fitToBounds(exactBounds.min, exactBounds.max);
+                const canvas = r.getCanvas();
+                const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+                const policy = r.getCamera().fitBoundsAdaptive(
+                  exactBounds,
+                  { viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
+                );
+                lastFitPolicyKindRef.current = policy.kind;
+                // Update the snapshot so a subsequent userMovedCamera check
+                // doesn't fire against the new pose's own delta.
+                const pos = r.getCamera().getPosition();
+                const tgt = r.getCamera().getTarget();
+                cameraSnapshotRef.current = { px: pos.x, py: pos.y, pz: pos.z, tx: tgt.x, ty: tgt.y, tz: tgt.z };
+                if (policy.kind === 'linear' && !linearFitHintShown) {
+                  linearFitHintShown = true;
+                  toast.info('Linear infrastructure — pan along the alignment, or select an element and press F to zoom in');
+                }
               }
               geometryBoundsRef.current = exactBounds;
               finalBoundsRefittedRef.current = true;
@@ -394,6 +557,63 @@ export function useGeometryStreaming(params: UseGeometryStreamingParams): void {
     }
   }, [pendingMeshColorUpdates, isInitialized, clearPendingMeshColorUpdates]);
 
+  // ─── Mesh removals (split / delete) ───────────────────────────────────
+  // Authoring actions push globalIds into pendingMeshRemovals; drain
+  // here so the renderer actually drops them rather than leaving the
+  // mesh hidden via the visibility set. The bucket rebuild rides
+  // along on the existing rebuildPendingBatches path the streaming
+  // queue already exercises every frame.
+  useEffect(() => {
+    if (pendingMeshRemovals === null || !isInitialized) return;
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const device = renderer.getGPUDevice();
+    const pipeline = renderer.getPipeline();
+    const scene = renderer.getScene();
+    if (!device || !pipeline) return;
+
+    if (pendingMeshRemovals.size > 0) {
+      scene.removeMeshesForEntities(pendingMeshRemovals);
+      if (scene.hasPendingBatches()) {
+        scene.rebuildPendingBatches(device, pipeline);
+      }
+      renderer.requestRender();
+    }
+    clearPendingMeshRemovals();
+  }, [pendingMeshRemovals, isInitialized, clearPendingMeshRemovals]);
+
+  // ─── Mesh translations (move / gizmo drag / numeric move) ────────────
+  // Drain the pending-translation map onto the renderer. Same
+  // rebuildPendingBatches ride-along; the in-place vertex update
+  // means a translate frame is one batch rebuild per affected
+  // bucket (typically one per entity).
+  useEffect(() => {
+    if (pendingMeshTranslations === null || !isInitialized) return;
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    const device = renderer.getGPUDevice();
+    const pipeline = renderer.getPipeline();
+    const scene = renderer.getScene();
+    if (!device || !pipeline) return;
+
+    if (pendingMeshTranslations.size > 0) {
+      scene.translateMeshesForEntities(pendingMeshTranslations);
+      if (scene.hasPendingBatches()) {
+        scene.rebuildPendingBatches(device, pipeline);
+      }
+      // An element appended during streaming (e.g. an authored IfcSpace) lingers
+      // as a streaming fragment at its ORIGINAL position on top of its now-moved
+      // bucket batch — a ghost duplicate. Finalising merges fragments into clean
+      // buckets (no-op once none remain). Skipped in ephemeral mode, where no
+      // geometry is retained to rebuild the batches from.
+      if (scene.hasStreamingFragments() && !scene.isEphemeralStreaming()) {
+        scene.finalizeStreaming(device, pipeline);
+      }
+      renderer.requestRender();
+    }
+    clearPendingMeshTranslations();
+  }, [pendingMeshTranslations, isInitialized, clearPendingMeshTranslations]);
+
   // ─── Lens color overlays ─────────────────────────────────────────────
   useEffect(() => {
     if (pendingColorUpdates === null || !isInitialized) return;
@@ -422,8 +642,13 @@ function computeBounds(meshes: MeshData[]): { min: { x: number; y: number; z: nu
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   for (let gi = 0; gi < meshes.length; gi++) {
     const positions = meshes[gi].positions;
+    // world = origin + position (per-element local frame); without folding the
+    // origin every element's local positions cluster near 0, so the camera fits
+    // to the origin while geometry draws at its true world coords → blank view.
+    const o = meshes[gi].origin;
+    const ox = o ? o[0] : 0, oy = o ? o[1] : 0, oz = o ? o[2] : 0;
     for (let i = 0; i < positions.length; i += 3) {
-      const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+      const x = positions[i] + ox, y = positions[i + 1] + oy, z = positions[i + 2] + oz;
       if (Math.abs(x) < MAX_VALID_COORD && Math.abs(y) < MAX_VALID_COORD && Math.abs(z) < MAX_VALID_COORD) {
         if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
         if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;

@@ -13,11 +13,13 @@ import {
   buildTreeData,
   buildTypeTree,
   buildIfcTypeTree,
+  buildMaterialTree,
   filterNodes,
   splitNodes,
+  type AuthoredProduct,
 } from './treeDataBuilder';
 
-export type GroupingMode = 'spatial' | 'type' | 'ifc-type';
+export type GroupingMode = 'spatial' | 'type' | 'ifc-type' | 'material';
 
 interface UseHierarchyTreeParams {
   models: Map<string, FederatedModel>;
@@ -182,19 +184,54 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
     return expressIds.map((expressId) => state.toGlobalId(modelId, expressId));
   }, []);
 
+  // Authored (overlay) products with geometry. They live in the mutation overlay,
+  // not the columnar parse the class/type builders scan, so a baked IfcSpace was
+  // absent from the "By Class" tree. Filtering by geometricIds keeps it to real
+  // products (the space has a mesh; its helper points/placements/solids don't).
+  const mutationViews = useViewerStore((s) => s.mutationViews);
+  const mutationVersion = useViewerStore((s) => s.mutationVersion);
+  const authoredProducts = useMemo<AuthoredProduct[]>(() => {
+    const out: AuthoredProduct[] = [];
+    const state = useViewerStore.getState();
+    for (const [modelId, view] of mutationViews) {
+      const getNew = (view as { getNewEntities?: () => Iterable<{ expressId: number; type: string; attributes: unknown[] }> }).getNewEntities;
+      if (typeof getNew !== 'function') continue;
+      for (const ent of getNew.call(view)) {
+        const globalId = modelId === 'legacy' || !models.has(modelId)
+          ? ent.expressId
+          : state.toGlobalId(modelId, ent.expressId);
+        if (!geometricIds.has(globalId)) continue;
+        const rawName = ent.attributes?.[2];
+        out.push({
+          modelId,
+          expressId: ent.expressId,
+          globalId,
+          ifcType: ent.type,
+          name: typeof rawName === 'string' && rawName ? rawName : `${ent.type} #${ent.expressId}`,
+        });
+      }
+    }
+    return out;
+    // mutationVersion bumps on every authoring edit; geometricIds tracks the mesh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mutationViews, models, geometricIds, mutationVersion]);
+
   // Build the tree data structure based on grouping mode
   // Note: hiddenEntities intentionally NOT in deps - visibility computed lazily for performance
   const treeData = useMemo(
     (): TreeNode[] => {
       if (groupingMode === 'type') {
-        return buildTypeTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds);
+        return buildTypeTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds, authoredProducts);
       }
       if (groupingMode === 'ifc-type') {
         return buildIfcTypeTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds);
       }
+      if (groupingMode === 'material') {
+        return buildMaterialTree(models, ifcDataStore, expandedNodes, isMultiModel, geometricIds);
+      }
       return buildTreeData(models, ifcDataStore, expandedNodes, isMultiModel, unifiedStoreys);
     },
-    [models, ifcDataStore, expandedNodes, isMultiModel, unifiedStoreys, groupingMode, geometricIds]
+    [models, ifcDataStore, expandedNodes, isMultiModel, unifiedStoreys, groupingMode, geometricIds, authoredProducts]
   );
 
   // Filter nodes based on search
@@ -223,7 +260,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
 
   // Get all elements for a node (handles type groups, ifc-type, unified storeys, single storeys, model contributions, and elements)
   const getNodeElements = useCallback((node: TreeNode): number[] => {
-    if (node.type === 'type-group' || node.type === 'ifc-type') {
+    if (node.type === 'type-group' || node.type === 'ifc-type' || node.type === 'material-group') {
       // GlobalIds are pre-stored on the node during tree construction — O(1)
       return node.globalIds;
     }
@@ -257,7 +294,7 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
         const localIds = (model.ifcDataStore.spatialHierarchy.byStorey.get(storeyId) as number[]) || [];
         return toGlobalIdsForModel(modelId, localIds);
       }
-    } else if (node.type === 'IfcSpace') {
+    } else if (node.type === 'IfcSpace' || node.type === 'IfcSpatialZone') {
       const spaceId = node.expressIds[0];
       const modelId = node.modelIds[0];
 

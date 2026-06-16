@@ -7,7 +7,7 @@
 //! Handles IfcTriangulatedFaceSet (explicit triangle meshes) and
 //! IfcPolygonalFaceSet (polygon meshes requiring triangulation).
 
-use crate::{Error, Mesh, Result};
+use crate::{Error, Mesh, Result, TessellationQuality};
 use ifc_lite_core::{AttributeValue, DecodedEntity, EntityDecoder, IfcSchema, IfcType};
 
 use crate::router::GeometryProcessor;
@@ -20,16 +20,17 @@ impl TriangulatedFaceSetProcessor {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl GeometryProcessor for TriangulatedFaceSetProcessor {
-    #[inline]
-    fn process(
-        &self,
+    /// Parse an `IfcTriangulatedFaceSet`'s positions + triangle indices and
+    /// apply the closed-shell outward orientation. Returns
+    /// `(positions, indices, flipped)` where `flipped` is whether the whole
+    /// shell was winding-flipped — the texture path needs it to keep the
+    /// parallel `TexCoordIndex` in lockstep (#961). Shared by `process` and
+    /// [`Self::process_with_texture`] so there is one parse/orient code path.
+    fn parse_positions_and_orient(
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
-        _schema: &IfcSchema,
-    ) -> Result<Mesh> {
+    ) -> Result<(Vec<f32>, Vec<u32>, bool)> {
         // IfcTriangulatedFaceSet attributes:
         // 0: Coordinates (IfcCartesianPointList3D)
         // 1: Normals (optional)
@@ -97,20 +98,97 @@ impl GeometryProcessor for TriangulatedFaceSetProcessor {
             AttributeValue::parse_index_list(face_list)
         };
 
-        // Create mesh (normals will be computed later)
-        let mut mesh = Mesh {
-            positions,
-            normals: Vec::new(),
-            indices,
-            rtc_applied: false,
+        // Read Closed (attribute 2): .T. means definitely closed, .F. means
+        // definitely open, $ / UNKNOWN means "not specified". Revit-exported
+        // light fixtures and similar families in IFC4 often omit Closed
+        // ($) but still author closed shells — sometimes with inward-facing
+        // winding (issue #819, IFC4TessellationComplex.ifc). Mirror the
+        // PolygonalFaceSet orientation pass but be less strict: also apply
+        // it when Closed is unknown, never when explicitly .F.
+        let closed_attr = entity.get(2);
+        let is_open = closed_attr
+            .and_then(|a| a.as_enum())
+            .map(|v| v == "F")
+            .unwrap_or(false);
+
+        let mut indices = indices;
+        let flipped = if !is_open {
+            PolygonalFaceSetProcessor::orient_closed_shell_outward(&positions, &mut indices)
+        } else {
+            false
         };
-        // Validate: IFC files (especially Revit exports) may have indices beyond vertex count
+
+        Ok((positions, indices, flipped))
+    }
+
+    /// Tessellate a textured `IfcTriangulatedFaceSet` (#961): builds the same
+    /// flat-shaded mesh as [`process`] plus a per-vertex UV array aligned 1:1
+    /// with the emitted vertices. `map.tex_coord_index` is parallel to the
+    /// original `CoordIndex`; the same whole-shell winding flip is applied to it
+    /// so corners stay aligned after orientation.
+    pub fn process_with_texture(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        map: &crate::processors::texture::ResolvedTextureMap,
+    ) -> Result<(Mesh, Vec<f32>)> {
+        let (positions, indices, flipped) = Self::parse_positions_and_orient(entity, decoder)?;
+        let mut tex_coord_index = map.tex_coord_index.clone();
+        if flipped {
+            for tri in tex_coord_index.iter_mut() {
+                tri.swap(1, 2);
+            }
+        }
+        let (mut mesh, uvs) = PolygonalFaceSetProcessor::build_flat_shaded_mesh_with_uvs(
+            &positions,
+            &indices,
+            &map.tex_coords,
+            &tex_coord_index,
+        );
+        mesh.validate_indices();
+        Ok((mesh, uvs))
+    }
+}
+
+impl GeometryProcessor for TriangulatedFaceSetProcessor {
+    #[inline]
+    fn process(
+        &self,
+        entity: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+        _schema: &IfcSchema,
+        _quality: TessellationQuality,
+    ) -> Result<Mesh> {
+        let (positions, indices, _flipped) = Self::parse_positions_and_orient(entity, decoder)?;
+
+        // Flat-shade by duplicating vertices per-triangle. Without this, the
+        // downstream per-vertex normal accumulator (`csg::calculate_normals`)
+        // averages adjacent face normals at every shared vertex, which
+        // softens crisp facet edges into a muddy gradient on faceted
+        // geometry — visible in issue #819 on `IFC4TessellationComplex.ifc`
+        // where the user contrasted ifc-lite's smoothed dome with the
+        // facet-sharp BIMVision render. `PolygonalFaceSetProcessor` already
+        // does this; bringing `IfcTriangulatedFaceSet` to parity matches
+        // IfcOpenShell / web-ifc behaviour for `Normals = $`.
+        //
+        // 3× vertex bloat. Acceptable for Revit lighting/family export
+        // sizes; if it ever becomes a bottleneck on giant tessellated
+        // models, gate this on per-edge crease angle.
+        let mut mesh = PolygonalFaceSetProcessor::build_flat_shaded_mesh(&positions, &indices);
         mesh.validate_indices();
         Ok(mesh)
     }
 
     fn supported_types(&self) -> Vec<IfcType> {
-        vec![IfcType::IfcTriangulatedFaceSet]
+        // IfcTriangulatedIrregularNetwork is a subtype of IfcTriangulatedFaceSet
+        // that adds an optional `ClosedOrOpen` list at the end and is used for
+        // terrain (TIN) surfaces. We don't read the extra attribute and the
+        // inherited Coordinates / Closed / CoordIndex layout is identical, so
+        // routing TIN through the same processor is correct.
+        vec![
+            IfcType::IfcTriangulatedFaceSet,
+            IfcType::IfcTriangulatedIrregularNetwork,
+        ]
     }
 }
 
@@ -339,8 +417,8 @@ impl PolygonalFaceSetProcessor {
             return;
         }
 
-        // Run ear-clipping triangulation
-        match earcutr::earcut(&coords_2d, &hole_starts, 2) {
+        // Run ear-clipping triangulation (guarded — see `triangulation::safe_earcut`)
+        match crate::triangulation::safe_earcut(&coords_2d, &hole_starts, 2) {
             Ok(tri_indices) => {
                 for tri in tri_indices.chunks(3) {
                     if tri.len() != 3
@@ -395,14 +473,18 @@ impl PolygonalFaceSetProcessor {
     }
 
     #[inline]
-    fn orient_closed_shell_outward(positions: &[f32], indices: &mut [u32]) {
+    /// Flip every triangle's winding to face outward when the shell is
+    /// inward-facing. Returns `true` if a (whole-shell) flip was applied — the
+    /// texture path needs this to swap the parallel `TexCoordIndex` in lockstep
+    /// (issue #961), or corners 1/2 of the UVs mirror on a flipped shell.
+    pub(crate) fn orient_closed_shell_outward(positions: &[f32], indices: &mut [u32]) -> bool {
         if indices.len() < 3 || positions.len() < 9 {
-            return;
+            return false;
         }
 
         let vertex_count = positions.len() / 3;
         if vertex_count == 0 {
-            return;
+            return false;
         }
 
         // Mesh centroid
@@ -466,11 +548,13 @@ impl PolygonalFaceSetProcessor {
             for tri in indices.chunks_exact_mut(3) {
                 tri.swap(1, 2);
             }
+            return true;
         }
+        false
     }
 
     #[inline]
-    fn build_flat_shaded_mesh(positions: &[f32], indices: &[u32]) -> Mesh {
+    pub(crate) fn build_flat_shaded_mesh(positions: &[f32], indices: &[u32]) -> Mesh {
         let mut flat_positions: Vec<f32> = Vec::with_capacity(indices.len() * 3);
         let mut flat_normals: Vec<f32> = Vec::with_capacity(indices.len() * 3);
         let mut flat_indices: Vec<u32> = Vec::with_capacity(indices.len());
@@ -530,8 +614,97 @@ impl PolygonalFaceSetProcessor {
             positions: flat_positions,
             normals: flat_normals,
             indices: flat_indices,
-            rtc_applied: false,
+            rtc_applied: false, 
+            origin: [0.0; 3],        }
+    }
+
+    /// Like [`Self::build_flat_shaded_mesh`] but also emits a per-vertex UV
+    /// array aligned 1:1 with the duplicated vertices (issue #961).
+    ///
+    /// `tex_coord_index` is parallel to `indices` (and already winding-flipped
+    /// to match it); each triangle's three 1-based entries index `tex_coords`.
+    /// Triangles dropped by the out-of-range vertex guard are dropped from both
+    /// positions and UVs in lockstep, so the UV/vertex alignment is exact.
+    /// Out-of-range texcoord corners fall back to (0, 0).
+    pub(crate) fn build_flat_shaded_mesh_with_uvs(
+        positions: &[f32],
+        indices: &[u32],
+        tex_coords: &[[f32; 2]],
+        tex_coord_index: &[[u32; 3]],
+    ) -> (Mesh, Vec<f32>) {
+        let mut flat_positions: Vec<f32> = Vec::with_capacity(indices.len() * 3);
+        let mut flat_normals: Vec<f32> = Vec::with_capacity(indices.len() * 3);
+        let mut flat_indices: Vec<u32> = Vec::with_capacity(indices.len());
+        let mut uvs: Vec<f32> = Vec::with_capacity((indices.len() / 3) * 6);
+
+        let vertex_count = positions.len() / 3;
+        let mut next_index: u32 = 0;
+
+        for (tri_i, tri) in indices.chunks_exact(3).enumerate() {
+            let i0 = tri[0] as usize;
+            let i1 = tri[1] as usize;
+            let i2 = tri[2] as usize;
+            if i0 >= vertex_count || i1 >= vertex_count || i2 >= vertex_count {
+                continue;
+            }
+
+            // Face normal — identical computation to build_flat_shaded_mesh.
+            let p0 = (positions[i0 * 3] as f64, positions[i0 * 3 + 1] as f64, positions[i0 * 3 + 2] as f64);
+            let p1 = (positions[i1 * 3] as f64, positions[i1 * 3 + 1] as f64, positions[i1 * 3 + 2] as f64);
+            let p2 = (positions[i2 * 3] as f64, positions[i2 * 3 + 1] as f64, positions[i2 * 3 + 2] as f64);
+            let e1 = (p1.0 - p0.0, p1.1 - p0.1, p1.2 - p0.2);
+            let e2 = (p2.0 - p0.0, p2.1 - p0.1, p2.2 - p0.2);
+            let nx = e1.1 * e2.2 - e1.2 * e2.1;
+            let ny = e1.2 * e2.0 - e1.0 * e2.2;
+            let nz = e1.0 * e2.1 - e1.1 * e2.0;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let (nx, ny, nz) = if len > 1e-12 {
+                (nx / len, ny / len, nz / len)
+            } else {
+                (0.0, 0.0, 1.0)
+            };
+
+            let tri_uv = tex_coord_index.get(tri_i);
+            for (corner, &idx) in [i0, i1, i2].iter().enumerate() {
+                flat_positions.push(positions[idx * 3]);
+                flat_positions.push(positions[idx * 3 + 1]);
+                flat_positions.push(positions[idx * 3 + 2]);
+                flat_normals.push(nx as f32);
+                flat_normals.push(ny as f32);
+                flat_normals.push(nz as f32);
+                // Use the authored texture coordinates directly. The optional
+                // IfcSurfaceTexture.TextureTransform is intentionally NOT applied:
+                // its Scale over-tiles the texture (the buildingSMART annex-E
+                // reference renders these coords ~1:1), and the TexCoords already
+                // carry any intended offset.
+                let uv = tri_uv
+                    .and_then(|t| {
+                        let one_based = t[corner] as usize;
+                        tex_coords.get(one_based.checked_sub(1)?).copied()
+                    })
+                    .unwrap_or([0.0, 0.0]);
+                // Flip V: IFC texture coordinates use a bottom-left origin (v up,
+                // OpenGL/STEP convention), but GPU sampling + glTF export use a
+                // top-left origin. Converting here (Rust = single source) keeps the
+                // image upright for every consumer (viewer, server, CLI, export)
+                // instead of each one re-flipping. Verified against the
+                // buildingSMART annex-E reference render.
+                uvs.push(uv[0]);
+                uvs.push(1.0 - uv[1]);
+                flat_indices.push(next_index);
+                next_index += 1;
+            }
         }
+
+        (
+            Mesh {
+                positions: flat_positions,
+                normals: flat_normals,
+                indices: flat_indices,
+                rtc_applied: false, 
+                origin: [0.0; 3],            },
+            uvs,
+        )
     }
 }
 
@@ -541,6 +714,7 @@ impl GeometryProcessor for PolygonalFaceSetProcessor {
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
         _schema: &IfcSchema,
+        _quality: TessellationQuality,
     ) -> Result<Mesh> {
         // IfcPolygonalFaceSet attributes:
         // 0: Coordinates (IfcCartesianPointList3D)

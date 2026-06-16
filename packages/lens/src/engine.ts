@@ -178,7 +178,10 @@ export function evaluateAutoColorLens(
 
     ruleCounts.set(ruleId, entityIds.length);
     ruleEntityIds.set(ruleId, entityIds);
-    legend.push({ id: ruleId, name: value, color, count: entityIds.length });
+    const displayName = autoColor.source === 'model'
+      ? (provider.getModelName?.(value) ?? value)
+      : value;
+    legend.push({ id: ruleId, name: displayName, color, count: entityIds.length });
   }
 
   // Ghost unmatched (null/empty value) entities
@@ -229,8 +232,14 @@ function extractAutoColorValue(
       {
         const cls = provider.getClassifications(globalId);
         if (!cls || cls.length === 0) return undefined;
-        // Use "system: identification" as the grouping key
-        const c = cls[0];
+        // Use "system: identification" as the grouping key. When psetName is set,
+        // treat it as a classification-system filter (mirroring matchesClassification),
+        // selecting the matching reference instead of unconditionally using the first.
+        const c = spec.psetName
+          ? (cls.find((ref) =>
+              (ref.system ?? '').toLowerCase().includes(spec.psetName!.toLowerCase()),
+            ) ?? cls[0])
+          : cls[0];
         const parts: string[] = [];
         if (c.system) parts.push(c.system);
         if (c.identification) parts.push(c.identification);
@@ -240,6 +249,22 @@ function extractAutoColorValue(
     case 'material':
       if (!provider.getMaterialName) return undefined;
       return provider.getMaterialName(globalId);
+
+    case 'model':
+      if (!provider.getModelId) return undefined;
+      return provider.getModelId(globalId);
+
+    case 'group': {
+      if (!provider.getEntityGroups) return undefined;
+      const groups = provider.getEntityGroups(globalId);
+      if (!groups || groups.length === 0) return undefined;
+      // Prefer an IfcZone membership so multi-group entities (IfcZone +
+      // IfcGroup/IfcSystem) bucket by zone deterministically, not by whichever
+      // relation happened to come first. Use the name when present, else
+      // "Type #id" so unnamed groups still bucket distinctly.
+      const g = groups.find((x) => x.type === 'IfcZone') ?? groups[0];
+      return g.name && g.name.trim() !== '' ? g.name : `${g.type} #${g.id}`;
+    }
 
     default:
       return undefined;

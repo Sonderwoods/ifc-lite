@@ -1,5 +1,293 @@
 # @ifc-lite/export
 
+## 1.19.8
+
+### Patch Changes
+
+- [#1116](https://github.com/LTplus-AG/ifc-lite/pull/1116) [`49778b1`](https://github.com/LTplus-AG/ifc-lite/commit/49778b179826d46e1c96361fe7b557e42db4ecfe) Thanks [@louistrue](https://github.com/louistrue)! - Fix STEP exporters dropping deferred property atoms, which produced hundreds of thousands of dangling `#`-references in merged (and single-model) IFC output.
+
+  On large files the parser can move high-cardinality property atoms (`IfcPropertySingleValue`, `IfcQuantity*`, `IfcPropertyEnumeratedValue`, …) out of `entityIndex.byId` into a secondary `deferredEntityIndex` to cap memory (`deferPropertyAtomIndex`). Every other consumer (on-demand property/material extraction) reads through the `byId.get(id) ?? deferredEntityIndex.get(id)` fallback, but `MergedExporter` and `StepExporter` walked `byId` alone. They therefore emitted the `IfcPropertySet` / `IfcElementQuantity` _containers_ while silently dropping the atoms those containers reference — leaving the STEP output full of references to entities that are never defined. Strict viewers (e.g. BIM Vision) reject such files, and lenient ones fall geometry back to the origin when a placement / type / material chain resolves to a dropped entity.
+
+  Both exporters now iterate the complete entity set via a shared `getCompleteEntityIndex` helper (primary index + deferred atoms), and the merge offset / new-id allocation now spans deferred ids too so remapped ids can't collide with a deferred atom sitting at a higher express id. When nothing was deferred the primary index is returned unchanged, so the common path keeps its existing behaviour and cost.
+
+- Updated dependencies [[`49778b1`](https://github.com/LTplus-AG/ifc-lite/commit/49778b179826d46e1c96361fe7b557e42db4ecfe)]:
+  - @ifc-lite/mutations@1.15.4
+
+## 1.19.7
+
+### Patch Changes
+
+- [#1114](https://github.com/LTplus-AG/ifc-lite/pull/1114) [`16d87f2`](https://github.com/LTplus-AG/ifc-lite/commit/16d87f201dfd7d4cba46bb43e0f4a44ccce717bb) Thanks [@louistrue](https://github.com/louistrue)! - Per-element local frame: eliminate f32 "fan" corruption on building-scale and georeferenced models.
+
+  When a mesh is stored at f32 precision while its vertices sit at building-scale world coordinates (a model whose extent reaches ~200 m from the coordinate origin), the f32 mantissa only resolves ~15 µm there, so vertices closer than one ULP collapse to the same value and the triangles joining them fan out as long needles across the model. Lowering the global RTC threshold is the wrong lever (it is reserved for >10 km federation re-basing), and a single global recentre still leaves the model genuinely spanning ~200 m.
+
+  Each element's vertices are now stored RELATIVE to a per-element `MeshData.origin` (the f64 AABB centre, snapped to the kernel reconcile grid `1/65536 m`), so the f32 coordinates stay element-small and collapse-free at any building or georef scale; the world position is `origin + position`. The renderer reconstructs world space with a per-batch model-matrix translate around a single shared scene origin (so abutting elements in different colour batches stay bit-coincident with no seam z-fighting), and the selection-highlight / GPU-picker buffers replicate the batch's exact f32 path so highlights are bit-coincident with no depth bias. The local frame is ON for the wasm (viewer) path and opt-in for native/server, so determinism snapshots and server output stay absolute-coordinate byte-identical.
+
+  Every world-space consumer of element geometry now folds `origin` (`world = origin + position`): camera/scene bounds, the CPU raycast + BVH narrow phase, snap detection, the section cutters (CPU + GPU), the BIM↔scan deviation BVH, the spatial index, clash (world-frame triangles fed to both the TS and Rust kernels), the glTF / IFC5 / Parquet exporters, the Cesium GLB overlay, the construction-projection outline + storey-band derivation, and the federation alignment / mesh-duplicate paths. `MeshData.origin` is serialized in the geometry cache (format version 6, which auto-heals stale entries). Position differences (normals, edge vectors, areas) are origin-invariant and unchanged.
+
+  This composes with the sub-grid sliver hygiene pass: the local frame removes the f32-storage fans, and `Mesh::clean_degenerate` removes the sub-grid slivers the finer-grained CSG host emits.
+
+- Updated dependencies [[`d2086aa`](https://github.com/LTplus-AG/ifc-lite/commit/d2086aa0c5ab5e4d4f98cb25498f58a88c24443c), [`4af01aa`](https://github.com/LTplus-AG/ifc-lite/commit/4af01aabe1c669864c3c3d1757789d7de81beaec), [`16d87f2`](https://github.com/LTplus-AG/ifc-lite/commit/16d87f201dfd7d4cba46bb43e0f4a44ccce717bb), [`02d5ba7`](https://github.com/LTplus-AG/ifc-lite/commit/02d5ba76151bcab80595c8ea80e4046260be73e8), [`16d87f2`](https://github.com/LTplus-AG/ifc-lite/commit/16d87f201dfd7d4cba46bb43e0f4a44ccce717bb), [`02d5ba7`](https://github.com/LTplus-AG/ifc-lite/commit/02d5ba76151bcab80595c8ea80e4046260be73e8), [`02d5ba7`](https://github.com/LTplus-AG/ifc-lite/commit/02d5ba76151bcab80595c8ea80e4046260be73e8), [`977b41d`](https://github.com/LTplus-AG/ifc-lite/commit/977b41db04a83d912f85cc9167cd564ffcb0aafb), [`e42b703`](https://github.com/LTplus-AG/ifc-lite/commit/e42b70324a9d5caab23257d52e96df0198d8caa9), [`16d87f2`](https://github.com/LTplus-AG/ifc-lite/commit/16d87f201dfd7d4cba46bb43e0f4a44ccce717bb)]:
+  - @ifc-lite/geometry@2.7.0
+
+## 1.19.6
+
+### Patch Changes
+
+- [#1071](https://github.com/LTplus-AG/ifc-lite/pull/1071) [`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe) Thanks [@louistrue](https://github.com/louistrue)! - Client/server alignment fixes:
+
+  - `@ifc-lite/create`: `IfcCreator` now generates spec-valid 128-bit GlobalIds via the canonical `@ifc-lite/encoding` encoder (previously ~94% of generated ids failed `isValidIfcGuid` and silently changed identity on guid→uuid→guid round-trips, e.g. in BCF).
+  - `@ifc-lite/export`: schema-downgrade `IFCPROXY` placeholders now carry spec-valid GlobalIds instead of synthetic `PROXY_…` markers.
+  - `@ifc-lite/parser`: `extractLengthUnitScale` now mirrors the canonical Rust extractor when an `IfcMeasureWithUnit` ValueComponent is unreadable — defaults the value to 1.0 and still applies the UnitComponent SI-prefix instead of falling through to metres (property scaling can no longer desync from geometry scaling).
+  - `@ifc-lite/geometry`: removed the dead legacy worker protocol (`process`/`prepass`/`prepass-fast` messages) — the streaming protocol (`stream-start`/`stream-chunk`/`stream-end` + `prepass-streaming`) is the only path; the wasm `buildPrePassFast` export is gone. Streaming pre-pass loads now apply aggregate void propagation (window/door cuts on aggregated parts) in parity with one-shot loads and the server.
+  - `@ifc-lite/server-client`: `ProcessingStats` gains optional `total_csg_failures` / `products_with_failures` fields — the server now reports the same CSG failure diagnostics the browser console shows.
+
+- [#1071](https://github.com/LTplus-AG/ifc-lite/pull/1071) [`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe) Thanks [@louistrue](https://github.com/louistrue)! - Client surface alignment (audit follow-ups):
+
+  - `@ifc-lite/server-client`: `ServerConfig.token` sends `Authorization: Bearer` on every request (servers running `IFC_SERVER_API_TOKEN` were unreachable from the TS client); the `ParseResponse` / `ProcessingStats` / `MeshData` mirrors gain the optional fields the Rust server actually serves (`mesh_coordinate_space`, transforms, scan/lookup/preprocess timings, mesh metadata).
+  - `@ifc-lite/geometry`: the worker-pool converter now carries `shadingColor` across the worker boundary — GLB "Shading" export no longer degrades on the default (parallel) load path; dead legacy wasm bindings removed (`IfcAPI.parse`, `parseStreaming`, `scanRelevantEntitiesFastBytes`, `MeshCollection.localToWorld`).
+  - `@ifc-lite/export`: `assembleStepBytes` deduplicated into `step-serialization` (was copied byte-for-byte in the STEP and merged exporters).
+
+- Updated dependencies [[`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe), [`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe), [`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe), [`891efef`](https://github.com/LTplus-AG/ifc-lite/commit/891efef5fa9fca04bf2e01be9a1de04bbb84aafe), [`da1999f`](https://github.com/LTplus-AG/ifc-lite/commit/da1999fc6e482fa3d668b9aa98a840d2bb838112)]:
+  - @ifc-lite/parser@3.2.0
+  - @ifc-lite/geometry@2.6.1
+  - @ifc-lite/data@2.0.3
+
+## 1.19.5
+
+### Patch Changes
+
+- [#1036](https://github.com/LTplus-AG/ifc-lite/pull/1036) [`0205c4d`](https://github.com/LTplus-AG/ifc-lite/commit/0205c4d50995572ef796ce66877aa389f19c6fbc) Thanks [@louistrue](https://github.com/louistrue)! - Add a `default` condition to every package's exports map. The maps only
+  declared `import` + `types`, so any resolver hitting the CJS/default
+  condition path (tsx, jest, plain `require`, some bundlers) failed with
+  ERR_PACKAGE_PATH_NOT_EXPORTED. The `default` entry points at the same
+  ESM dist file; pure ESM consumers are unaffected.
+- Updated dependencies [[`0205c4d`](https://github.com/LTplus-AG/ifc-lite/commit/0205c4d50995572ef796ce66877aa389f19c6fbc)]:
+  - @ifc-lite/data@2.0.2
+  - @ifc-lite/encoding@1.14.7
+  - @ifc-lite/geometry@2.4.1
+  - @ifc-lite/mutations@1.15.3
+  - @ifc-lite/parser@3.1.1
+
+## 1.19.4
+
+### Patch Changes
+
+- [#946](https://github.com/LTplus-AG/ifc-lite/pull/946) [`6378998`](https://github.com/LTplus-AG/ifc-lite/commit/6378998ec146f7f9297ef5fcc5953b155fd6b5e0) Thanks [@louistrue](https://github.com/louistrue)! - Fix a batch of verified findings from a full-codebase review (security, correctness,
+  data-loss, and resource/memory leaks). Highlights:
+
+  **Security**
+
+  - collab-server: a malformed WebSocket frame no longer crashes the whole process
+    (decode is wrapped; a bad frame is rejected/audited instead of throwing).
+  - mcp: the local HTTP transport now validates `Host`/`Origin` and no longer sends a
+    wildcard `Access-Control-Allow-Origin`, closing a DNS-rebinding/CSRF hole; the
+    `AuthScope.modelIds` allowlist is now enforced at model resolution.
+  - server-bin: `extractZip` uses `execFileSync` (argv, no shell), removing command
+    injection via archive/destination paths.
+  - export / sdk / cli / mcp / lists / viewer CSV exporters now neutralize spreadsheet
+    formula injection (CWE-1236) consistently.
+  - create-ifc-lite: validates the project name (no path traversal) and drops the
+    unused `execSync`-based downloader.
+  - embed-sdk: inbound `postMessage` now validates `event.origin`.
+
+  **Correctness / data-loss**
+
+  - parser: `lengthUnitScale` survives the worker transport; the nested STEP list
+    parser is string-aware (commas/parens inside quoted values no longer mis-split).
+  - mutations: deleting a property from a session-created pset and replaying
+    `UPDATE_ATTRIBUTE` / `CREATE_PROPERTY_SET` mutations now work.
+  - export: merged-export ID remapping no longer rewrites `#N` inside quoted strings.
+  - drawing-2d: GPU section cutter triangle upload/readback use correct WGSL std-layout
+    offsets and strides.
+  - ifcx: cyclic children no longer abort the parse; spatial children round-trip; the
+    mesh transform guards a zero/non-finite homogeneous `w`.
+  - data / cache: a `NULL` string property value stays `null` instead of becoming `""`.
+  - pointcloud, bcf, server-client, query, viewer-core, viewer store/federation: assorted
+    decoding, federation-id, and selection-state fixes.
+
+  **Resource / memory leaks**
+
+  - geometry, query (DuckDB), renderer (GPU buffers), collab (federation presence),
+    sandbox (host log capture + runtime), mcp (clash mesh cache), server-bin (signal
+    listeners), and the viewer renderer on unmount now release resources deterministically.
+
+  **Hardening (apps, not published)**
+
+  - server: a dedicated `server-release` Cargo profile (`panic = "unwind"`) plus a
+    `CatchPanicLayer` contain a malformed-IFC parse panic to the offending request
+    instead of aborting the whole server.
+  - desktop (Tauri): a Content-Security-Policy is set, and unused `shell:*` /
+    `fs:allow-write|mkdir|remove` capabilities (and the unused shell plugin) are removed.
+
+  **Second pass** (additional verified findings)
+
+  - collab-server: S3 log load now follows `ListObjectsV2` pagination (no dropped frames);
+    awareness frames are size-capped + rate-limited; path-lock verify runs after role/rate-limit;
+    the blob route requires auth and `/metrics` can be token-gated.
+  - server-bin: downloaded binaries are SHA-256 verified against a release sidecar (fail-closed on
+    mismatch, warn-if-absent for older releases).
+  - extensions: inner-ring capability check fails _closed_ for unknown namespaces; signing
+    canonicalization is now injective (length-prefixed).
+  - correctness/leaks: mutations quantity type+unit preserved on replay; `findByProperty` boolean
+    comparisons; Parquet REAL columns kept as Float64; blob GC fail-safe on missing `uploadedAt`;
+    spatial-hierarchy + codegen cycle guards; BVH NaN edge; bSDD/playground caches bounded;
+    point-cloud GPU asset freed on federation error; mcp `parseColor` rejects non-hex; bcf/SVG/STEP
+    output escaping; and more.
+
+- Updated dependencies [[`b33e1f7`](https://github.com/LTplus-AG/ifc-lite/commit/b33e1f7c4706fe4b0d850d3da782ea84267dd525), [`55fd14e`](https://github.com/LTplus-AG/ifc-lite/commit/55fd14e5017f626567b10622bb41ddac3311e70c), [`6378998`](https://github.com/LTplus-AG/ifc-lite/commit/6378998ec146f7f9297ef5fcc5953b155fd6b5e0), [`ca293ed`](https://github.com/LTplus-AG/ifc-lite/commit/ca293ed7080495b29dd555b191ae0095ff267e4b)]:
+  - @ifc-lite/parser@3.1.0
+  - @ifc-lite/geometry@2.3.0
+  - @ifc-lite/mutations@1.15.2
+  - @ifc-lite/data@2.0.1
+
+## 1.19.3
+
+### Patch Changes
+
+- [#874](https://github.com/LTplus-AG/ifc-lite/pull/874) [`e73ac09`](https://github.com/LTplus-AG/ifc-lite/commit/e73ac0931b85cd299ae9b723073e956b6b124c85) Thanks [@louistrue](https://github.com/louistrue)! - Centralize IFC STEP entity scan selection behind a typed scanner helper, remove the unused duplicate `parseEntityOnDemand` implementation, keep the legacy `parse()` adapter on the shared scan path, route LOD exports through shared/adaptive ingestion paths, persist cache entity-index columns to avoid cache reload rescans, and update public docs away from legacy sync parse/geometry paths.
+
+- Updated dependencies [[`e73ac09`](https://github.com/LTplus-AG/ifc-lite/commit/e73ac0931b85cd299ae9b723073e956b6b124c85), [`e73ac09`](https://github.com/LTplus-AG/ifc-lite/commit/e73ac0931b85cd299ae9b723073e956b6b124c85)]:
+  - @ifc-lite/parser@3.0.0
+  - @ifc-lite/geometry@2.0.0
+  - @ifc-lite/data@2.0.0
+  - @ifc-lite/mutations@1.15.1
+
+## 1.19.2
+
+### Patch Changes
+
+- [#813](https://github.com/LTplus-AG/ifc-lite/pull/813) [`78f1d10`](https://github.com/LTplus-AG/ifc-lite/commit/78f1d10aab812da682962845638daa95b86ae178) Thanks [@louistrue](https://github.com/louistrue)! - fix(glb): preserve per-mesh colours when re-importing a `.glb`
+
+  Both GLB importers (`parseGLBToMeshData` in `@ifc-lite/cache` and the
+  secondary one in `@ifc-lite/export`) hardcoded
+  `color: [0.8, 0.8, 0.8, 1.0]` on every mesh and never looked at
+  `materials[*].pbrMetallicRoughness.baseColorFactor`. After the
+  GLB-export-dialog work ([#688](https://github.com/LTplus-AG/ifc-lite/issues/688)) wired colour authoring through the
+  exporter end-to-end, a round-trip
+  (IFC → GLB → re-import as model) silently lost all colour and the
+  viewport went grey.
+
+  Fix: resolve each primitive's `material` index against the glTF
+  `materials` array and copy `baseColorFactor` into `MeshData.color`,
+  keeping the previous grey as the fallback when a primitive has no
+  material (e.g. third-party glTFs). Regression tests added in both
+  packages cover the round-trip and the no-material fallback.
+
+- Updated dependencies [[`bdb9978`](https://github.com/LTplus-AG/ifc-lite/commit/bdb997842fe38627fefbcddf250fc0136289bc84)]:
+  - @ifc-lite/parser@2.4.2
+
+## 1.19.1
+
+### Patch Changes
+
+- [#810](https://github.com/LTplus-AG/ifc-lite/pull/810) [`e80e728`](https://github.com/LTplus-AG/ifc-lite/commit/e80e7281273a4a8352d9efae151f07c9f6be18f7) Thanks [@louistrue](https://github.com/louistrue)! - fix(glb): preserve per-mesh colours when re-importing a `.glb`
+
+  Both GLB importers (`parseGLBToMeshData` in `@ifc-lite/cache` and the
+  secondary one in `@ifc-lite/export`) hardcoded
+  `color: [0.8, 0.8, 0.8, 1.0]` on every mesh and never looked at
+  `materials[*].pbrMetallicRoughness.baseColorFactor`. After the
+  GLB-export-dialog work ([#688](https://github.com/LTplus-AG/ifc-lite/issues/688)) wired colour authoring through the
+  exporter end-to-end, a round-trip
+  (IFC → GLB → re-import as model) silently lost all colour and the
+  viewport went grey.
+
+  Fix: resolve each primitive's `material` index against the glTF
+  `materials` array and copy `baseColorFactor` into `MeshData.color`,
+  keeping the previous grey as the fallback when a primitive has no
+  material (e.g. third-party glTFs). Regression tests added in both
+  packages cover the round-trip and the no-material fallback.
+
+## 1.19.0
+
+### Minor Changes
+
+- [#688](https://github.com/LTplus-AG/ifc-lite/pull/688) [`d0ba541`](https://github.com/LTplus-AG/ifc-lite/commit/d0ba541dda3936b985c2189fbca4300cbb89df91) Thanks [@louistrue](https://github.com/louistrue)! - Add GLB export dialog with colour-source selection and visibility
+  filtering (PR [#688](https://github.com/LTplus-AG/ifc-lite/issues/688)).
+
+  The new `GLBExportDialog` in the viewer replaces the inline GLB
+  export handler in `MainToolbar` with a dedicated dialog. Features:
+
+  - **Model picker** for federated multi-model scenes.
+  - **Colour source** selector: "Rendering" (the apparent display
+    colour — `IfcSurfaceStyleRendering.DiffuseColour` if authored,
+    falling back to `IfcSurfaceStyleShading.SurfaceColour`) or
+    "Shading" (the raw `SurfaceColour`, only available when the file
+    authored a distinct `DiffuseColour`).
+  - **Visible-only filter** that respects the viewer's hidden /
+    isolated entity sets. Mesh-vs-set comparison runs in global ID
+    space so federated models with non-zero `idOffset` filter
+    correctly.
+  - **Metadata inclusion** toggle for IFC GlobalId / type / name
+    side-tables.
+
+  Pipeline changes underneath:
+
+  - `MeshData` / `MeshDataJs` carry an optional `shadingColor`
+    alongside `color`. The Rust styling module now extracts both
+    `IfcSurfaceStyleRendering.DiffuseColour` (rendering) and
+    `IfcSurfaceStyleShading.SurfaceColour` (shading) in a single
+    pre-pass and returns them as separate maps; `shadingColor` is
+    only populated when it actually differs from the rendering
+    colour, so memory cost stays sparse on the common case.
+  - The streaming geometry path
+    (`convertMeshCollectionToBatch`) and the worker collector
+    (`IfcLiteMeshCollector`) both copy `shadingColor` end-to-end so
+    the dialog's "Shading" source works on every load path, not just
+    the batch path.
+  - `GLTFExporter` gains `colorSource`, `visibleOnly`,
+    `hiddenEntityIds`, and `isolatedEntityIds` options. Visibility
+    filtering compares mesh `expressId` (global) against the dialog-
+    supplied sets (also global) — no offset arithmetic in the
+    exporter.
+
+### Patch Changes
+
+- Updated dependencies [[`d0ba541`](https://github.com/LTplus-AG/ifc-lite/commit/d0ba541dda3936b985c2189fbca4300cbb89df91)]:
+  - @ifc-lite/geometry@1.19.0
+
+## 1.18.1
+
+### Patch Changes
+
+- [#726](https://github.com/LTplus-AG/ifc-lite/pull/726) [`58e2e9e`](https://github.com/LTplus-AG/ifc-lite/commit/58e2e9ed3e3f17b6d2fc73ae320ec95be5b17e36) Thanks [@louistrue](https://github.com/louistrue)! - Fix STEP/IFC export failing with `TextDecoder.decode: ArrayBufferView ... can't
+be a SharedArrayBuffer` when the data store's source buffer is SAB-backed.
+  Both `StepExporter` and `MergedExporter` now route all source-byte decodes
+  through `safeUtf8Decode` from `@ifc-lite/data`, which transparently copies
+  into a scratch buffer on the (Firefox / Chrome-with-mitigation) runtimes
+  that reject `TextDecoder.decode()` on `SharedArrayBuffer` views.
+
+## 1.18.0
+
+### Minor Changes
+
+- [#598](https://github.com/louistrue/ifc-lite/pull/598) [`25c9877`](https://github.com/louistrue/ifc-lite/commit/25c9877969d2dcccb9c4e61f57b188cbf5fbbc3c) Thanks [@louistrue](https://github.com/louistrue)! - `StepExporter` improvements for the overlay-driven add/duplicate/edit flow.
+
+  - Overlay-created entities (`view.createEntity()` / `store.addEntity()`)
+    now respect `includeGeometry: false` and the `visibleOnly` /
+    `allowedEntityIds` closure — same filters that already apply to
+    source entities. Without this a freshly-added wall would smuggle
+    its `IfcCartesianPoint`/`IfcExtrudedAreaSolid` helpers past
+    `exportPropertiesOnly()`.
+  - `deltaOnly` mode now keeps overlay-created entities even when no
+    other modifications exist — the early-return predicate consults
+    `mutationView.getNewEntities()` and `newGeorefLines` so a
+    `createEntity()`-only edit isn't silently dropped from the
+    delta. Regression test
+    (`emits overlay-created entities under deltaOnly when no other
+modifications exist`) locks this behaviour in.
+  - `serializeStepArgs` / `serializeStepValue` are exported from
+    `@ifc-lite/export/step-serialization` so the overlay-emit path
+    and the rest of the codebase share one canonical STEP-formatting
+    implementation.
+
+### Patch Changes
+
+- Updated dependencies [[`25c9877`](https://github.com/louistrue/ifc-lite/commit/25c9877969d2dcccb9c4e61f57b188cbf5fbbc3c), [`25c9877`](https://github.com/louistrue/ifc-lite/commit/25c9877969d2dcccb9c4e61f57b188cbf5fbbc3c), [`25c9877`](https://github.com/louistrue/ifc-lite/commit/25c9877969d2dcccb9c4e61f57b188cbf5fbbc3c), [`1309f8c`](https://github.com/louistrue/ifc-lite/commit/1309f8cba128b3b6237ebfb9831bf359c426a742), [`1309f8c`](https://github.com/louistrue/ifc-lite/commit/1309f8cba128b3b6237ebfb9831bf359c426a742), [`16d7a63`](https://github.com/louistrue/ifc-lite/commit/16d7a6361a78bb39a2bd61bba6990db5d3df0c04)]:
+  - @ifc-lite/mutations@1.15.0
+  - @ifc-lite/parser@2.2.0
+  - @ifc-lite/geometry@1.16.6
+
 ## 1.17.2
 
 ### Patch Changes

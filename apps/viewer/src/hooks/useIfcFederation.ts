@@ -10,34 +10,26 @@
  * Extracted from useIfc.ts for better separation of concerns
  */
 
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { useViewerStore, type FederatedModel, type SchemaVersion } from '../store.js';
-import { detectFormat, parseFederatedIfcx, type IfcDataStore, type FederatedIfcxParseResult } from '@ifc-lite/parser';
-import type { MeshData } from '@ifc-lite/geometry';
+import { useViewerStore, type FederatedModel, type SchemaVersion } from '../store/index.js';
+import {
+  detectFormat,
+  parseFederatedIfcx,
+  type IfcDataStore,
+  type FederatedIfcxParseResult,
+} from '@ifc-lite/parser';
+import type { CoordinateInfo, MeshData } from '@ifc-lite/geometry';
 import { IfcQuery } from '@ifc-lite/query';
 import { buildSpatialIndexGuarded } from '../utils/loadingUtils.js';
 import { getDynamicBatchConfig } from '../utils/ifcConfig.js';
 import { calculateMeshBounds, createCoordinateInfo } from '../utils/localParsingUtils.js';
 import {
   convertIfcxMeshes,
-  getMaxExpressId,
-  parseGlbViewerModel,
-  parseIfcxViewerModel,
-  parseStepBufferViewerModel,
 } from './ingest/viewerModelIngest.js';
-import { readNativeFile, type NativeFileHandle } from '../services/file-dialog.js';
-
-function isNativeFileHandle(file: File | NativeFileHandle): file is NativeFileHandle {
-  return typeof (file as NativeFileHandle).path === 'string';
-}
-
-function toExactArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
-    return bytes.buffer;
-  }
-  return bytes.slice().buffer;
-}
+import { extractModelGeoref, alignGeometryToReference, findReferenceGeorefModel } from './ingest/federationAlign.js';
+import { toast } from '../components/ui/toast.js';
+import { acquireFederationLoadSlot, releaseFederationLoadSlot } from './federationLoadGate.js';
 
 /**
  * Extended data store type for IFCX (IFC5) files.
@@ -60,7 +52,11 @@ export interface IfcxDataStore extends IfcDataStore {
  * Includes addModel, removeModel, federated IFCX loading, overlay management,
  * and ID resolution helpers
  */
-export function useIfcFederation() {
+export function useIfcFederation(
+  // The ONE canonical loader. Federated adds route through it (target
+  // 'federated') so model #1 and model #N share an identical pipeline.
+  loadFile: (file: File, target?: import('./useIfcLoader.js').LoadTarget) => Promise<void>,
+) {
   const {
     setLoading,
     setError,
@@ -93,200 +89,245 @@ export function useIfcFederation() {
     findModelForGlobalId: s.findModelForGlobalId,
   })));
 
+  // Per-call ownership token. Each addModel() bumps this; state writes
+  // (loading/error/progress) in the catch block must compare back to
+  // their captured value before mutating, so a cancelled load A doesn't
+  // overwrite progress for a newer load B that started after A's abort.
+  // Mirrors the same pattern in useIfcLoader.ts.
+  const loadSessionRef = useRef(0);
+
   /**
    * Add a model to the federation (multi-model support)
    * Uses FederationRegistry to assign unique ID offsets - BULLETPROOF against ID collisions
    * Returns the model ID on success, null on failure
    */
   const addModel = useCallback(async (
-    file: File | NativeFileHandle,
-    options?: { name?: string }
+    file: File,
+    options?: {
+      name?: string;
+      modelId?: string;
+      loadedAt?: number;
+      visible?: boolean;
+      collapsed?: boolean;
+    }
   ): Promise<string | null> => {
-    const modelId = crypto.randomUUID();
+    const modelId = options?.modelId ?? crypto.randomUUID();
     const addStart = performance.now();
+    // Bump the per-call ownership token first so that any error path
+    // (including the load gate) can compare against this captured value
+    // before mutating shared loading/error/progress state.
+    const currentSession = ++loadSessionRef.current;
+    // Memory-aware load gate: if a previous federation load is still in
+    // flight on this tab and admitting this one would exceed the device
+    // memory budget, wait until headroom frees. Single-file loads never
+    // wait. See `federationLoadGate.ts` for the budget formula. (#600)
+    const fileSizeForGateMB = (typeof (file as File).size === 'number' ? (file as File).size : 0) / (1024 * 1024);
+    const gateSlot = await acquireFederationLoadSlot(fileSizeForGateMB);
     try {
-      // IMPORTANT: Before adding a new model, check if there's a legacy model
-      // (loaded via loadFile) that's not in the Map yet. If so, migrate it first.
-      const currentModels = useViewerStore.getState().models;
-      const currentIfcDataStore = useViewerStore.getState().ifcDataStore;
-      const currentGeometryResult = useViewerStore.getState().geometryResult;
-
-      if (currentModels.size === 0 && currentIfcDataStore && currentGeometryResult) {
-        // Migrate the legacy model to the Map
-        // Legacy model has offset 0 (IDs are unchanged)
-        const legacyModelId = crypto.randomUUID();
-        const legacyName = currentIfcDataStore.spatialHierarchy?.project?.name || 'Model 1';
-
-        // Find max expressId in legacy model for registry
-        // IMPORTANT: Include ALL entities, not just meshes, for proper globalId resolution
-        const legacyMeshes = currentGeometryResult.meshes || [];
-        const legacyMaxExpressIdFromMeshes = legacyMeshes.reduce((max: number, m: MeshData) => Math.max(max, m.expressId), 0);
-        // FIXED: Use iteration instead of spread to avoid stack overflow with large Maps
-        let legacyMaxExpressIdFromEntities = 0;
-        if (currentIfcDataStore.entityIndex?.byId) {
-          for (const key of currentIfcDataStore.entityIndex.byId.keys()) {
-            if (key > legacyMaxExpressIdFromEntities) legacyMaxExpressIdFromEntities = key;
-          }
-        }
-        const legacyMaxExpressId = Math.max(legacyMaxExpressIdFromMeshes, legacyMaxExpressIdFromEntities);
-
-        // Register legacy model with offset 0 (IDs already in use as-is)
-        const legacyOffset = registerModelOffset(legacyModelId, legacyMaxExpressId);
-
-        const legacyModel: FederatedModel = {
-          id: legacyModelId,
-          name: legacyName,
-          ifcDataStore: currentIfcDataStore,
-          geometryResult: currentGeometryResult,
-          visible: true,
-          collapsed: false,
-          schemaVersion: 'IFC4',
-          loadedAt: Date.now() - 1000,
-          fileSize: 0,
-          idOffset: legacyOffset,
-          maxExpressId: legacyMaxExpressId,
-        };
-        storeAddModel(legacyModel);
-      }
-
+      // (Removed the legacy→Map migration: every model — including model #1 —
+      // now registers in the FederationRegistry + models Map via loadFile's
+      // upsertModel/finalizeModel, so a top-level-only "legacy" model can no
+      // longer exist. See PR description for the audit.)
       setLoading(true);
       setError(null);
       setProgress({ phase: 'Loading file', percent: 0 });
 
-      // Read file from disk
-      const buffer = isNativeFileHandle(file)
-        ? toExactArrayBuffer(await readNativeFile(file.path))
-        : await file.arrayBuffer();
-      const fileSizeMB = buffer.byteLength / (1024 * 1024);
-
-      // Detect file format
-      const format = detectFormat(buffer);
-
-      let parsedDataStore: IfcDataStore | null = null;
-      let parsedGeometry: FederatedModel['geometryResult'] = null;
-      let schemaVersion: SchemaVersion = 'IFC4';
-
-      if (format === 'ifcx') {
-        setProgress({ phase: 'Parsing IFCX (client-side)', percent: 10 });
-        try {
-          const result = await parseIfcxViewerModel(buffer, setProgress);
-          parsedDataStore = result.dataStore;
-          parsedGeometry = result.geometryResult;
-          schemaVersion = result.schemaVersion;
-        } catch (error) {
-          if (error instanceof Error && error.message === 'overlay-only-ifcx') {
-            console.warn(`[useIfc] IFCX file "${file.name}" has no geometry - this is an overlay file.`);
-            setError(`"${file.name}" is an overlay file with no geometry. Please load it together with a base IFCX file (select all files at once for federated loading).`);
-            setLoading(false);
-            return null;
-          }
-          throw error;
-        }
-      } else if (format === 'glb') {
-        setProgress({ phase: 'Parsing GLB', percent: 10 });
-        const result = await parseGlbViewerModel(buffer);
-        parsedDataStore = result.dataStore;
-        parsedGeometry = result.geometryResult;
-        schemaVersion = result.schemaVersion;
-      } else {
-        setProgress({ phase: 'Starting geometry streaming', percent: 10 });
-
-        // For federated models: use the first model's RTC offset so all models
-        // share the same coordinate origin. This ensures pixel-perfect alignment
-        // without error-prone delta adjustments.
-        let sharedRtcOffset: { x: number; y: number; z: number } | undefined;
-        const existingModelsForRtc = Array.from(useViewerStore.getState().models.values()) as FederatedModel[];
-        if (existingModelsForRtc.length > 0) {
-          const sorted = [...existingModelsForRtc].sort((a, b) => (a.loadedAt ?? 0) - (b.loadedAt ?? 0));
-          sharedRtcOffset = sorted.find(
-            (model) => model.geometryResult?.coordinateInfo?.wasmRtcOffset != null,
-          )?.geometryResult?.coordinateInfo?.wasmRtcOffset;
-        }
-
-        const result = await parseStepBufferViewerModel({
-          fileName: file.name,
-          buffer,
-          fileSizeMB,
-          getDynamicBatchSize: getDynamicBatchConfig,
-          onProgress: setProgress,
-          sharedRtcOffset,
-        });
-        parsedDataStore = result.dataStore;
-        parsedGeometry = result.geometryResult;
-        schemaVersion = result.schemaVersion;
+      // Pick the shared RTC origin from the earliest existing model so every
+      // federated model lands in one coordinate space (pixel-perfect alignment,
+      // no post-shift). Threaded into the canonical loader below.
+      let sharedRtcOffset: { x: number; y: number; z: number } | undefined;
+      const existingModelsForRtc = Array.from(useViewerStore.getState().models.values()) as FederatedModel[];
+      if (existingModelsForRtc.length > 0) {
+        const sorted = [...existingModelsForRtc].sort((a, b) => (a.loadedAt ?? 0) - (b.loadedAt ?? 0));
+        sharedRtcOffset = sorted.find(
+          (model) => model.geometryResult?.coordinateInfo?.wasmRtcOffset != null,
+        )?.geometryResult?.coordinateInfo?.wasmRtcOffset;
       }
 
-      if (!parsedDataStore || !parsedGeometry) {
-        throw new Error('Failed to parse file');
+      // THE canonical load path. loadFile acquires bytes, detects format
+      // (IFC / IFCX / GLB / point cloud), produces geometry through the single
+      // GeometryProcessor pipeline, parses the data store, and — because the
+      // target is federated — finalizeModel aligns to the anchor, offsets ids,
+      // builds the spatial index, and registers the model via addModel. loadFile
+      // awaits that finalize, so on return the model is already in the map.
+      await loadFile(file, {
+        kind: 'federated',
+        modelId,
+        name: options?.name,
+        visible: options?.visible,
+        collapsed: options?.collapsed,
+        loadedAt: options?.loadedAt,
+        sharedRtcOffset,
+      });
+
+      if (loadSessionRef.current !== currentSession) return null;
+      const registered = useViewerStore.getState().models.has(modelId);
+      if (registered) {
+        console.log(`[ifc-lite] Added model ${file.name} (${fileSizeForGateMB.toFixed(1)}MB) in ${(performance.now() - addStart).toFixed(0)}ms`);
       }
-
-      // =========================================================================
-      // FEDERATION REGISTRY: Transform expressIds to globally unique IDs
-      // This is the BULLETPROOF fix for multi-model ID collisions
-      // =========================================================================
-
-      // Step 1: Find max expressId in this model
-      // IMPORTANT: Use ALL entities from data store, not just meshes
-      // Spatial containers (IfcProject, IfcSite, etc.) don't have geometry but need valid globalId resolution
-      const maxExpressId = getMaxExpressId(parsedDataStore, parsedGeometry.meshes);
-
-      // Step 2: Register with federation registry to get unique offset
-      const idOffset = registerModelOffset(modelId, maxExpressId);
-
-      // Step 3: Transform ALL mesh expressIds to globalIds
-      // globalId = originalExpressId + offset
-      // This ensures no two models can have the same ID
-      if (idOffset > 0) {
-        for (const mesh of parsedGeometry.meshes) {
-          mesh.expressId = mesh.expressId + idOffset;
-        }
-      }
-
-      // =========================================================================
-      // COORDINATE ALIGNMENT: All federated models use the same shared RTC offset
-      // (passed to WASM during parsing above), so no post-processing vertex
-      // adjustment is needed. All models are already in the same coordinate space.
-      // =========================================================================
-
-      // Build spatial index AFTER ID offset + RTC alignment so it stores
-      // correct globalIds and final world-space positions.
-      buildSpatialIndexGuarded(parsedGeometry.meshes, parsedDataStore, setIfcDataStore);
-
-      // Create the federated model with offset info
-      const federatedModel: FederatedModel = {
-        id: modelId,
-        name: options?.name ?? file.name,
-        ifcDataStore: parsedDataStore,
-        geometryResult: parsedGeometry,
-        visible: true,
-        collapsed: hasModels(), // Collapse if not first model
-        schemaVersion,
-        loadedAt: Date.now(),
-        fileSize: buffer.byteLength,
-        idOffset,
-        maxExpressId,
-      };
-
-      // Add to store
-      storeAddModel(federatedModel);
-
-      // Also set legacy single-model state for backward compatibility
-      setIfcDataStore(parsedDataStore);
-      setGeometryResult(parsedGeometry);
-
-      setProgress({ phase: 'Complete', percent: 100 });
-      setLoading(false);
-      console.log(`[ifc-lite] Added model ${file.name} (${fileSizeMB.toFixed(1)}MB) in ${(performance.now() - addStart).toFixed(0)}ms`);
-
-      return modelId;
+      return registered ? modelId : null;
 
     } catch (err) {
+      // Only mutate shared loading/error/progress state if our session
+      // is still the active one. A second addModel() that started after
+      // we were cancelled has already taken over the spinner — we must
+      // not overwrite it with our "Cancelled" state.
+      const isCurrent = loadSessionRef.current === currentSession;
+      // User-initiated cancel surfaces as an AbortError. Map it to a
+      // benign "Cancelled" state so the federated path matches the
+      // single-model loader rather than reporting a parse failure.
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        console.log('[useIfc] addModel cancelled by user');
+        if (isCurrent) {
+          setError(null);
+          setProgress({ phase: 'Cancelled', percent: 0 });
+          setLoading(false);
+        }
+        return null;
+      }
       console.error('[useIfc] addModel failed:', err);
-      setError(err instanceof Error ? err.message : 'Unknown error');
-      setLoading(false);
+      if (isCurrent) {
+        setError(err instanceof Error ? err.message : 'Unknown error');
+        setLoading(false);
+      }
       return null;
+    } finally {
+      releaseFederationLoadSlot(gateSlot);
     }
-  }, [setLoading, setError, setProgress, setIfcDataStore, setGeometryResult, storeAddModel, hasModels, registerModelOffset]);
+  }, [loadFile, setLoading, setError, setProgress]);
+
+  /**
+   * Re-apply federation alignment using the currently selected anchor
+   * (`anchorModelIdOverride` from the store, falling back to earliest-loaded).
+   *
+   * Restores each non-anchor model's geometry from its `preAlignmentPositions`
+   * snapshot, then re-runs alignment against the new anchor. Skips models that
+   * have no snapshot — those were loaded standalone and would need a reload to
+   * participate in re-alignment. Updates `federationAlignmentStatus` on every
+   * touched model so the UI badges reflect the new state.
+   *
+   * Per user preference: this is an explicit operation, not auto-triggered by
+   * remove/reorder/anchor-change. Wire it to a "Re-align federation" button.
+   */
+  const realignFederation = useCallback(async (): Promise<void> => {
+    const state = useViewerStore.getState();
+    const allModels = Array.from(state.models.entries()) as Array<[string, FederatedModel]>;
+    if (allModels.length === 0) {
+      toast.info('No models loaded — nothing to re-align.');
+      return;
+    }
+
+    const referenceSelection = findReferenceGeorefModel();
+    if (!referenceSelection) {
+      toast.error('Cannot re-align: no model with valid georeferencing.');
+      return;
+    }
+    const { modelId: anchorModelId, georef: anchorGeoref } = referenceSelection;
+
+    let aligned = 0;
+    let reprojected = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    const updateModel = state.updateModel;
+
+    for (const [modelId, model] of allModels) {
+      if (modelId === anchorModelId) {
+        if (model.federationAlignmentStatus !== 'anchor') {
+          updateModel(modelId, { federationAlignmentStatus: 'anchor' });
+        }
+        continue;
+      }
+      if (!model.geometryResult || !model.ifcDataStore) {
+        skipped += 1;
+        continue;
+      }
+
+      // Lazy-snapshot: a model that joined before federation existed (or as
+      // the original anchor of a previous federation) was never re-baked, so
+      // its current vertices ARE its pre-alignment positions. Take a snapshot
+      // before we mutate them so subsequent re-aligns can restore.
+      let snapshots = model.preAlignmentPositions;
+      let normalSnapshots = model.preAlignmentNormals;
+      let snapshotInfo = model.preAlignmentCoordinateInfo;
+      if (!snapshots || !snapshotInfo) {
+        snapshots = model.geometryResult.meshes.map((m) => new Float32Array(m.positions));
+        normalSnapshots = model.geometryResult.meshes.map((m) =>
+          m.normals && m.normals.length > 0 ? new Float32Array(m.normals) : undefined,
+        );
+        snapshotInfo = model.geometryResult.coordinateInfo;
+      }
+
+      // Restore vertices and normals to pre-alignment state. Normals must be
+      // restored too because applyAlignmentTransformAndUpdateBounds rotates
+      // them in place — without restoring, repeated re-aligns would compound
+      // rotations and drift lighting/shading.
+      const meshes = model.geometryResult.meshes;
+      const restoreCount = Math.min(meshes.length, snapshots.length);
+      for (let i = 0; i < restoreCount; i += 1) {
+        meshes[i].positions = new Float32Array(snapshots[i]);
+        if (normalSnapshots) {
+          const snap = normalSnapshots[i];
+          if (snap) {
+            meshes[i].normals = new Float32Array(snap);
+          }
+        }
+      }
+      model.geometryResult.coordinateInfo = {
+        ...snapshotInfo,
+        originalBounds: { ...snapshotInfo.originalBounds },
+        shiftedBounds: { ...snapshotInfo.shiftedBounds },
+      };
+
+      const parsedGeoref = extractModelGeoref(
+        model.ifcDataStore,
+        model.geometryResult.coordinateInfo,
+        state.georefMutations.get(modelId),
+      );
+      if (!parsedGeoref) {
+        updateModel(modelId, {
+          preAlignmentPositions: snapshots,
+          preAlignmentNormals: normalSnapshots,
+          preAlignmentCoordinateInfo: snapshotInfo,
+          federationAlignmentStatus: 'none',
+        });
+        skipped += 1;
+        continue;
+      }
+
+      const status = await alignGeometryToReference(model.geometryResult, parsedGeoref, anchorGeoref);
+      updateModel(modelId, {
+        preAlignmentPositions: snapshots,
+        preAlignmentNormals: normalSnapshots,
+        preAlignmentCoordinateInfo: snapshotInfo,
+        federationAlignmentStatus: status,
+      });
+      if (status === 'reprojected') reprojected += 1;
+      else if (status === 'failed') failed += 1;
+      else aligned += 1;
+    }
+
+    // Signal that mesh content was mutated in place — forces the merged-mesh
+    // cache in ViewportContainer to rebuild AND the streaming hook to clear
+    // the WebGPU scene and re-upload buffers. Without this, the success toast
+    // fires but the visible model doesn't move because the GPU still has the
+    // old vertex positions cached.
+    if (aligned + reprojected > 0) {
+      useViewerStore.getState().bumpGeometryContentVersion();
+    }
+
+    const messageParts: string[] = [];
+    if (aligned > 0) messageParts.push(`${aligned} aligned`);
+    if (reprojected > 0) messageParts.push(`${reprojected} reprojected`);
+    if (skipped > 0) messageParts.push(`${skipped} skipped`);
+    if (failed > 0) messageParts.push(`${failed} failed`);
+    const summary = messageParts.length > 0 ? messageParts.join(', ') : 'no changes needed';
+    if (failed > 0) {
+      toast.error(`Federation re-aligned against "${anchorGeoref.projectedCRS.name}": ${summary}.`);
+    } else {
+      toast.success(`Federation re-aligned against "${anchorGeoref.projectedCRS.name}": ${summary}.`);
+    }
+  }, []);
 
   /**
    * Remove a model from the federation
@@ -493,7 +534,10 @@ export function useIfcFederation() {
       return;
     }
 
-    // Check that all files are IFCX format and read buffers
+    // Check that all files are IFCX format and read buffers.
+    // IFCX is JSON; SAB streaming would force a SAB→scratch copy in
+    // safeUtf8Decode + retain the scratch (net worse peak than ArrayBuffer).
+    // Keep on file.arrayBuffer().
     const buffers: Array<{ buffer: ArrayBuffer; name: string }> = [];
     for (const file of files) {
       const buffer = await file.arrayBuffer();
@@ -547,7 +591,10 @@ export function useIfcFederation() {
       return;
     }
 
-    // Read new overlay buffers
+    // Read new overlay buffers.
+    // IFCX is JSON; SAB streaming would force a SAB→scratch copy in
+    // safeUtf8Decode + retain the scratch (net worse peak than ArrayBuffer).
+    // Keep on file.arrayBuffer().
     const newBuffers: Array<{ buffer: ArrayBuffer; name: string }> = [];
     for (const file of files) {
       const buffer = await file.arrayBuffer();
@@ -591,6 +638,7 @@ export function useIfcFederation() {
     addIfcxOverlays,
     findModelForEntity,
     resolveGlobalId,
+    realignFederation,
   };
 }
 

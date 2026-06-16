@@ -12,8 +12,11 @@
 
 import type { LensDataProvider, PropertySetInfo, ClassificationInfo } from '@ifc-lite/lens';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import { RelationshipType } from '@ifc-lite/data';
 import {
   extractEntityAttributesOnDemand,
+  extractPropertiesOnDemand,
+  extractTypePropertiesOnDemand,
   extractQuantitiesOnDemand,
   extractClassificationsOnDemand,
   extractMaterialsOnDemand,
@@ -23,6 +26,7 @@ import type { FederatedModel } from '@/store/types';
 
 interface ModelEntry {
   id: string;
+  name: string;
   ifcDataStore: IfcDataStore;
   idOffset: number;
   maxExpressId: number;
@@ -56,6 +60,7 @@ export function createLensDataProvider(
       if (model.ifcDataStore) {
         entries.push({
           id: model.id,
+          name: model.name,
           ifcDataStore: model.ifcDataStore,
           idOffset: model.idOffset ?? 0,
           maxExpressId: model.maxExpressId ?? 0,
@@ -65,6 +70,7 @@ export function createLensDataProvider(
   } else if (legacyDataStore) {
     entries.push({
       id: 'legacy',
+      name: 'Model',
       ifcDataStore: legacyDataStore,
       idOffset: 0,
       maxExpressId: computeMaxExpressId(legacyDataStore),
@@ -105,17 +111,61 @@ export function createLensDataProvider(
     ): unknown {
       const resolved = resolveGlobalId(globalId, entries);
       if (!resolved) return undefined;
-      return resolved.entry.ifcDataStore.properties?.getPropertyValue?.(
-        resolved.expressId,
-        propertySetName,
-        propertyName,
-      );
+      const store = resolved.entry.ifcDataStore;
+      const id = resolved.expressId;
+
+      // On-demand extraction path: pre-built table is empty for client-parsed
+      // stores, so iterate the same psets we expose via getPropertySets.
+      if (store.onDemandPropertyMap && store.source?.length > 0) {
+        const instancePsets = extractPropertiesOnDemand(store, id);
+        for (const pset of instancePsets) {
+          if (pset.name !== propertySetName) continue;
+          for (const prop of pset.properties) {
+            if (prop.name === propertyName) return prop.value;
+          }
+        }
+        // Fall through to type-inherited psets (Pset_*Common is typically
+        // attached to IfcSpaceType / IfcWallType, not the instance).
+        const typeProps = extractTypePropertiesOnDemand(store, id);
+        if (typeProps) {
+          for (const pset of typeProps.properties) {
+            if (pset.name !== propertySetName) continue;
+            for (const prop of pset.properties) {
+              if (prop.name === propertyName) return prop.value;
+            }
+          }
+        }
+        return undefined;
+      }
+
+      return store.properties?.getPropertyValue?.(id, propertySetName, propertyName);
     },
 
     getPropertySets(globalId: number): PropertySetInfo[] {
       const resolved = resolveGlobalId(globalId, entries);
       if (!resolved) return [];
-      const psets = resolved.entry.ifcDataStore.properties?.getForEntity?.(resolved.expressId);
+      const store = resolved.entry.ifcDataStore;
+      const id = resolved.expressId;
+
+      // Properties are extracted lazily — the pre-built table is empty unless
+      // server-parsed. Mirror the quantity path and use the on-demand extractor,
+      // which itself falls back to the eager table when no on-demand map exists.
+      if (store.onDemandPropertyMap && store.source?.length > 0) {
+        const instancePsets = extractPropertiesOnDemand(store, id) as PropertySetInfo[];
+        // Merge type-inherited psets (Pset_*Common lives on the type entity
+        // for occurrences). Instance psets take precedence on name conflict.
+        const typeProps = extractTypePropertiesOnDemand(store, id);
+        if (!typeProps || typeProps.properties.length === 0) return instancePsets;
+
+        const seen = new Set(instancePsets.map((p) => p.name));
+        const merged = instancePsets.slice();
+        for (const pset of typeProps.properties) {
+          if (!seen.has(pset.name)) merged.push(pset as PropertySetInfo);
+        }
+        return merged;
+      }
+
+      const psets = store.properties?.getForEntity?.(id);
       if (!psets) return [];
       return psets as PropertySetInfo[];
     },
@@ -236,8 +286,38 @@ export function createLensDataProvider(
       if (info.layers?.length) return info.layers[0].materialName;
       if (info.constituents?.length) return info.constituents[0].materialName;
       if (info.profiles?.length) return info.profiles[0].materialName;
-      if (info.materials?.length) return info.materials[0];
+      if (info.materials?.length) return info.materials[0]?.name;
       return undefined;
+    },
+
+    getModelId(globalId: number): string | undefined {
+      const resolved = resolveGlobalId(globalId, entries);
+      if (!resolved) return undefined;
+      return resolved.entry.id;
+    },
+
+    getModelName(modelId: string): string | undefined {
+      const entry = entries.find(e => e.id === modelId);
+      return entry?.name ?? modelId;
+    },
+
+    getEntityGroups(globalId: number): ReadonlyArray<{ id: number; name?: string; type: string }> {
+      const resolved = resolveGlobalId(globalId, entries);
+      if (!resolved) return [];
+      const store = resolved.entry.ifcDataStore;
+      if (!store.relationships) return [];
+      // Inverse IfcRelAssignsToGroup: entity → the groups/zones it belongs to.
+      const groupIds = store.relationships.getRelated(resolved.expressId, RelationshipType.AssignsToGroup, 'inverse');
+      if (!groupIds || groupIds.length === 0) return [];
+      const out: Array<{ id: number; name?: string; type: string }> = [];
+      for (const gid of groupIds) {
+        const name = store.entities?.getName(gid);
+        // Canonical IfcPascalCase so the "By Zone" lens can match `IfcZone`
+        // deterministically; `byId.get(gid).type` is the raw STEP token. (#1075)
+        const type = store.entities?.getTypeName?.(gid) || store.entityIndex?.byId.get(gid)?.type || 'Unknown';
+        out.push({ id: gid, name: name || undefined, type });
+      }
+      return out;
     },
   };
 }

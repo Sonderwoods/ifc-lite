@@ -8,8 +8,8 @@
 //! Used by both AdvancedBrepProcessor and ShellBasedSurfaceModelProcessor/FaceBasedSurfaceModelProcessor
 //! when shells contain IfcAdvancedFace entities (common in CATIA exports).
 
-use crate::triangulation::{calculate_polygon_normal, project_to_2d, triangulate_polygon};
-use crate::{Error, Point3, Result};
+use crate::triangulation::{calculate_polygon_normal, project_to_2d};
+use crate::{scale_segments, Error, Point3, Result, TessellationQuality};
 use ifc_lite_core::{DecodedEntity, EntityDecoder};
 use nalgebra::Matrix4;
 
@@ -22,6 +22,7 @@ use super::helpers::get_axis2_placement_transform_by_id;
 pub(super) fn process_advanced_face(
     face: &DecodedEntity,
     decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     // IfcAdvancedFace has:
     // 0: Bounds (list of FaceBound)
@@ -46,16 +47,17 @@ pub(super) fn process_advanced_face(
         .unwrap_or(true);
 
     let result = if surface_type == "IFCPLANE" {
-        process_planar_face(face, decoder)
+        process_planar_face(face, decoder, quality)
     } else if surface_type == "IFCBSPLINESURFACEWITHKNOTS" {
-        process_bspline_face(&surface, decoder, None)
+        process_bspline_face(&surface, decoder, None, quality)
     } else if surface_type == "IFCRATIONALBSPLINESURFACEWITHKNOTS" {
         let weights = parse_rational_weights(&surface);
-        process_bspline_face(&surface, decoder, weights.as_deref())
+        process_bspline_face(&surface, decoder, weights.as_deref(), quality)
     } else if surface_type == "IFCCYLINDRICALSURFACE" {
-        process_cylindrical_face(face, &surface, decoder)
+        process_cylindrical_face(face, &surface, decoder, quality)
+    } else if surface_type == "IFCSURFACEOFREVOLUTION" {
+        process_surface_of_revolution_face(face, &surface, decoder, quality)
     } else if surface_type == "IFCSURFACEOFLINEAREXTRUSION"
-        || surface_type == "IFCSURFACEOFREVOLUTION"
         || surface_type == "IFCCONICALSURFACE"
         || surface_type == "IFCSPHERICALSURFACE"
         || surface_type == "IFCTOROIDALSURFACE"
@@ -64,11 +66,31 @@ pub(super) fn process_advanced_face(
         // on the surface. Extracting and triangulating them gives a reasonable
         // polygonal approximation. This covers IfcSurfaceOfLinearExtrusion
         // (common in CATIA exports) and other analytic surface types.
-        process_planar_face(face, decoder)
+        process_planar_face(face, decoder, quality)
     } else {
         // Unsupported surface type - return empty geometry
+        #[cfg(feature = "debug_geometry")]
+        eprintln!(
+            "[ifc-lite][advanced_face] face #{} unsupported surface {}",
+            face.id, surface_type
+        );
         Ok((Vec::new(), Vec::new()))
     };
+
+    #[cfg(feature = "debug_geometry")]
+    {
+        if let Ok((ref pos, ref idx)) = result {
+            if pos.is_empty() || idx.is_empty() {
+                eprintln!(
+                    "[ifc-lite][advanced_face] face #{} surface={} produced 0 tris (verts={}, idx={})",
+                    face.id,
+                    surface_type,
+                    pos.len() / 3,
+                    idx.len() / 3,
+                );
+            }
+        }
+    }
 
     // When SameSense is false, flip triangle winding to correct face orientation
     if !same_sense {
@@ -249,7 +271,7 @@ fn tessellate_bspline_surface(
 
 /// Parse rational weights from IfcRationalBSplineSurfaceWithKnots.
 /// Attribute 12: WeightsData (LIST of LIST of REAL).
-fn parse_rational_weights(bspline: &DecodedEntity) -> Option<Vec<Vec<f64>>> {
+pub(super) fn parse_rational_weights(bspline: &DecodedEntity) -> Option<Vec<Vec<f64>>> {
     let weights_attr = bspline.get(12)?;
     let rows = weights_attr.as_list()?;
     let mut result = Vec::with_capacity(rows.len());
@@ -424,6 +446,7 @@ fn sample_bspline_edge_curve(
     start: &Point3<f64>,
     curve_forward: bool,
     decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
 ) -> Vec<Point3<f64>> {
     // Parse B-spline curve: degree(0), control_points(1), ..., knot_mults(6), knots(7)
     let degree = curve.get_float(0).unwrap_or(3.0) as usize;
@@ -470,8 +493,8 @@ fn sample_bspline_edge_curve(
     let t_min = knots[degree];
     let t_max = knots[knots.len() - degree - 1];
 
-    // Adaptive segment count based on control point density
-    let n_segments = (control_points.len() * 2).clamp(4, 16);
+    // Adaptive segment count based on control point density; scaled by quality.
+    let n_segments = scale_segments(control_points.len() * 2, 4, 16, quality);
 
     let mut points = Vec::with_capacity(n_segments + 1);
     // Add the start vertex first
@@ -500,11 +523,160 @@ fn sample_bspline_edge_curve(
     points
 }
 
+/// Read an `IfcAxis2Placement3D` (or 2D) entity and return (location, axis_z, axis_x).
+/// Falls back to identity orientation when axis/refdir are absent.
+fn read_axis2_placement_3d(
+    placement: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+) -> (Point3<f64>, nalgebra::Vector3<f64>, nalgebra::Vector3<f64>) {
+    use nalgebra::Vector3;
+
+    let location = placement
+        .get(0)
+        .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+        .and_then(|p| {
+            let coords = p.get(0).and_then(|v| v.as_list())?;
+            let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+            let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+            let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+            Some(Point3::new(x, y, z))
+        })
+        .unwrap_or_else(|| Point3::new(0.0, 0.0, 0.0));
+
+    let read_dir = |entity: &DecodedEntity| -> Option<Vector3<f64>> {
+        let coords = entity.get(0).and_then(|v| v.as_list())?;
+        let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+        let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+        let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+        Some(Vector3::new(x, y, z))
+    };
+
+    let axis_z = placement
+        .get(1)
+        .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+        .and_then(|e| read_dir(&e))
+        .and_then(|v| v.try_normalize(1e-12))
+        .unwrap_or_else(|| Vector3::new(0.0, 0.0, 1.0));
+
+    let mut axis_x = placement
+        .get(2)
+        .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+        .and_then(|e| read_dir(&e))
+        .unwrap_or_else(|| {
+            // Pick a non-parallel reference if RefDirection is missing
+            if axis_z.x.abs() < 0.9 {
+                Vector3::new(1.0, 0.0, 0.0)
+            } else {
+                Vector3::new(0.0, 1.0, 0.0)
+            }
+        });
+
+    // Orthogonalise: subtract the component along axis_z, then renormalise
+    axis_x -= axis_z * axis_x.dot(&axis_z);
+    let axis_x = axis_x.try_normalize(1e-12).unwrap_or_else(|| {
+        // Fallback that is guaranteed NOT parallel to axis_z: pick the world
+        // basis vector with the smallest |dot| with axis_z, then orthogonalise.
+        // Using a hard-coded (1,0,0) here can collapse the basis when axis_z
+        // itself is along X (CodeRabbit feedback on PR #605).
+        let candidates = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ];
+        let pick = candidates
+            .iter()
+            .min_by(|a, b| {
+                let da = axis_z.dot(a).abs();
+                let db = axis_z.dot(b).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+            .unwrap_or(Vector3::new(1.0, 0.0, 0.0));
+        let ortho = pick - axis_z * pick.dot(&axis_z);
+        ortho
+            .try_normalize(1e-12)
+            .unwrap_or(Vector3::new(1.0, 0.0, 0.0))
+    });
+
+    (location, axis_z, axis_x)
+}
+
+/// Sample an `IfcCircle` edge from `start` to `end`, walking the arc in the
+/// curve's native (CCW around axis_z) direction when `curve_forward` is true,
+/// otherwise CW. Returns `start` plus intermediate samples; the end vertex is
+/// omitted because the next edge in the loop starts there.
+fn sample_circle_edge_curve(
+    curve: &DecodedEntity,
+    start: &Point3<f64>,
+    end: &Point3<f64>,
+    curve_forward: bool,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+) -> Vec<Point3<f64>> {
+    use std::f64::consts::TAU;
+
+    // IfcCircle: 0=Position(IfcAxis2Placement3D|2D), 1=Radius
+    let radius = match curve.get(1).and_then(|v| v.as_float()) {
+        Some(r) if r > 0.0 => r,
+        _ => return vec![*start],
+    };
+
+    let placement = match curve.get(0).and_then(|a| decoder.resolve_ref(a).ok().flatten()) {
+        Some(p) => p,
+        None => return vec![*start],
+    };
+
+    let (center, axis_z, axis_x) = read_axis2_placement_3d(&placement, decoder);
+    let axis_y = axis_z.cross(&axis_x);
+
+    // Project start/end onto the circle plane to recover their angles.
+    let project_angle = |p: &Point3<f64>| -> f64 {
+        let v = p - center;
+        v.dot(&axis_y).atan2(v.dot(&axis_x))
+    };
+
+    let a_start = project_angle(start);
+    let a_end = project_angle(end);
+
+    // Signed CCW arc length from a_start to a_end, in (0, 2π].
+    let mut ccw_delta = (a_end - a_start).rem_euclid(TAU);
+    let mut cw_delta = (a_start - a_end).rem_euclid(TAU);
+
+    // Treat coincident endpoints as a full 360° arc (full circle in topology).
+    let coincident = (start - end).norm() < 1e-6 * radius.max(1.0);
+    if coincident || ccw_delta < 1e-9 {
+        ccw_delta = TAU;
+        cw_delta = TAU;
+    }
+
+    let (delta, sign) = if curve_forward {
+        (ccw_delta, 1.0_f64)
+    } else {
+        (cw_delta, -1.0_f64)
+    };
+
+    // ~12° per segment at Medium, clamped to keep simple half-turns affordable;
+    // scaled by quality.
+    let n_base = (delta / (TAU / 30.0)).ceil() as usize;
+    let n_segments = scale_segments(n_base, 2, 32, quality);
+
+    let mut points = Vec::with_capacity(n_segments);
+    points.push(*start);
+    for i in 1..n_segments {
+        let t = delta * (i as f64) / (n_segments as f64);
+        let angle = a_start + sign * t;
+        let p = center + axis_x * (radius * angle.cos()) + axis_y * (radius * angle.sin());
+        points.push(p);
+    }
+    points
+}
+
 /// Extract polygon points from an edge loop, sampling B-spline curve edges
 /// for intermediate points to preserve curvature.
 fn extract_edge_loop_points(
     loop_entity: &DecodedEntity,
     decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
 ) -> Vec<Point3<f64>> {
     let edges = match loop_entity.get(0).and_then(|a| a.as_list()) {
         Some(e) => e,
@@ -593,11 +765,26 @@ fn extract_edge_loop_points(
             if geom_type == "IFCBSPLINECURVEWITHKNOTS" {
                 // Sample B-spline curve for intermediate points
                 let s = walk_start.unwrap_or(Point3::new(0.0, 0.0, 0.0));
-                let sampled = sample_bspline_edge_curve(&geom, &s, curve_forward, decoder);
+                let sampled =
+                    sample_bspline_edge_curve(&geom, &s, curve_forward, decoder, quality);
                 polygon_points.extend(sampled);
                 continue;
             }
-            // For IfcLine, IfcCircle, etc.: just use start vertex
+            if geom_type == "IFCCIRCLE" {
+                // Sample arc from walk_start to the next edge's start (i.e. the
+                // other endpoint of THIS edge in the loop's walk direction).
+                // Without this, every circular boundary collapses to a single
+                // vertex per edge — disc caps and curved fillets become slivers.
+                if let (Some(s), Some(e)) = (walk_start, _walk_end) {
+                    let sampled =
+                        sample_circle_edge_curve(&geom, &s, &e, curve_forward, decoder, quality);
+                    polygon_points.extend(sampled);
+                    continue;
+                }
+            }
+            // For IfcLine and other straight/unsupported curves: just use start
+            // vertex (the next edge contributes its own start, so straight lines
+            // are correctly represented by their two endpoints).
         }
 
         // Default: add start vertex only
@@ -610,12 +797,28 @@ fn extract_edge_loop_points(
 }
 
 /// Process a planar or boundary-represented face.
-/// Extracts edge loop boundary points (with B-spline curve sampling)
-/// and triangulates with robust ear-cutting.
+///
+/// Per IFC 4.3 `IfcAdvancedFace`, `Bounds` is a list of `IfcFaceBound` —
+/// at most one is `IfcFaceOuterBound` (the outer ring), the rest are holes.
+/// The previous implementation triangulated each bound as an independent
+/// polygon and concatenated, which meant a face with one outer + one hole
+/// emitted a solid outer quad PLUS a reversed-winding solid quad over the
+/// hole — exactly coplanar, opposite normals, overlapping in the hole's
+/// footprint. With the renderer running `cullMode: 'none'` ("IFC winding
+/// order varies", `packages/renderer/src/pipeline.ts`), that pair surfaced
+/// as a Z-fight on the door panel's glass cutout (issue #674 follow-up).
+///
+/// Mirrors the FacetedBrep path in `processors/brep.rs`: pick the outer
+/// (or first) bound, project to 2D using its basis, project hole bounds
+/// using the SAME basis, and call `triangulate_polygon_with_holes` once.
 fn process_planar_face(
     face: &DecodedEntity,
     decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
+    use crate::triangulation::{project_to_2d_with_basis, triangulate_polygon_with_holes};
+    use ifc_lite_core::IfcType;
+
     let bounds_attr = face
         .get(0)
         .ok_or_else(|| Error::geometry("AdvancedFace missing Bounds".to_string()))?;
@@ -623,69 +826,97 @@ fn process_planar_face(
         .as_list()
         .ok_or_else(|| Error::geometry("Expected bounds list".to_string()))?;
 
-    let mut positions = Vec::new();
-    let mut indices = Vec::new();
+    // Collect (points, is_outer, orientation) per bound. Orientation is
+    // attribute 1 of IfcFaceBound; when .F., the loop must be reversed.
+    let mut outer_points: Option<Vec<Point3<f64>>> = None;
+    let mut hole_points: Vec<Vec<Point3<f64>>> = Vec::new();
 
     for bound in bounds {
-        if let Some(bound_id) = bound.as_entity_ref() {
-            let bound_entity = decoder.decode_by_id(bound_id)?;
+        let Some(bound_id) = bound.as_entity_ref() else {
+            continue;
+        };
+        let bound_entity = decoder.decode_by_id(bound_id)?;
 
-            let loop_attr = bound_entity
-                .get(0)
-                .ok_or_else(|| Error::geometry("FaceBound missing Bound".to_string()))?;
+        let loop_attr = bound_entity
+            .get(0)
+            .ok_or_else(|| Error::geometry("FaceBound missing Bound".to_string()))?;
+        let loop_entity = decoder
+            .resolve_ref(loop_attr)?
+            .ok_or_else(|| Error::geometry("Failed to resolve loop".to_string()))?;
+        if !loop_entity.ifc_type.as_str().eq_ignore_ascii_case("IFCEDGELOOP") {
+            continue;
+        }
 
-            let loop_entity = decoder
-                .resolve_ref(loop_attr)?
-                .ok_or_else(|| Error::geometry("Failed to resolve loop".to_string()))?;
+        let mut points = extract_edge_loop_points(&loop_entity, decoder, quality);
+        if points.len() < 3 {
+            continue;
+        }
+        let orientation = bound_entity
+            .get(1)
+            .and_then(|a| a.as_enum())
+            .map(|e| e == "T" || e == "TRUE")
+            .unwrap_or(true);
+        if !orientation {
+            points.reverse();
+        }
 
-            if !loop_entity.ifc_type.as_str().eq_ignore_ascii_case("IFCEDGELOOP") {
-                continue;
-            }
-
-            // Extract polygon points with B-spline curve sampling
-            let polygon_points = extract_edge_loop_points(&loop_entity, decoder);
-
-            if polygon_points.len() >= 3 {
-                let base_idx = (positions.len() / 3) as u32;
-
-                for point in &polygon_points {
-                    positions.push(point.x as f32);
-                    positions.push(point.y as f32);
-                    positions.push(point.z as f32);
-                }
-
-                // Project 3D polygon to 2D for robust ear-cutting triangulation
-                let normal = calculate_polygon_normal(&polygon_points);
-                let (points_2d, _, _, _) = project_to_2d(&polygon_points, &normal);
-
-                match triangulate_polygon(&points_2d) {
-                    Ok(tri_indices) => {
-                        for idx in tri_indices {
-                            indices.push(base_idx + idx as u32);
-                        }
-                    }
-                    Err(_) => {
-                        // Fallback to fan triangulation
-                        for i in 1..polygon_points.len() - 1 {
-                            indices.push(base_idx);
-                            indices.push(base_idx + i as u32);
-                            indices.push(base_idx + i as u32 + 1);
-                        }
-                    }
+        let is_outer = bound_entity.ifc_type == IfcType::IfcFaceOuterBound;
+        if is_outer || outer_points.is_none() {
+            if is_outer {
+                if let Some(prev_outer) = outer_points.take() {
+                    hole_points.push(prev_outer);
                 }
             }
+            outer_points = Some(points);
+        } else {
+            hole_points.push(points);
         }
     }
+
+    let Some(outer) = outer_points else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let normal = calculate_polygon_normal(&outer);
+    let (outer_2d, u_axis, v_axis, origin) = project_to_2d(&outer, &normal);
+    let holes_2d: Vec<Vec<nalgebra::Point2<f64>>> = hole_points
+        .iter()
+        .map(|h| project_to_2d_with_basis(h, &u_axis, &v_axis, &origin))
+        .collect();
+
+    let mut positions = Vec::with_capacity((outer.len() + hole_points.iter().map(|h| h.len()).sum::<usize>()) * 3);
+    for p in outer.iter().chain(hole_points.iter().flat_map(|h| h.iter())) {
+        positions.push(p.x as f32);
+        positions.push(p.y as f32);
+        positions.push(p.z as f32);
+    }
+
+    let indices = match triangulate_polygon_with_holes(&outer_2d, &holes_2d) {
+        Ok(idx) => idx.into_iter().map(|i| i as u32).collect(),
+        Err(_) => {
+            // Outer-only fan fallback. Drops holes — same behaviour as the
+            // pre-fix code on a no-hole face, so worst case matches the old
+            // legacy path rather than emitting nothing.
+            let mut idx = Vec::with_capacity((outer.len() - 2) * 3);
+            for i in 1..outer.len() - 1 {
+                idx.push(0u32);
+                idx.push(i as u32);
+                idx.push(i as u32 + 1);
+            }
+            idx
+        }
+    };
 
     Ok((positions, indices))
 }
 
 /// Process a B-spline surface face.
 /// When `weights` is `Some`, rational (NURBS) evaluation is used.
-fn process_bspline_face(
+pub(super) fn process_bspline_face(
     bspline: &DecodedEntity,
     decoder: &mut EntityDecoder,
     weights: Option<&[Vec<f64>]>,
+    quality: TessellationQuality,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     // Get degrees
     let u_degree = bspline.get_float(0).unwrap_or(3.0) as usize;
@@ -697,12 +928,12 @@ fn process_bspline_face(
     // Parse knot vectors
     let (u_knots, v_knots) = parse_knot_vectors(bspline)?;
 
-    // Determine tessellation resolution based on surface complexity
-    let u_segments = (control_points.len() * 3).clamp(8, 24);
+    // Determine tessellation resolution based on surface complexity; scaled by quality.
+    let u_segments = scale_segments(control_points.len() * 3, 8, 24, quality);
     let v_segments = if !control_points.is_empty() {
-        (control_points[0].len() * 3).clamp(4, 24)
+        scale_segments(control_points[0].len() * 3, 4, 24, quality)
     } else {
-        4
+        scale_segments(4, 4, 24, quality)
     };
 
     // Tessellate the surface (returns None if knot data is inconsistent)
@@ -726,6 +957,7 @@ fn process_cylindrical_face(
     face: &DecodedEntity,
     surface: &DecodedEntity,
     decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
 ) -> Result<(Vec<f32>, Vec<u32>)> {
     // Get the radius from IfcCylindricalSurface (attribute 1)
     let radius = surface
@@ -745,107 +977,13 @@ fn process_cylindrical_face(
         Matrix4::identity()
     };
 
-    // Extract boundary edges to determine angular and height extent
-    let bounds_attr = face
-        .get(0)
-        .ok_or_else(|| Error::geometry("AdvancedFace missing Bounds".to_string()))?;
-
-    let bounds = bounds_attr
-        .as_list()
-        .ok_or_else(|| Error::geometry("Expected bounds list".to_string()))?;
-
-    // Collect all boundary points to determine the extent
-    let mut boundary_points: Vec<Point3<f64>> = Vec::new();
-
-    for bound in bounds {
-        if let Some(bound_id) = bound.as_entity_ref() {
-            let bound_entity = decoder.decode_by_id(bound_id)?;
-            let loop_attr = bound_entity
-                .get(0)
-                .ok_or_else(|| Error::geometry("FaceBound missing Bound".to_string()))?;
-
-            if let Some(loop_entity) = decoder.resolve_ref(loop_attr)? {
-                if loop_entity
-                    .ifc_type
-                    .as_str()
-                    .eq_ignore_ascii_case("IFCEDGELOOP")
-                {
-                    if let Some(edges_attr) = loop_entity.get(0) {
-                        if let Some(edges) = edges_attr.as_list() {
-                            for edge_ref in edges {
-                                if let Some(edge_id) = edge_ref.as_entity_ref() {
-                                    if let Ok(oriented_edge) = decoder.decode_by_id(edge_id) {
-                                        // IfcOrientedEdge: 0=EdgeStart, 1=EdgeEnd, 2=EdgeElement, 3=Orientation
-                                        // EdgeStart/EdgeEnd can be * (null), get from EdgeElement if needed
-
-                                        // Try to get start vertex from OrientedEdge first
-                                        let start_vertex = oriented_edge
-                                            .get(0)
-                                            .and_then(|attr| {
-                                                decoder.resolve_ref(attr).ok().flatten()
-                                            });
-
-                                        // If null, get from EdgeElement (attribute 2)
-                                        let vertex = if start_vertex.is_some() {
-                                            start_vertex
-                                        } else if let Some(edge_elem_attr) =
-                                            oriented_edge.get(2)
-                                        {
-                                            // Get EdgeElement (IfcEdgeCurve)
-                                            if let Some(edge_curve) = decoder
-                                                .resolve_ref(edge_elem_attr)
-                                                .ok()
-                                                .flatten()
-                                            {
-                                                // IfcEdgeCurve: 0=EdgeStart, 1=EdgeEnd, 2=EdgeGeometry
-                                                edge_curve.get(0).and_then(|attr| {
-                                                    decoder.resolve_ref(attr).ok().flatten()
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        };
-
-                                        if let Some(vertex) = vertex {
-                                            // IfcVertexPoint: 0=VertexGeometry (IfcCartesianPoint)
-                                            if let Some(point_attr) = vertex.get(0) {
-                                                if let Some(point) = decoder
-                                                    .resolve_ref(point_attr)
-                                                    .ok()
-                                                    .flatten()
-                                                {
-                                                    if let Some(coords) =
-                                                        point.get(0).and_then(|v| v.as_list())
-                                                    {
-                                                        let x = coords
-                                                            .first()
-                                                            .and_then(|v| v.as_float())
-                                                            .unwrap_or(0.0);
-                                                        let y = coords
-                                                            .get(1)
-                                                            .and_then(|v| v.as_float())
-                                                            .unwrap_or(0.0);
-                                                        let z = coords
-                                                            .get(2)
-                                                            .and_then(|v| v.as_float())
-                                                            .unwrap_or(0.0);
-                                                        boundary_points
-                                                            .push(Point3::new(x, y, z));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Extract boundary points using the shared edge-loop sampler so that
+    // B-spline and circle edges contribute interpolated points (instead of
+    // collapsing the boundary to vertex corners). This is critical for the
+    // glazing-mullion fillet faces in IFC4 door exports, where each
+    // cylindrical face has B-spline edge curves running along the surface.
+    let boundary_points: Vec<Point3<f64>> =
+        extract_edge_loop_points_for_bounds(face, decoder, quality);
 
     if boundary_points.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -860,36 +998,62 @@ fn process_cylindrical_face(
         .map(|p| inv_transform.transform_point(p))
         .collect();
 
-    // Determine angular extent (from local x,y) and height extent (from local z)
-    let mut min_angle = f64::MAX;
-    let mut max_angle = f64::MIN;
+    // Determine angular extent via the largest-gap-on-the-circle algorithm
+    // (same approach as SoR). Robust to faces that straddle θ=π — the
+    // previous min/max + wrap heuristic could give a 270° span for a
+    // half-cylinder face whose samples cluster at the seam, leaving a
+    // visible misalignment with the opposite half.
+    let mut angles: Vec<f64> = local_points
+        .iter()
+        .map(|p| {
+            let mut a = p.y.atan2(p.x);
+            if a < 0.0 {
+                a += std::f64::consts::TAU;
+            }
+            a
+        })
+        .collect();
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    angles.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    let (min_angle, max_angle) = if angles.len() < 2 {
+        (0.0, std::f64::consts::TAU)
+    } else {
+        let n = angles.len();
+        let mut max_gap = 0.0;
+        let mut max_gap_idx = 0usize;
+        for i in 0..n {
+            let next = if i + 1 < n {
+                angles[i + 1]
+            } else {
+                angles[0] + std::f64::consts::TAU
+            };
+            let gap = next - angles[i];
+            if gap > max_gap {
+                max_gap = gap;
+                max_gap_idx = i;
+            }
+        }
+        let start = angles[(max_gap_idx + 1) % n];
+        let end_raw = angles[max_gap_idx];
+        let end = if end_raw < start {
+            end_raw + std::f64::consts::TAU
+        } else {
+            end_raw
+        };
+        let span = end - start;
+        if span < 1e-6 || span > std::f64::consts::TAU - 1e-6 {
+            (0.0, std::f64::consts::TAU)
+        } else {
+            (start, end)
+        }
+    };
+
     let mut min_z = f64::MAX;
     let mut max_z = f64::MIN;
-
     for p in &local_points {
-        let angle = p.y.atan2(p.x);
-        min_angle = min_angle.min(angle);
-        max_angle = max_angle.max(angle);
         min_z = min_z.min(p.z);
         max_z = max_z.max(p.z);
-    }
-
-    // Handle angle wrapping (if angles span across -pi/pi boundary)
-    if max_angle - min_angle > std::f64::consts::PI * 1.5 {
-        // Likely wraps around, recalculate with positive angles
-        let positive_angles: Vec<f64> = local_points
-            .iter()
-            .map(|p| {
-                let a = p.y.atan2(p.x);
-                if a < 0.0 {
-                    a + 2.0 * std::f64::consts::PI
-                } else {
-                    a
-                }
-            })
-            .collect();
-        min_angle = positive_angles.iter().cloned().fold(f64::MAX, f64::min);
-        max_angle = positive_angles.iter().cloned().fold(f64::MIN, f64::max);
     }
 
     // Tessellation parameters
@@ -897,11 +1061,12 @@ fn process_cylindrical_face(
     let height = max_z - min_z;
 
     // Balance between accuracy and matching web-ifc's output
-    // Use ~15 degrees per segment (pi/12) for good curvature approximation
-    let angle_segments =
-        ((angle_span / (std::f64::consts::PI / 12.0)).ceil() as usize).clamp(3, 16);
-    // Height segments based on aspect ratio - at least 1, more for tall cylinders
-    let height_segments = ((height / (radius * 2.0)).ceil() as usize).clamp(1, 4);
+    // Use ~10 degrees per segment for smooth handle/glazing curvature; scaled by quality.
+    let angle_base = (angle_span / (std::f64::consts::PI / 18.0)).ceil() as usize;
+    let angle_segments = scale_segments(angle_base, 6, 32, quality);
+    // Height segments based on aspect ratio - at least 1, more for tall cylinders.
+    let height_base = (height / (radius * 2.0)).ceil() as usize;
+    let height_segments = scale_segments(height_base, 1, 8, quality);
 
     let mut positions = Vec::new();
     let mut indices = Vec::new();
@@ -943,4 +1108,467 @@ fn process_cylindrical_face(
     }
 
     Ok((positions, indices))
+}
+
+// ---------- Surface-of-revolution ----------
+
+/// Sample points along a curve in 3D. Currently handles `IfcLine`, `IfcCircle`,
+/// `IfcTrimmedCurve` and `IfcBSplineCurveWithKnots`. Returns a polyline that
+/// approximates the curve. Used as the generator profile for surfaces of
+/// revolution.
+fn sample_curve_polyline(
+    curve: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+) -> Vec<Point3<f64>> {
+    use std::f64::consts::TAU;
+    let kind = curve.ifc_type.as_str().to_uppercase();
+    if kind == "IFCBSPLINECURVEWITHKNOTS" {
+        // Reuse the helper with a synthetic start; we just need the polyline.
+        let mut pts = sample_bspline_edge_curve(
+            curve,
+            &Point3::new(0.0, 0.0, 0.0),
+            true,
+            decoder,
+            quality,
+        );
+        if !pts.is_empty() {
+            // Replace the synthetic start with an explicit evaluation at t_min.
+            let degree = curve.get_float(0).unwrap_or(3.0) as usize;
+            if let (Some(cp_list), Some(mults), Some(knot_values)) = (
+                curve.get(1).and_then(|a| a.as_list()),
+                curve
+                    .get(6)
+                    .and_then(|a| a.as_list())
+                    .map(|l| l.iter().filter_map(|v| v.as_int()).collect::<Vec<_>>()),
+                curve
+                    .get(7)
+                    .and_then(|a| a.as_list())
+                    .map(|l| l.iter().filter_map(|v| v.as_float()).collect::<Vec<_>>()),
+            ) {
+                let cps: Vec<Point3<f64>> = cp_list
+                    .iter()
+                    .filter_map(|r| {
+                        let id = r.as_entity_ref()?;
+                        let pt = decoder.decode_by_id(id).ok()?;
+                        let coords = pt.get(0)?.as_list()?;
+                        let x = coords.first()?.as_float().unwrap_or(0.0);
+                        let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        Some(Point3::new(x, y, z))
+                    })
+                    .collect();
+                if !cps.is_empty() && !mults.is_empty() && !knot_values.is_empty() {
+                    let knots = expand_knots(&knot_values, &mults);
+                    if knots.len() > degree {
+                        let t0 = knots[degree];
+                        pts[0] = evaluate_bspline_curve(t0, degree, &cps, &knots);
+                        // Also append the explicit terminal endpoint so
+                        // standalone polyline callers (e.g. SoR generator
+                        // profiles) don't lose the last segment. Edge-loop
+                        // callers tolerate the duplicate via dedup later.
+                        // Per CodeRabbit feedback on PR #605.
+                        let t_max_idx = knots.len().saturating_sub(degree + 1);
+                        if t_max_idx > degree {
+                            let t_max = knots[t_max_idx];
+                            let p_end = evaluate_bspline_curve(t_max, degree, &cps, &knots);
+                            // Avoid duplicating the last sampled point.
+                            let near_dup = pts
+                                .last()
+                                .map(|p| (p - p_end).norm_squared() < 1e-18)
+                                .unwrap_or(false);
+                            if !near_dup {
+                                pts.push(p_end);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return pts;
+    }
+    if kind == "IFCLINE" {
+        // IfcLine: 0=Pnt, 1=Dir(IfcVector). Treat as segment [Pnt, Pnt+Dir·magnitude].
+        let pnt = curve
+            .get(0)
+            .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+            .and_then(|p| {
+                let coords = p.get(0).and_then(|v| v.as_list())?;
+                let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                Some(Point3::new(x, y, z))
+            });
+        let (dir, mag) = curve
+            .get(1)
+            .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+            .map(|v| {
+                let direction = v.get(0).and_then(|a| decoder.resolve_ref(a).ok().flatten());
+                let magnitude = v.get(1).and_then(|a| a.as_float()).unwrap_or(1.0);
+                let dir = direction
+                    .and_then(|d| {
+                        let coords = d.get(0).and_then(|v| v.as_list())?;
+                        let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                        Some(nalgebra::Vector3::new(x, y, z))
+                    })
+                    .and_then(|v| v.try_normalize(1e-12))
+                    .unwrap_or_else(|| nalgebra::Vector3::new(1.0, 0.0, 0.0));
+                (dir, magnitude)
+            })
+            .unwrap_or_else(|| (nalgebra::Vector3::new(1.0, 0.0, 0.0), 1.0));
+        let start = pnt.unwrap_or_else(|| Point3::new(0.0, 0.0, 0.0));
+        return vec![start, start + dir * mag];
+    }
+    if kind == "IFCCIRCLE" {
+        let radius = curve.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+        if radius <= 0.0 {
+            return Vec::new();
+        }
+        let placement = match curve.get(0).and_then(|a| decoder.resolve_ref(a).ok().flatten()) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let (center, axis_z, axis_x) = read_axis2_placement_3d(&placement, decoder);
+        let axis_y = axis_z.cross(&axis_x);
+        let n = scale_segments(24, 8, 96, quality);
+        return (0..=n)
+            .map(|i| {
+                let a = TAU * (i as f64) / (n as f64);
+                center + axis_x * (radius * a.cos()) + axis_y * (radius * a.sin())
+            })
+            .collect();
+    }
+    if kind == "IFCTRIMMEDCURVE" {
+        // 0=BasisCurve, 1=Trim1, 2=Trim2, 3=Sense, 4=MasterRepresentation.
+        let basis = match curve.get(0).and_then(|a| decoder.resolve_ref(a).ok().flatten()) {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+        let basis_kind = basis.ifc_type.as_str().to_uppercase();
+        let sense = curve
+            .get(3)
+            .and_then(|a| a.as_enum())
+            .map(|e| e == "T" || e == "TRUE")
+            .unwrap_or(true);
+
+        let mut read_trim_point = |idx: usize| -> Option<Point3<f64>> {
+            let list = curve.get(idx)?.as_list()?;
+            for v in list {
+                if let Some(id) = v.as_entity_ref() {
+                    if let Ok(e) = decoder.decode_by_id(id) {
+                        if e.ifc_type.as_str().eq_ignore_ascii_case("IFCCARTESIANPOINT") {
+                            let coords = e.get(0).and_then(|a| a.as_list())?;
+                            let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                            let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                            let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                            return Some(Point3::new(x, y, z));
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let p1 = read_trim_point(1);
+        let p2 = read_trim_point(2);
+
+        if basis_kind == "IFCCIRCLE" {
+            if let (Some(p_start), Some(p_end)) = (p1, p2) {
+                // Edge-loop callers consume `start..pre_end` and rely on the
+                // *next* edge to add the end vertex. When this helper is used
+                // standalone (e.g. as a surface-of-revolution generator
+                // profile) we have to append the terminal point ourselves so
+                // the polyline isn't truncated by one segment.
+                // Per CodeRabbit feedback on PR #605.
+                let mut pts =
+                    sample_circle_edge_curve(&basis, &p_start, &p_end, sense, decoder, quality);
+                pts.push(p_end);
+                return pts;
+            }
+        }
+        if basis_kind == "IFCBSPLINECURVEWITHKNOTS" {
+            if let (Some(p_start), Some(p_end)) = (p1, p2) {
+                let mut pts = sample_bspline_edge_curve(&basis, &p_start, sense, decoder, quality);
+                pts.push(p_end);
+                return pts;
+            }
+            if let Some(p_start) = p1 {
+                return sample_bspline_edge_curve(&basis, &p_start, sense, decoder, quality);
+            }
+        }
+        if basis_kind == "IFCLINE" {
+            // A trimmed line is just the segment between its two cartesian trim
+            // points. Falling through to `sample_curve_polyline(&basis)` below
+            // would discard Trim1/Trim2 and sample the *raw* IfcLine, whose
+            // IfcVector magnitude is a tool-emitted unit length (e.g. Revit's
+            // 0.3048 = 1 ft) wholly unrelated to the trimmed extent. For a
+            // surface-of-revolution generator profile that inflates the
+            // revolved radius/extent ~50-70x (light-fixture #189538 hull 9.5x,
+            // proxy #209435 hull 3.2x in ISSUE_159).
+            if let (Some(p_start), Some(p_end)) = (p1, p2) {
+                return if sense {
+                    vec![p_start, p_end]
+                } else {
+                    vec![p_end, p_start]
+                };
+            }
+        }
+        return sample_curve_polyline(&basis, decoder, quality);
+    }
+    Vec::new()
+}
+
+/// Tessellate an `IfcSurfaceOfRevolution` face by sweeping its profile curve
+/// around the axis through the angular extent recovered from the face's edge
+/// loops. Falls back to the planar boundary approximation when the profile or
+/// axis can't be parsed.
+fn process_surface_of_revolution_face(
+    face: &DecodedEntity,
+    surface: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+) -> Result<(Vec<f32>, Vec<u32>)> {
+    use nalgebra::Vector3;
+    use std::f64::consts::TAU;
+
+    let swept = surface
+        .get(0)
+        .and_then(|a| decoder.resolve_ref(a).ok().flatten());
+    // IfcSurfaceOfRevolution inherits Position (optional IfcAxis2Placement3D)
+    // at slot 1 from IfcSweptSurface, and AxisPosition (IfcAxis1Placement) is
+    // its own attribute at slot 2. The previous code read slot 1 and got the
+    // (usually null) Position, leaving axis_origin at the (0,0,0) fallback
+    // and collapsing the angular-extent calculation — the real cause of
+    // issue #674's "stem in wrong direction" defect, not the radius/sign
+    // collapse the earlier patch went after.
+    let axis_pos = surface
+        .get(2)
+        .and_then(|a| decoder.resolve_ref(a).ok().flatten());
+
+    let (axis_origin, axis_dir) = if let Some(ap) = axis_pos {
+        // IfcAxis1Placement: 0=Location, 1=Axis(Direction)
+        let loc = ap
+            .get(0)
+            .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+            .and_then(|p| {
+                let coords = p.get(0).and_then(|v| v.as_list())?;
+                let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                Some(Point3::new(x, y, z))
+            })
+            .unwrap_or_else(|| Point3::new(0.0, 0.0, 0.0));
+        let dir = ap
+            .get(1)
+            .and_then(|a| decoder.resolve_ref(a).ok().flatten())
+            .and_then(|d| {
+                let coords = d.get(0).and_then(|v| v.as_list())?;
+                let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+                let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
+                let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
+                Some(Vector3::new(x, y, z))
+            })
+            .and_then(|v| v.try_normalize(1e-12))
+            .unwrap_or_else(|| Vector3::new(0.0, 0.0, 1.0));
+        (loc, dir)
+    } else {
+        (Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0))
+    };
+
+    // Sample the generator profile curve.
+    let profile_pts: Vec<Point3<f64>> = match swept {
+        Some(s) if s.ifc_type.as_str().eq_ignore_ascii_case("IFCARBITRARYOPENPROFILEDEF") => {
+            // Attribute 2 is the curve.
+            if let Some(curve) = s.get(2).and_then(|a| decoder.resolve_ref(a).ok().flatten()) {
+                sample_curve_polyline(&curve, decoder, quality)
+            } else {
+                Vec::new()
+            }
+        }
+        Some(s) => sample_curve_polyline(&s, decoder, quality),
+        None => Vec::new(),
+    };
+
+    if profile_pts.len() < 2 {
+        return process_planar_face(face, decoder, quality);
+    }
+
+    // Build an orthonormal basis (axis_x, axis_y, axis_dir).
+    let ref_dir = if axis_dir.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let axis_x = (ref_dir - axis_dir * ref_dir.dot(&axis_dir))
+        .try_normalize(1e-12)
+        .unwrap_or_else(|| Vector3::new(1.0, 0.0, 0.0));
+    let axis_y = axis_dir.cross(&axis_x);
+
+    // Determine angular extent from the boundary edge points. We project each
+    // boundary point's radial vector to a [0, TAU) angle, then find the
+    // *largest gap* between sorted angles — the face occupies the complement.
+    // This robustly handles faces that straddle the θ=π discontinuity (e.g.
+    // a fillet at θ=−π/2..π) where naive min/max gives 3π/2 instead of π/2.
+    let boundary = extract_edge_loop_points_for_bounds(face, decoder, quality);
+    let (a_min, span) = if boundary.is_empty() {
+        (0.0, TAU)
+    } else {
+        let mut angles: Vec<f64> = boundary
+            .iter()
+            .map(|p| {
+                let v = p - axis_origin;
+                let mut a = v.dot(&axis_y).atan2(v.dot(&axis_x));
+                if a < 0.0 {
+                    a += TAU;
+                }
+                a
+            })
+            .collect();
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        angles.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+        if angles.len() < 2 {
+            (0.0, TAU)
+        } else {
+            let n = angles.len();
+            let mut max_gap = 0.0;
+            let mut max_gap_idx = 0usize;
+            for i in 0..n {
+                let next = if i + 1 < n { angles[i + 1] } else { angles[0] + TAU };
+                let gap = next - angles[i];
+                if gap > max_gap {
+                    max_gap = gap;
+                    max_gap_idx = i;
+                }
+            }
+            // The face occupies the complement of the largest gap. If the
+            // boundary samples are all on one side, the largest gap is on the
+            // other side, and the face spans angles[(idx+1)%n] → angles[idx]+TAU.
+            let start = angles[(max_gap_idx + 1) % n];
+            let end_raw = angles[max_gap_idx];
+            let end = if end_raw < start { end_raw + TAU } else { end_raw };
+            let s = end - start;
+            // If the gap is near zero or full, treat it as a full revolution.
+            if s < 1e-6 || s > TAU - 1e-6 {
+                (0.0, TAU)
+            } else {
+                (start, s)
+            }
+        }
+    };
+    let n_angle = scale_segments((span / (TAU / 36.0)).ceil() as usize, 4, 48, quality);
+    let n_v = profile_pts.len();
+
+    // Preserve the profile's (rx, ry) — issue #674: collapsing to radius
+    // mirrored profiles on the −axis_x half to the +axis_x side, drifting
+    // door-handle SoR bulbs 180° away from their bar.
+    let local_profile: Vec<(f64, f64, f64)> = profile_pts
+        .iter()
+        .map(|p| {
+            let r = p - axis_origin;
+            (r.dot(&axis_x), r.dot(&axis_y), r.dot(&axis_dir))
+        })
+        .collect();
+
+    // Per IFC 4.3 IfcSurfaceOfRevolution: S(u, v) = R(v) * (SweptCurve(u) -
+    // AxisPosition.Location) + AxisPosition.Location, with v ∈ [0, 2π].
+    // R(0) = identity, so the swept curve is its *natural* position at v=0.
+    //
+    // `(a_min, span)` here is the angular range of the FACE BOUNDARY POINTS
+    // around the axis (computed by largest-gap detection above). For a
+    // planar profile, every profile point shares the same natural angle
+    // (the angle of the profile-plane around the axis), so the boundary
+    // angle of a point at parameter v on the swept curve is
+    //   boundary_angle = natural_angle + v
+    // and the v-range we actually need to sweep is
+    //   v ∈ [a_min − natural_angle, a_min − natural_angle + span].
+    //
+    // The previous fix dropped `a_min` and swept v ∈ [0, span] starting at
+    // the natural position — correct only when a_min happens to coincide
+    // with natural_angle. Door-handle bends (a_min = π/2, natural_angle =
+    // π) regressed: the bulb pivoted to the opposite quadrant, producing
+    // the "stem in wrong direction" defect issue #674 #674 reopened.
+    // Pick the first profile point that's clearly off-axis. atan2(0, 0)
+    // returns 0 even though the natural angle is undefined for a point
+    // sitting on the rotation axis, so a profile that starts on-axis (a
+    // common case for partial SoR faces where the profile touches the
+    // axis at one end) would skew the entire sweep by a wrong constant
+    // offset — Codex P1 on PR #799 follow-up.
+    let natural_angle = local_profile
+        .iter()
+        .find(|&&(rx, ry, _)| rx.hypot(ry) > 1e-9)
+        .map(|&(rx, ry, _)| ry.atan2(rx))
+        .unwrap_or(0.0);
+
+    let mut positions = Vec::with_capacity((n_angle + 1) * n_v * 3);
+    for i in 0..=n_angle {
+        let boundary_angle = a_min + span * (i as f64) / (n_angle as f64);
+        let v = boundary_angle - natural_angle;
+        let cos_v = v.cos();
+        let sin_v = v.sin();
+        for &(rx, ry, z) in &local_profile {
+            let nrx = rx * cos_v - ry * sin_v;
+            let nry = rx * sin_v + ry * cos_v;
+            let world = axis_origin + axis_x * nrx + axis_y * nry + axis_dir * z;
+            positions.push(world.x as f32);
+            positions.push(world.y as f32);
+            positions.push(world.z as f32);
+        }
+    }
+
+    let mut indices = Vec::with_capacity(n_angle * (n_v - 1) * 6);
+    for i in 0..n_angle {
+        for j in 0..(n_v - 1) {
+            let a = (i * n_v + j) as u32;
+            let b = a + n_v as u32;
+            let c = b + 1;
+            let d = a + 1;
+            indices.push(a);
+            indices.push(b);
+            indices.push(c);
+            indices.push(a);
+            indices.push(c);
+            indices.push(d);
+        }
+    }
+
+    if positions.is_empty() || indices.is_empty() {
+        return process_planar_face(face, decoder, quality);
+    }
+    Ok((positions, indices))
+}
+
+/// Helper that runs `extract_edge_loop_points` over every outer/inner bound of a
+/// face and concatenates the results. Used to recover boundary coverage when we
+/// need angular extents (e.g. for surfaces of revolution).
+fn extract_edge_loop_points_for_bounds(
+    face: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    quality: TessellationQuality,
+) -> Vec<Point3<f64>> {
+    let mut all = Vec::new();
+    let bounds = match face.get(0).and_then(|a| a.as_list()) {
+        Some(b) => b,
+        None => return all,
+    };
+    for bound in bounds {
+        if let Some(bound_id) = bound.as_entity_ref() {
+            if let Ok(bound_entity) = decoder.decode_by_id(bound_id) {
+                if let Some(loop_attr) = bound_entity.get(0) {
+                    if let Some(loop_entity) = decoder.resolve_ref(loop_attr).ok().flatten() {
+                        if loop_entity
+                            .ifc_type
+                            .as_str()
+                            .eq_ignore_ascii_case("IFCEDGELOOP")
+                        {
+                            all.extend(extract_edge_loop_points(&loop_entity, decoder, quality));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    all
 }

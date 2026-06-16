@@ -1,6 +1,6 @@
 import type { MeshData } from '@ifc-lite/geometry';
-import type { Ray, Vec3, Intersection } from './raycaster';
-import { Raycaster } from './raycaster';
+import type { Ray, Vec3, Intersection } from './raycaster.js';
+import { Raycaster } from './raycaster.js';
 import { distance, vecEquals, closestPointOnEdgeWithT, screenToWorldRadius } from './snap-geometry-utils.js';
 import { buildGeometryCache, type MeshGeometryCache } from './snap-geometry-cache.js';
 
@@ -623,9 +623,14 @@ export class SnapDetector {
       metadata: { faceIndex: intersection.triangleIndex },
     });
 
-    // Calculate face center (centroid of triangle)
+    // Calculate face center (centroid of triangle). Positions are in the
+    // element's local frame; the intersection point is world-space, so lift
+    // each vertex by the per-mesh origin (world = origin + local).
     const positions = mesh.positions;
     const indices = mesh.indices;
+    const ox = mesh.origin ? mesh.origin[0] : 0;
+    const oy = mesh.origin ? mesh.origin[1] : 0;
+    const oz = mesh.origin ? mesh.origin[2] : 0;
 
     if (indices) {
       const triIndex = intersection.triangleIndex * 3;
@@ -634,19 +639,19 @@ export class SnapDetector {
       const i2 = indices[triIndex + 2] * 3;
 
       const v0: Vec3 = {
-        x: positions[i0],
-        y: positions[i0 + 1],
-        z: positions[i0 + 2],
+        x: positions[i0] + ox,
+        y: positions[i0 + 1] + oy,
+        z: positions[i0 + 2] + oz,
       };
       const v1: Vec3 = {
-        x: positions[i1],
-        y: positions[i1 + 1],
-        z: positions[i1 + 2],
+        x: positions[i1] + ox,
+        y: positions[i1 + 1] + oy,
+        z: positions[i1 + 2] + oz,
       };
       const v2: Vec3 = {
-        x: positions[i2],
-        y: positions[i2 + 1],
-        z: positions[i2 + 2],
+        x: positions[i2] + ox,
+        y: positions[i2 + 1] + oy,
+        z: positions[i2 + 2] + oz,
       };
 
       const center: Vec3 = {

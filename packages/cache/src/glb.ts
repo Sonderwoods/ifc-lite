@@ -45,6 +45,7 @@ interface GLTFDocument {
   scenes?: Array<{ nodes?: number[] }>;
   nodes?: GLTFNode[];
   meshes?: GLTFMesh[];
+  materials?: GLTFMaterial[];
   accessors?: GLTFAccessor[];
   bufferViews?: GLTFBufferView[];
   buffers?: GLTFBuffer[];
@@ -69,6 +70,14 @@ interface GLTFPrimitive {
   };
   indices?: number;
   mode?: number;
+  material?: number;
+}
+
+interface GLTFMaterial {
+  pbrMetallicRoughness?: {
+    baseColorFactor?: [number, number, number, number] | number[];
+  };
+  alphaMode?: 'OPAQUE' | 'MASK' | 'BLEND';
 }
 
 interface GLTFAccessor {
@@ -338,6 +347,28 @@ export function parseGLBToMeshData(gltf: GLTFDocument, bin: Uint8Array): MeshDat
     return meshes;
   }
 
+  const DEFAULT_COLOR: [number, number, number, number] = [0.8, 0.8, 0.8, 1.0];
+
+  const resolveMaterialColor = (
+    materialIdx: number | undefined,
+  ): [number, number, number, number] => {
+    if (materialIdx === undefined) return [...DEFAULT_COLOR];
+    const material = gltf.materials?.[materialIdx];
+    const factor = material?.pbrMetallicRoughness?.baseColorFactor;
+    if (!Array.isArray(factor) || factor.length < 3) return [...DEFAULT_COLOR];
+    const r = factor[0], g = factor[1], b = factor[2];
+    const a = factor.length >= 4 ? factor[3] : 1.0;
+    if (
+      typeof r !== 'number' || !Number.isFinite(r) ||
+      typeof g !== 'number' || !Number.isFinite(g) ||
+      typeof b !== 'number' || !Number.isFinite(b) ||
+      typeof a !== 'number' || !Number.isFinite(a)
+    ) {
+      return [...DEFAULT_COLOR];
+    }
+    return [r, g, b, a];
+  };
+
   for (let nodeIdx = 0; nodeIdx < gltf.nodes.length; nodeIdx++) {
     const node = gltf.nodes[nodeIdx];
     if (node.mesh === undefined) continue;
@@ -402,7 +433,7 @@ export function parseGLBToMeshData(gltf: GLTFDocument, bin: Uint8Array): MeshDat
         positions,
         normals,
         indices,
-        color: [0.8, 0.8, 0.8, 1.0], // Default grey, can be overridden
+        color: resolveMaterialColor(primitive.material),
       });
     }
   }

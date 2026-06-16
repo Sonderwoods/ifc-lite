@@ -1,0 +1,23 @@
+{
+  "name": "ifc-lite-collab-3d-demo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MPL-2.0",
+  "description": "Three.js + @ifc-lite/collab — two-tab live 3D walls",
+  "scripts": {
+    "dev": "vite --port 5175"
+  },
+  "dependencies": {
+    "@ifc-lite/collab": "workspace:*",
+    "three": "^0.184.0",
+    "yjs": "^13.6.31"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.1",
+    "typescript": "^6.0.3",
+    "vite": "^7.3.5",
+    "vite-plugin-top-level-await": "^1.5.0",
+    "vite-plugin-wasm": "^3.6.0"
+  }
+}

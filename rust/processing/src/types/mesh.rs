@@ -7,6 +7,20 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// A decoded RGBA8 surface texture attached to a mesh (issue #961).
+/// Decoded entirely in Rust (`IfcBlobTexture` PNG / `IfcPixelTexture` raw); the
+/// browser only uploads `rgba` to a GPU texture — no image logic in TS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshTextureData {
+    /// `width * height * 4` bytes, row-major, top-down, straight alpha.
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Sampler wrap from `IfcSurfaceTexture.RepeatS/RepeatT`.
+    pub repeat_s: bool,
+    pub repeat_t: bool,
+}
+
 /// Individual mesh data with geometry and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshData {
@@ -41,6 +55,38 @@ pub struct MeshData {
     /// Primarily attached for IfcSpace/IfcZone so downstream tools can build room attribute UIs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, String>>,
+    /// Per-vertex texture coordinates (u, v pairs, 1:1 with `positions`),
+    /// present only for textured meshes (issue #961).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uvs: Option<Vec<f32>>,
+    /// Decoded surface texture, present only for textured meshes (#961).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub texture: Option<MeshTextureData>,
+    /// Provenance of the geometry for the viewer's Model/Types switch (#957):
+    /// 0 = ordinary occurrence, 1 = orphan type-product RepresentationMap (no
+    /// occurrence instantiates it), 2 = instanced type-product map (the type
+    /// library shape; its occurrences already draw the real geometry).
+    /// Serde-default so existing JSON payloads and disk caches stay readable;
+    /// skipped when 0 so ordinary meshes serialize byte-identically.
+    #[serde(default, skip_serializing_if = "geometry_class_is_occurrence")]
+    pub geometry_class: u8,
+    /// Per-mesh local origin (world/RTC frame, f64). `positions` are stored
+    /// RELATIVE to this — the world position of a vertex is `origin + position` —
+    /// so building/georef-scale placement never collapses adjacent vertices to
+    /// bit-identical f32. The renderer applies it as a per-mesh translation
+    /// (camera-relative). `[0, 0, 0]` ⇒ positions are absolute (legacy/local).
+    /// Serde-default + skip-when-zero so existing payloads/caches stay readable
+    /// and local meshes serialize byte-identically.
+    #[serde(default, skip_serializing_if = "origin_is_zero")]
+    pub origin: [f64; 3],
+}
+
+fn geometry_class_is_occurrence(class: &u8) -> bool {
+    *class == 0
+}
+
+fn origin_is_zero(origin: &[f64; 3]) -> bool {
+    origin[0] == 0.0 && origin[1] == 0.0 && origin[2] == 0.0
 }
 
 impl MeshData {
@@ -66,7 +112,31 @@ impl MeshData {
             material_name: None,
             geometry_item_id: None,
             properties: None,
+            uvs: None,
+            texture: None,
+            geometry_class: 0,
+            origin: [0.0; 3],
         }
+    }
+
+    /// Tag the geometry's provenance for the Model/Types view switch (#957).
+    pub fn with_geometry_class(mut self, geometry_class: u8) -> Self {
+        self.geometry_class = geometry_class;
+        self
+    }
+
+    /// Set the per-mesh local origin (positions are relative to it).
+    pub fn with_origin(mut self, origin: [f64; 3]) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    /// Attach per-vertex UVs + a decoded surface texture (issue #961).
+    /// `uvs` must be 1:1 with `positions` (2 floats per vertex).
+    pub fn with_texture(mut self, uvs: Vec<f32>, texture: MeshTextureData) -> Self {
+        self.uvs = Some(uvs);
+        self.texture = Some(texture);
+        self
     }
 
     /// Set element-level IFC metadata.

@@ -27,6 +27,20 @@ export type { ClassificationInfo } from './classification-resolver.js';
 export { extractMaterialsOnDemand } from './material-resolver.js';
 export type { MaterialInfo, MaterialLayerInfo, MaterialProfileInfo, MaterialConstituentInfo } from './material-resolver.js';
 
+export {
+    resolveMaterialDefId,
+    collectMaterialLeaves,
+    buildMaterialUsageIndex,
+    getMaterialDisplay,
+} from './material-resolver.js';
+export type { MaterialLeaf, MaterialUsage } from './material-resolver.js';
+
+import {
+    resolveMaterialDefId as resolveMaterialDefIdImpl,
+    collectMaterialLeaves as collectMaterialLeavesImpl,
+    getMaterialDisplay as getMaterialDisplayImpl,
+} from './material-resolver.js';
+
 // ============================================================================
 // Remaining Interfaces
 // ============================================================================
@@ -37,7 +51,7 @@ export type { MaterialInfo, MaterialLayerInfo, MaterialProfileInfo, MaterialCons
 export interface TypePropertyInfo {
     typeName: string;
     typeId: number;
-    properties: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }>;
+    properties: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }>;
 }
 
 /**
@@ -60,11 +74,24 @@ export interface DocumentInfo {
 export interface EntityRelationships {
     voids: Array<{ id: number; name?: string; type: string }>;
     fills: Array<{ id: number; name?: string; type: string }>;
-    groups: Array<{ id: number; name?: string }>;
+    /** Groups this entity is assigned to (IfcZone, IfcGroup, IfcSystem, …) via
+     *  IfcRelAssignsToGroup. `type` distinguishes IfcZone from a plain IfcGroup. */
+    groups: Array<{ id: number; name?: string; type: string }>;
     connections: Array<{ id: number; name?: string; type: string }>;
 }
 
 export type { GeoreferenceInfo as GeorefInfo };
+
+/**
+ * Property sets attached to a material via IfcMaterialProperties (e.g.
+ * Pset_MaterialConcrete). Grouped per underlying IfcMaterial so the UI can
+ * show which material each set belongs to. See {@link extractMaterialPropertiesOnDemand}.
+ */
+export interface MaterialPsetGroup {
+    materialId: number;
+    materialName: string;
+    psets: Array<{ name: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }>;
+}
 
 // ============================================================================
 // Property Value Parsing Helpers
@@ -80,7 +107,7 @@ export type { GeoreferenceInfo as GeorefInfo };
  * - IfcPropertyTableValue: defining/defined value pairs → "Table(N rows)"
  * - IfcPropertyReferenceValue: entity reference → "Reference #ID"
  */
-export function parsePropertyValue(propEntity: IfcEntity): { type: number; value: PropertyValue } {
+export function parsePropertyValue(propEntity: IfcEntity): { type: number; value: PropertyValue; values?: string[]; dataType?: string } {
     const attrs = propEntity.attributes || [];
     const typeUpper = propEntity.type.toUpperCase();
 
@@ -93,7 +120,11 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                     if (Array.isArray(v) && v.length === 2) return String(v[1]); // Typed value
                     return String(v);
                 }).filter(v => v !== 'null' && v !== 'undefined');
-                return { type: 0, value: values.join(', ') };
+                // Surface the raw value list separately so IDS facet
+                // checks can iterate "any matching value passes". The
+                // joined display string remains the primary `value`
+                // for visualisation/property-table consumers.
+                return { type: 0, value: values.join(', ') || null, values };
             }
             return { type: 0, value: null };
         }
@@ -108,7 +139,33 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
             if (lower != null && upper != null) {
                 display += ` [${lower} – ${upper}]`;
             }
-            return { type: displayValue != null ? 1 : 0, value: display || null };
+            // Surface every defined bound as a candidate value — IDS
+            // bounded-property checks pass when ANY of the bounds /
+            // setpoint matches the constraint, per upstream ifctester.
+            const candidates: string[] = [];
+            if (lower != null) candidates.push(String(lower));
+            if (upper != null && upper !== lower) candidates.push(String(upper));
+            if (setPoint != null && setPoint !== lower && setPoint !== upper) {
+                candidates.push(String(setPoint));
+            }
+            // Carry the IFC-declared measure tag so the IDS-side data
+            // type comparison and unit conversion both work.
+            const inferDataType = (attr: unknown): string | undefined => {
+                if (Array.isArray(attr) && attr.length === 2) {
+                    return String(attr[0]).toUpperCase();
+                }
+                return undefined;
+            };
+            const dataType =
+                inferDataType(attrs[5]) ||
+                inferDataType(attrs[2]) ||
+                inferDataType(attrs[3]);
+            return {
+                type: displayValue != null ? 1 : 0,
+                value: display || null,
+                ...(candidates.length > 0 ? { values: candidates } : {}),
+                ...(dataType ? { dataType } : {}),
+            };
         }
 
         case 'IFCPROPERTYLISTVALUE': {
@@ -119,7 +176,7 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                     if (Array.isArray(v) && v.length === 2) return String(v[1]);
                     return String(v);
                 }).filter(v => v !== 'null' && v !== 'undefined');
-                return { type: 0, value: values.join(', ') };
+                return { type: 0, value: values.join(', ') || null, values };
             }
             return { type: 0, value: null };
         }
@@ -129,8 +186,29 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
             const definingValues = attrs[2];
             const definedValues = attrs[3];
             const rowCount = Array.isArray(definingValues) ? definingValues.length : 0;
-            if (rowCount > 0 && Array.isArray(definedValues)) {
-                return { type: 0, value: `Table (${rowCount} rows)` };
+            if (rowCount > 0 && Array.isArray(definedValues) && Array.isArray(definingValues)) {
+                // Surface both defining and defined values as candidate
+                // matches — IDS table-value checks pass when ANY entry
+                // matches the constraint (per upstream ifctester).
+                const stringify = (v: unknown): string => {
+                    if (Array.isArray(v) && v.length === 2) return String(v[1]);
+                    return String(v);
+                };
+                const values = [
+                    ...definingValues.map(stringify),
+                    ...definedValues.map(stringify),
+                ].filter(v => v !== 'null' && v !== 'undefined');
+                // Tables mix types per column (label / length / …),
+                // so we can't surface a single representative
+                // dataType. Leaving it unset lets the IDS check fall
+                // through to a pure value match against any of the
+                // candidates — which is what upstream ifctester does
+                // for table values.
+                return {
+                    type: 0,
+                    value: `Table (${rowCount} rows)`,
+                    values,
+                };
             }
             return { type: 0, value: null };
         }
@@ -149,11 +227,13 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
             const nominalValue = attrs[2];
             let type: number = PropertyValueType.String;
             let value: PropertyValue = nominalValue as PropertyValue;
+            let dataType: string | undefined;
 
             // Handle typed values like IFCBOOLEAN(.T.), IFCREAL(1.5)
             if (Array.isArray(nominalValue) && nominalValue.length === 2) {
                 const innerValue = nominalValue[1];
                 const typeName = String(nominalValue[0]).toUpperCase();
+                dataType = typeName;
 
                 if (typeName.includes('BOOLEAN')) {
                     type = PropertyValueType.Boolean;
@@ -167,7 +247,20 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
                         value = innerValue === '.T.' || innerValue === true;
                     }
                 } else if (typeof innerValue === 'number') {
-                    if (Number.isInteger(innerValue)) {
+                    // Preserve the IFC-declared numeric measure (IFCREAL,
+                    // IFCINTEGER, IFCLENGTHMEASURE, IFCAREAMEASURE, …) —
+                    // the source explicitly tagged the value, so don't
+                    // re-infer from JS number-ness (which would
+                    // misclassify e.g. `IFCREAL(0.0)` as integer).
+                    if (typeName === 'IFCINTEGER' || typeName === 'IFCCOUNTMEASURE') {
+                        type = PropertyValueType.Integer;
+                    } else if (
+                        typeName === 'IFCREAL' ||
+                        typeName.endsWith('MEASURE') ||
+                        typeName.endsWith('RATIO')
+                    ) {
+                        type = PropertyValueType.Real;
+                    } else if (Number.isInteger(innerValue)) {
                         type = PropertyValueType.Integer;
                     } else {
                         type = PropertyValueType.Real;
@@ -182,10 +275,24 @@ export function parsePropertyValue(propEntity: IfcEntity): { type: number; value
             } else if (typeof nominalValue === 'boolean') {
                 type = PropertyValueType.Boolean;
             } else if (nominalValue !== null && nominalValue !== undefined) {
-                value = String(nominalValue);
+                // Normalize untagged STEP enumeration tokens. Conformant IFC wraps
+                // booleans as IFCBOOLEAN(.T.) (handled above), but some authoring
+                // tools emit the bare tokens directly in the NominalValue slot.
+                if (nominalValue === '.T.') {
+                    type = PropertyValueType.Boolean;
+                    value = true;
+                } else if (nominalValue === '.F.') {
+                    type = PropertyValueType.Boolean;
+                    value = false;
+                } else if (nominalValue === '.U.' || nominalValue === '.X.') {
+                    type = PropertyValueType.Logical;
+                    value = null;
+                } else {
+                    value = String(nominalValue);
+                }
             }
 
-            return { type, value };
+            return { type, value, ...(dataType ? { dataType } : {}) };
         }
     }
 }
@@ -209,8 +316,8 @@ export function extractPsetsFromIds(
     store: IfcDataStore,
     extractor: EntityExtractor,
     psetIds: number[]
-): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> {
-    const result: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> = [];
+): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> {
+    const result: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> }> = [];
 
     for (const psetId of psetIds) {
         const psetRef = store.entityIndex.byId.get(psetId);
@@ -227,7 +334,7 @@ export function extractPsetsFromIds(
         const psetName = typeof psetAttrs[2] === 'string' ? psetAttrs[2] : `PropertySet #${psetId}`;
         const hasProperties = psetAttrs[4];
 
-        const properties: Array<{ name: string; type: number; value: PropertyValue }> = [];
+        const properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string }> = [];
 
         if (Array.isArray(hasProperties)) {
             for (const propRef of hasProperties) {
@@ -244,7 +351,14 @@ export function extractPsetsFromIds(
                 if (!propName) continue;
 
                 const parsed = parsePropertyValue(propEntity);
-                properties.push({ name: propName, type: parsed.type, value: parsed.value });
+                const entry: { name: string; type: number; value: PropertyValue; values?: string[]; dataType?: string } = {
+                    name: propName,
+                    type: parsed.type,
+                    value: parsed.value,
+                };
+                if (parsed.values) entry.values = parsed.values;
+                if (parsed.dataType) entry.dataType = parsed.dataType;
+                properties.push(entry);
             }
         }
 
@@ -291,7 +405,7 @@ export function extractTypePropertiesOnDemand(
         ? typeEntity.attributes[2]
         : typeRef.type;
 
-    const allPsets: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> = [];
+    const allPsets: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[] }> }> = [];
     const seenPsetNames = new Set<string>();
 
     // Source 1: HasPropertySets attribute on the type entity (index 5 for IfcTypeObject subtypes)
@@ -338,7 +452,7 @@ export function extractTypePropertiesOnDemand(
 export function extractTypeEntityOwnProperties(
     store: IfcDataStore,
     typeEntityId: number
-): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> {
+): Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[] }> }> {
     const ref = store.entityIndex.byId.get(typeEntityId);
     if (!ref || !store.source?.length) return [];
 
@@ -346,7 +460,7 @@ export function extractTypeEntityOwnProperties(
     const typeEntity = extractor.extractEntity(ref);
     if (!typeEntity) return [];
 
-    const allPsets: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue }> }> = [];
+    const allPsets: Array<{ name: string; globalId?: string; properties: Array<{ name: string; type: number; value: PropertyValue; values?: string[] }> }> = [];
     const seenPsetNames = new Set<string>();
 
     // Source 1: HasPropertySets attribute (index 5 for IfcTypeObject subtypes)
@@ -529,11 +643,11 @@ export function extractRelationshipsOnDemand(
         result.fills.push({ id, ...info });
     }
 
-    // AssignsToGroup: groups this element belongs to
+    // AssignsToGroup: groups (IfcZone / IfcGroup / IfcSystem) this element belongs to
     const groupIds = store.relationships.getRelated(entityId, RelationshipType.AssignsToGroup, 'inverse');
     for (const id of groupIds) {
-        const name = store.entities?.getName(id);
-        result.groups.push({ id, name: name || undefined });
+        const info = getEntityInfo(id);
+        result.groups.push({ id, ...info });
     }
 
     // ConnectsPathElements: connected walls
@@ -547,6 +661,42 @@ export function extractRelationshipsOnDemand(
     }
 
     return result;
+}
+
+/** A member object of an IfcZone / IfcGroup (the RelatedObjects of its
+ *  IfcRelAssignsToGroup). */
+export interface GroupMember {
+    id: number;
+    name?: string;
+    type: string;
+}
+
+/**
+ * Enumerate the member objects of a group/zone ON-DEMAND — the inverse of the
+ * `groups` field in {@link extractRelationshipsOnDemand}. Resolves the
+ * RelatedObjects of the group's IfcRelAssignsToGroup (forward direction:
+ * group → members). For an IfcZone this returns the IfcSpace / IfcSpatialZone
+ * members so the UI can select/isolate everything in a dwelling, house number,
+ * fire compartment, etc. (#1075).
+ */
+export function extractGroupMembersOnDemand(
+    store: IfcDataStore,
+    groupId: number
+): GroupMember[] {
+    if (!store.relationships) return [];
+    const memberIds = store.relationships.getRelated(groupId, RelationshipType.AssignsToGroup, 'forward');
+    const members: GroupMember[] = [];
+    for (const id of memberIds) {
+        const ref = store.entityIndex.byId.get(id);
+        if (!ref) continue;
+        const name = store.entities?.getName(id);
+        // Canonical IfcPascalCase (e.g. "IfcSpace") — `ref.type` is the raw STEP
+        // token ("IFCSPACE"), which would break case-sensitive class checks in
+        // consumers (member-isolation toggles, lens zone matching). (#1075)
+        const type = store.entities?.getTypeName(id) || ref.type;
+        members.push({ id, name: name || undefined, type });
+    }
+    return members;
 }
 
 // ============================================================================
@@ -567,12 +717,16 @@ export function extractGeoreferencingOnDemand(store: IfcDataStore): Georeference
     const entityMap = new Map<number, { expressId: number; attributes: unknown[] }>();
     const typeMap = new Map<string, number[]>();
 
-    for (const typeName of ['IFCMAPCONVERSION', 'IFCPROJECTEDCRS']) {
+    for (const typeName of ['IFCMAPCONVERSION', 'IFCPROJECTEDCRS', 'IFCSITE']) {
         const ids = byType.get(typeName);
         if (!ids?.length) continue;
 
         // Use mixed-case for the georef extractor's type lookup
-        const displayName = typeName === 'IFCMAPCONVERSION' ? 'IfcMapConversion' : 'IfcProjectedCRS';
+        const displayName = typeName === 'IFCMAPCONVERSION'
+            ? 'IfcMapConversion'
+            : typeName === 'IFCPROJECTEDCRS'
+                ? 'IfcProjectedCRS'
+                : 'IfcSite';
         typeMap.set(displayName, ids);
 
         for (const id of ids) {
@@ -581,6 +735,20 @@ export function extractGeoreferencingOnDemand(store: IfcDataStore): Georeference
             const entity = extractor.extractEntity(ref);
             if (entity) {
                 entityMap.set(id, entity);
+
+                // For IfcProjectedCRS, also resolve the MapUnit reference (attribute [6])
+                // so the georef extractor can determine the actual unit scale
+                if (typeName === 'IFCPROJECTEDCRS' && entity.attributes) {
+                    const mapUnitAttr = entity.attributes[6];
+                    const mapUnitRefId = typeof mapUnitAttr === 'number' ? mapUnitAttr : null;
+                    if (mapUnitRefId && !entityMap.has(mapUnitRefId)) {
+                        const unitRef = byId.get(mapUnitRefId);
+                        if (unitRef) {
+                            const unitEntity = extractor.extractEntity(unitRef);
+                            if (unitEntity) entityMap.set(mapUnitRefId, unitEntity);
+                        }
+                    }
+                }
             }
         }
     }
@@ -589,4 +757,163 @@ export function extractGeoreferencingOnDemand(store: IfcDataStore): Georeference
 
     // Cast to IfcEntity (they share the same shape)
     return extractGeorefFromEntities(entityMap as Parameters<typeof extractGeorefFromEntities>[0], typeMap);
+}
+
+// ============================================================================
+// Material Property Set Extraction (issue #978)
+//
+// Material psets are attached to an IfcMaterial via IfcMaterialProperties
+// (the material's `Material` attribute points back to the material), NOT via
+// IfcRelDefinesByProperties — so they never appear in `onDemandPropertyMap`.
+// We build a reverse index (materialId -> material psets) by scanning every
+// *MaterialProperties entity once, then resolve it for the selected element's
+// underlying materials.
+// ============================================================================
+
+interface MaterialPsetEntry { name: string; properties: MaterialPsetGroup['psets'][number]['properties'] }
+
+const materialPropertyIndexCache = new WeakMap<IfcDataStore, Map<number, MaterialPsetEntry[]>>();
+
+/** Resolve an entity ref from the primary index, falling back to deferred atoms. */
+function refFromStore(store: IfcDataStore, id: number) {
+    return store.entityIndex.byId.get(id) ?? store.deferredEntityIndex?.get(id);
+}
+
+/**
+ * Resolve the (materialId, propsList, psetName) triple for a *MaterialProperties
+ * entity, dispatching on its concrete class rather than guessing attribute
+ * positions. The two generic forms that carry an IfcProperty list are handled:
+ *   - IfcMaterialProperties      (IFC4+):  [Name, Description, Properties, Material]
+ *   - IfcExtendedMaterialProperties (IFC2x3): [Material, ExtendedProperties, Description, Name]
+ * The typed IFC2x3 subtypes (IfcMechanicalMaterialProperties, IfcThermalMaterialProperties,
+ * …) expose domain-specific scalar fields instead of a generic property list and
+ * are not surfaced (returns null) — they are not the Pset_Material* this targets.
+ */
+function readMaterialPropsEntity(
+    typeKey: string,
+    attrs: readonly unknown[],
+    entityType: string,
+): { materialId: number; propsList: unknown[]; psetName: string } | null {
+    let materialId: unknown;
+    let propsList: unknown;
+    let name: unknown;
+
+    if (typeKey === 'IFCMATERIALPROPERTIES') {
+        name = attrs[0]; propsList = attrs[2]; materialId = attrs[3];
+    } else if (typeKey === 'IFCEXTENDEDMATERIALPROPERTIES') {
+        materialId = attrs[0]; propsList = attrs[1]; name = attrs[3];
+    } else {
+        return null; // typed IFC2x3 scalar subtype — no generic property list
+    }
+
+    if (typeof materialId !== 'number' || !Array.isArray(propsList)) return null;
+    const psetName = typeof name === 'string' && name ? name : (entityType || 'Material Properties');
+    return { materialId, propsList, psetName };
+}
+
+/**
+ * Build (and memoise) the model-wide map of materialId -> property sets defined
+ * via IfcMaterialProperties / IfcExtendedMaterialProperties. These reference the
+ * material directly (not through IfcRelDefinesByProperties), so they are found by
+ * scanning every *MaterialProperties entity once.
+ */
+function getMaterialPropertyIndex(store: IfcDataStore): Map<number, MaterialPsetEntry[]> {
+    const cached = materialPropertyIndexCache.get(store);
+    if (cached) return cached;
+
+    const index = new Map<number, MaterialPsetEntry[]>();
+    if (!store.source?.length || !store.entityIndex?.byType) {
+        materialPropertyIndexCache.set(store, index);
+        return index;
+    }
+
+    const extractor = new EntityExtractor(store.source);
+
+    for (const [typeKey, ids] of store.entityIndex.byType) {
+        if (!typeKey.endsWith('MATERIALPROPERTIES')) continue;
+        for (const matPropsId of ids) {
+            const ref = refFromStore(store, matPropsId);
+            if (!ref) continue;
+            const entity = extractor.extractEntity(ref);
+            const attrs = entity?.attributes;
+            if (!attrs) continue;
+
+            const parsed = readMaterialPropsEntity(typeKey, attrs, entity!.type);
+            if (!parsed) continue;
+
+            const properties: MaterialPsetEntry['properties'] = [];
+            for (const propRef of parsed.propsList) {
+                if (typeof propRef !== 'number') continue;
+                const propEntityRef = refFromStore(store, propRef);
+                if (!propEntityRef) continue;
+                const propEntity = extractor.extractEntity(propEntityRef);
+                if (!propEntity) continue;
+                const propAttrs = propEntity.attributes || [];
+                const propName = typeof propAttrs[0] === 'string' ? propAttrs[0] : '';
+                if (!propName) continue;
+                const pv = parsePropertyValue(propEntity);
+                const entry: MaterialPsetEntry['properties'][number] = {
+                    name: propName,
+                    type: pv.type,
+                    value: pv.value,
+                };
+                if (pv.values) entry.values = pv.values;
+                if (pv.dataType) entry.dataType = pv.dataType;
+                properties.push(entry);
+            }
+            if (properties.length === 0) continue;
+
+            let list = index.get(parsed.materialId);
+            if (!list) { list = []; index.set(parsed.materialId, list); }
+            list.push({ name: parsed.psetName, properties });
+        }
+    }
+
+    materialPropertyIndexCache.set(store, index);
+    return index;
+}
+
+/** Build pset groups for a set of candidate material ids using the reverse index. */
+function buildMaterialPsetGroups(store: IfcDataStore, materialIds: number[]): MaterialPsetGroup[] {
+    const index = getMaterialPropertyIndex(store);
+    if (index.size === 0) return [];
+
+    const groups: MaterialPsetGroup[] = [];
+    const seen = new Set<number>();
+    for (const matId of materialIds) {
+        if (seen.has(matId)) continue;
+        seen.add(matId);
+        const entries = index.get(matId);
+        if (!entries || entries.length === 0) continue;
+        const { name } = getMaterialDisplayImpl(store, matId);
+        groups.push({
+            materialId: matId,
+            materialName: name,
+            psets: entries.map((e) => ({ name: e.name, properties: e.properties })),
+        });
+    }
+    return groups;
+}
+
+/**
+ * Material property sets associated with a selected element, resolved through
+ * its material association. Fans out a layer/profile/constituent set to its
+ * member IfcMaterials (where Pset_Material* typically lives) and also checks
+ * the set definition itself. Returns one group per material that has psets.
+ */
+export function extractMaterialPropertiesOnDemand(store: IfcDataStore, entityId: number): MaterialPsetGroup[] {
+    const defId = resolveMaterialDefIdImpl(store, entityId);
+    if (defId === undefined) return [];
+    const leafIds = collectMaterialLeavesImpl(store, defId).map((l) => l.id);
+    return buildMaterialPsetGroups(store, [defId, ...leafIds]);
+}
+
+/**
+ * Material property sets for a directly-selected material entity (the Materials
+ * hierarchy tab). Includes the material's own psets plus, when it is a set
+ * definition, those of its member materials.
+ */
+export function extractMaterialPropertiesForMaterialId(store: IfcDataStore, materialId: number): MaterialPsetGroup[] {
+    const leafIds = collectMaterialLeavesImpl(store, materialId).map((l) => l.id);
+    return buildMaterialPsetGroups(store, [materialId, ...leafIds]);
 }

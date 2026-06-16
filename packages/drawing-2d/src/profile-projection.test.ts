@@ -4,9 +4,9 @@
 
 import { describe, expect, it } from 'vitest';
 import type { MeshData } from '@ifc-lite/geometry';
-import type { ProfileEntry, SectionConfig } from './types';
-import { Drawing2DGenerator } from './drawing-generator';
-import { projectProfiles } from './profile-projector';
+import type { ProfileEntry, SectionConfig } from './types.js';
+import { Drawing2DGenerator } from './drawing-generator.js';
+import { projectProfiles } from './profile-projector.js';
 
 function createTransform(tx = 0, ty = 0, tz = 0): Float32Array {
   return new Float32Array([
@@ -84,13 +84,16 @@ describe('profile projection integration', () => {
       extrusionDepth: 1,
     });
 
-    const lines = projectProfiles([profile], sectionConfig.plane, sectionConfig.projectionDepth);
+    const lines = projectProfiles([profile], sectionConfig.plane, {
+      below: sectionConfig.projectionDepth,
+      above: sectionConfig.projectionDepth,
+    });
 
     expect(lines.length).toBeGreaterThan(0);
     expect(lines.every((line) => line.entityId === profile.expressId)).toBe(true);
   });
 
-  it('retains crease-edge projection fallback for entities without extracted profiles', async () => {
+  it('retains silhouette projection fallback for entities without extracted profiles', async () => {
     const generator = new Drawing2DGenerator();
     const profile = createProfile({ expressId: 10 });
     const mesh = createBoxMesh(20, 1.2, 1.8);

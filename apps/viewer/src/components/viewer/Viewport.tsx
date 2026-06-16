@@ -7,9 +7,11 @@
  */
 
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react';
-import { Renderer, type VisualEnhancementOptions } from '@ifc-lite/renderer';
-import type { MeshData, CoordinateInfo } from '@ifc-lite/geometry';
+import { Renderer, type VisualEnhancementOptions, type LightingEnvironment } from '@ifc-lite/renderer';
+import type { MeshData, CoordinateInfo, PointCloudAsset } from '@ifc-lite/geometry';
 import { useViewerStore, resolveEntityRef, type MeasurePoint, type SnapVisualization } from '@/store';
+import { LIGHTING_PRESETS } from '@/lib/lighting-presets';
+import { sunLightingForAltitude } from '@/lib/geo/solar-direction';
 import {
   useSelectionState,
   useVisibilityState,
@@ -32,17 +34,32 @@ import {
 import { setGlobalCanvasRef, setGlobalRendererRef, clearGlobalRefs } from '../../hooks/useBCF.js';
 
 import { useMouseControls, type MouseState } from './useMouseControls.js';
+import { RectSelectionOverlay, type RectSelectionRect } from './RectSelectionOverlay.js';
 import { useTouchControls, type TouchState } from './useTouchControls.js';
 import { useKeyboardControls } from './useKeyboardControls.js';
 import { useAnimationLoop } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
+import { usePointCloudSync } from './usePointCloudSync.js';
+import { usePointCloudLifecycle } from './usePointCloudLifecycle.js';
 import { useRenderUpdates } from './useRenderUpdates.js';
+import {
+  useSymbolicAnnotations,
+  useSymbolicAnnotationsRichData,
+  type SectionClipForGrid,
+} from '../../hooks/useSymbolicAnnotations.js';
+import { useAlignmentLines3D } from '../../hooks/useAlignmentLines3D.js';
+import { useGridLines3D } from '../../hooks/useGridLines3D.js';
 
 interface ViewportProps {
   geometry: MeshData[] | null;
   /** Monotonic counter that increments when geometry changes — used to trigger
    *  streaming effects even when the geometry array reference is stable. */
   geometryVersion?: number;
+  /** Bumps when existing mesh vertex/normal data has been mutated in place
+   *  (e.g. realignFederation). Forces the streaming hook to re-upload buffers. */
+  geometryContentVersion?: number;
+  /** Point cloud assets aggregated across visible federated models. */
+  pointClouds?: ReadonlyArray<PointCloudAsset> | null;
   coordinateInfo?: CoordinateInfo;
   computedIsolatedIds?: Set<number> | null;
   modelIdToIndex?: Map<string, number>;
@@ -56,6 +73,8 @@ interface ViewportProps {
 export function Viewport({
   geometry,
   geometryVersion,
+  geometryContentVersion,
+  pointClouds,
   coordinateInfo,
   computedIsolatedIds,
   modelIdToIndex,
@@ -66,6 +85,7 @@ export function Viewport({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
 
   const focusViewportForKeyboardShortcuts = useCallback(() => {
     const canvas = canvasRef.current;
@@ -194,8 +214,17 @@ export function Viewport({
   const { hiddenEntities, isolatedEntities: storeIsolatedEntities } = useVisibilityState();
   const isolatedEntities = computedIsolatedIds ?? storeIsolatedEntities ?? null;
 
-  // Tool state
-  const { activeTool, sectionPlane } = useToolState();
+  // Tool state — `sectionPickMode` arms a face-pick on the next click for
+  // the section tool (issue #243); the action setters are forwarded into
+  // the mouse-controls context.
+  const {
+    activeTool,
+    sectionPlane,
+    sectionPickMode,
+    setSectionPlaneFromFace,
+    setSectionPickMode,
+    setSectionPickPreview,
+  } = useToolState();
 
   // Camera state
   const { updateCameraRotationRealtime, updateScaleRealtime, setCameraCallbacks } = useCameraState();
@@ -251,8 +280,12 @@ export function Viewport({
   const {
     pendingColorUpdates,
     pendingMeshColorUpdates,
+    pendingMeshRemovals,
+    pendingMeshTranslations,
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
+    clearPendingMeshRemovals,
+    clearPendingMeshTranslations,
   } = useColorUpdateState();
 
   // IFC data state
@@ -277,9 +310,9 @@ export function Viewport({
   // Tokyo Night storm: #1a1b26 = rgb(26, 27, 38)
   const clearColorRef = useRef<[number, number, number, number]>([0.102, 0.106, 0.149, 1]);
   const visualEnhancement = useMemo<VisualEnhancementOptions>(() => ({
-    enabled: visualEnhancementsEnabled,
+    enabled: isMobile ? false : visualEnhancementsEnabled,
     edgeContrast: {
-      enabled: edgeContrastEnabled,
+      enabled: isMobile ? false : edgeContrastEnabled,
       intensity: edgeContrastIntensity,
     },
     contactShading: {
@@ -288,7 +321,7 @@ export function Viewport({
       radius: contactShadingRadius,
     },
     separationLines: {
-      enabled: separationLinesEnabled,
+      enabled: isMobile ? false : separationLinesEnabled,
       quality: isMobile ? 'low' : separationLinesQuality,
       intensity: isMobile ? Math.min(0.4, separationLinesIntensity) : separationLinesIntensity,
       radius: isMobile ? 1.0 : separationLinesRadius,
@@ -317,6 +350,51 @@ export function Viewport({
     rendererRef.current?.requestRender();
   }, [cesiumActive, theme]);
 
+  // ── Lighting environment ───────────────────────────────────────────────
+  // Compose the renderer's lighting from the active preset (which brings
+  // its own sky — picking "Day" means day lighting AND a day sky), the
+  // user's exposure trim, and (when the solar study runs) the true sun
+  // position at the site. The sky pass must stay OFF while Cesium is
+  // active — the WebGPU canvas composites over Cesium with a transparent
+  // clear, and Cesium draws its own atmosphere.
+  const envPreset = useViewerStore((s) => s.envPreset);
+  const envExposure = useViewerStore((s) => s.envExposure);
+  const solarEnabledForEnv = useViewerStore((s) => s.solarEnabled);
+  const solarSunDirection = useViewerStore((s) => s.solarSunDirection);
+  const solarSunAltitude = useViewerStore((s) => s.solarSunInfo?.altitude);
+
+  const environment = useMemo<LightingEnvironment>(() => {
+    const preset = LIGHTING_PRESETS[envPreset].environment;
+    const env: LightingEnvironment = {
+      ...preset,
+      skyEnabled: (preset.skyEnabled ?? false) && !cesiumActive,
+      exposure: (preset.exposure ?? 0.85) * envExposure,
+    };
+    if (solarEnabledForEnv && solarSunDirection) {
+      const altitude = solarSunAltitude
+        ?? Math.asin(Math.max(-1, Math.min(1, solarSunDirection[1]))) * (180 / Math.PI);
+      const sun = sunLightingForAltitude(altitude);
+      env.sunDirection = solarSunDirection;
+      env.sunColor = sun.color;
+      env.sunIntensity = (preset.sunIntensity ?? 0.55) * sun.intensityFactor;
+      env.ambientIntensity = (preset.ambientIntensity ?? 0.25) * sun.ambientFactor;
+      // Let the sky derive its palette from the real sun altitude.
+      delete env.sky;
+    }
+    return env;
+  }, [
+    envPreset,
+    envExposure,
+    cesiumActive,
+    solarEnabledForEnv,
+    solarSunDirection,
+    solarSunAltitude,
+  ]);
+  const environmentRef = useLatestRef(environment);
+  useEffect(() => {
+    rendererRef.current?.requestRender();
+  }, [environment]);
+
   // Animation frame ref
   const animationFrameRef = useRef<number | null>(null);
   const lastFrameTimeRef = useRef<number>(0);
@@ -344,6 +422,10 @@ export function Viewport({
     didMove: false,
     // Track if multi-touch occurred (prevents false tap-select after pinch/zoom)
     multiTouch: false,
+    // 2-finger gesture detection
+    twoFingerGesture: 'none',
+    gestureDistanceAccum: 0,
+    gesturePanAccum: 0,
   });
 
   // Double-click detection
@@ -381,7 +463,12 @@ export function Viewport({
   const measurementConstraintEdgeRef = useLatestRef(measurementConstraintEdge);
   const sectionPlaneRef = useLatestRef(sectionPlane);
   const sectionRangeRef = useLatestRef(sectionRange);
+  const sectionPickModeRef = useLatestRef(sectionPickMode);
   const visualEnhancementRef = useLatestRef(visualEnhancement);
+  // Renderer model bounds, kept fresh per-render. The face-pick handler
+  // forwards these to the slice so the cardinal-fallback `position` % is
+  // computed against the actual model extents at click time.
+  const modelBoundsRef = useRef<{ min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null>(null);
 
   // Terrain clip Y from Cesium store (read as ref for animation loop)
   const cesiumTerrainClipY = useViewerStore((s) => s.cesiumTerrainClipY);
@@ -455,13 +542,32 @@ export function Viewport({
       }
     }
 
-    // Set cursor based on active tool
-    if (activeTool === 'measure') {
+    // Leaving the section tool disarms face-pick so it doesn't ambush the
+    // user on re-entry to a different tool (issue #243).
+    if (activeTool !== 'section' && sectionPickMode) {
+      setSectionPickMode(false);
+    }
+
+    // Set cursor based on active tool. Section + pick-armed gets a
+    // crosshair to telegraph "click a face".
+    if (activeTool === 'measure' || activeTool === 'annotate' || activeTool === 'addElement') {
+      canvas.style.cursor = 'crosshair';
+    } else if (activeTool === 'section' && sectionPickMode) {
       canvas.style.cursor = 'crosshair';
     } else {
       canvas.style.cursor = 'default';
     }
-  }, [activeTool, activeMeasurement, cancelMeasurement]);
+
+    // Clear add-element pending state + hover point when leaving the
+    // tool so the SVG overlay doesn't paint stale geometry from a
+    // previous session.
+    if (activeTool !== 'addElement') {
+      const state = useViewerStore.getState();
+      if (state.addElementPendingPoints.length > 0 || state.addElementHoverPoint !== null) {
+        state.clearAddElementPending();
+      }
+    }
+  }, [activeTool, activeMeasurement, cancelMeasurement, sectionPickMode, setSectionPickMode]);
 
   // Helper: calculate scale bar value (world-space size for 96px scale bar)
   const calculateScale = () => {
@@ -511,6 +617,7 @@ export function Viewport({
     if (!canvas) return;
 
     setIsInitialized(false);
+    setInitError(null);
 
     let aborted = false;
     let resizeObserver: ResizeObserver | null = null;
@@ -522,9 +629,17 @@ export function Viewport({
       return Math.max(64, Math.floor(size / 64) * 64);
     };
 
+    // Cap at the conservative WebGPU floor; the renderer re-clamps using the actual
+    // adapter limit once the device is initialized. Without this, tall iframe layouts
+    // can ask for canvas dimensions that exceed 8192 and every texture creation fails.
+    const MAX_CANVAS_DIM = 8192;
+
+    // Use CSS pixel dimensions for canvas. The Renderer.render() method manages
+    // its own dimension alignment via getBoundingClientRect() — do NOT apply DPR
+    // here as it creates a mismatch that causes constant context reconfiguration.
     const rect = canvas.getBoundingClientRect();
-    const width = alignToWebGPU(Math.max(1, Math.floor(rect.width)));
-    const height = Math.max(1, Math.floor(rect.height));
+    const width = Math.min(MAX_CANVAS_DIM, alignToWebGPU(Math.max(1, Math.floor(rect.width))));
+    const height = Math.min(MAX_CANVAS_DIM, Math.max(1, Math.floor(rect.height)));
     canvas.width = width;
     canvas.height = height;
 
@@ -537,7 +652,6 @@ export function Viewport({
 
     renderer.init().then(() => {
       if (aborted) return;
-
       setIsInitialized(true);
 
       const camera = renderer.getCamera();
@@ -561,8 +675,19 @@ export function Viewport({
           calculateScale();
         },
         home: () => {
-          // Reset to isometric view
-          camera.zoomToFit(geometryBoundsRef.current.min, geometryBoundsRef.current.max, 500);
+          // Adaptive home: compact buildings get the historical SE isometric
+          // pose (1:1 with the old behaviour), linear infrastructure gets a
+          // side-on view at a distance where signals / referents are visible
+          // instead of receding to sub-pixel. The policy is computed from
+          // the current bbox shape so a federation that swaps from one
+          // building to a railway picks the right pose on Home press.
+          // See packages/renderer/src/camera-fit-policy.ts.
+          const canvas = rendererRef.current?.getCanvas();
+          const canvasShort = Math.min(canvas?.height ?? 0, canvas?.width ?? 0);
+          camera.fitBoundsAdaptive(
+            { min: geometryBoundsRef.current.min, max: geometryBoundsRef.current.max },
+            { animate: true, duration: 500, viewportShortPx: canvasShort > 0 ? canvasShort : undefined },
+          );
           calculateScale();
         },
         zoomIn: () => {
@@ -576,19 +701,43 @@ export function Viewport({
           calculateScale();
         },
         frameSelection: () => {
-          // Frame selection - zoom to fit selected element
-          const selectedId = selectedEntityIdRef.current;
+          // Frame the current selection. Prefer the full multi-selection set
+          // (Ctrl-click, box-select, a clash pair) so the camera encloses EVERY
+          // selected element; fall back to the single primary id. The set is
+          // kept in sync with selection (cleared on a plain click), so the
+          // union is always an accurate frame of what's highlighted.
           const geom = geometryRef.current;
-          if (selectedId !== null && geom) {
-            const bounds = getEntityBounds(geom, selectedId);
-            if (bounds) {
-              camera.frameBounds(bounds.min, bounds.max, 300);
-              calculateScale();
-            } else {
-              console.warn('[Viewport] frameSelection: Could not get bounds for selected element');
-            }
-          } else {
+          const set = selectedEntityIdsRef.current;
+          const single = selectedEntityIdRef.current;
+          const ids = set && set.size > 0
+            ? Array.from(set)
+            : single !== null ? [single] : [];
+          if (!geom || ids.length === 0) {
             console.warn('[Viewport] frameSelection: No selection or geometry');
+            return;
+          }
+          let min: { x: number; y: number; z: number } | null = null;
+          let max: { x: number; y: number; z: number } | null = null;
+          for (const id of ids) {
+            const b = getEntityBounds(geom, id);
+            if (!b) continue;
+            if (!min || !max) {
+              min = { x: b.min.x, y: b.min.y, z: b.min.z };
+              max = { x: b.max.x, y: b.max.y, z: b.max.z };
+            } else {
+              min.x = Math.min(min.x, b.min.x);
+              min.y = Math.min(min.y, b.min.y);
+              min.z = Math.min(min.z, b.min.z);
+              max.x = Math.max(max.x, b.max.x);
+              max.y = Math.max(max.y, b.max.y);
+              max.z = Math.max(max.z, b.max.z);
+            }
+          }
+          if (min && max) {
+            camera.frameBounds(min, max, 300);
+            calculateScale();
+          } else {
+            console.warn('[Viewport] frameSelection: Could not get bounds for selected element');
           }
         },
         orbit: (deltaX: number, deltaY: number) => {
@@ -603,6 +752,33 @@ export function Viewport({
           const c = canvasRef.current;
           if (!c) return null;
           return camera.projectToScreen(worldPos, c.width, c.height);
+        },
+        unprojectToFloor: (clientX, clientY, worldY) => {
+          // Inverse of projectToScreen, but only against a horizontal
+          // plane at the given world Y. `unprojectToRay` expects
+          // drawing-buffer coords (c.width / c.height) — same space
+          // `projectToScreen` uses above — so we scale the CSS-space
+          // cursor delta by DPR before handing it over. This matches
+          // what raycastStoreyFloor does for the mouse handlers
+          // (after #723 — see the matching fix there).
+          const c = canvasRef.current;
+          if (!c) return null;
+          const rect = c.getBoundingClientRect();
+          const cssX = clientX - rect.left;
+          const cssY = clientY - rect.top;
+          const x = (cssX / rect.width) * c.width;
+          const y = (cssY / rect.height) * c.height;
+          const ray = camera.unprojectToRay(x, y, c.width, c.height);
+          if (!ray) return null;
+          const dy = ray.direction.y;
+          if (Math.abs(dy) < 1e-6) return null;
+          const t = (worldY - ray.origin.y) / dy;
+          if (!Number.isFinite(t) || t <= 0) return null;
+          return {
+            x: ray.origin.x + ray.direction.x * t,
+            y: worldY,
+            z: ray.origin.z + ray.direction.z * t,
+          };
         },
         setProjectionMode: (mode) => {
           camera.setProjectionMode(mode);
@@ -649,13 +825,12 @@ export function Viewport({
         },
       });
 
-      // ResizeObserver
+      // ResizeObserver — let renderer handle its own dimension alignment
       resizeObserver = new ResizeObserver(() => {
         if (aborted) return;
         const rect = canvas.getBoundingClientRect();
-        // Use same WebGPU alignment as initialization
-        const w = alignToWebGPU(Math.max(1, Math.floor(rect.width)));
-        const h = Math.max(1, Math.floor(rect.height));
+        const w = Math.min(MAX_CANVAS_DIM, alignToWebGPU(Math.max(1, Math.floor(rect.width))));
+        const h = Math.min(MAX_CANVAS_DIM, Math.max(1, Math.floor(rect.height)));
         renderer.resize(w, h);
         renderCurrent();
       });
@@ -663,6 +838,11 @@ export function Viewport({
 
       // Initial render
       renderCurrent();
+    }).catch((err) => {
+      if (aborted) return;
+      const message = err instanceof Error ? err.message : 'Failed to initialize 3D renderer';
+      console.error('[Viewport] Renderer init failed:', message);
+      setInitError(message);
     });
 
     return () => {
@@ -675,6 +855,9 @@ export function Viewport({
       }
       setIsInitialized(false);
       rendererRef.current = null;
+      // Free all WebGPU resources held by this renderer instance.
+      // destroy() is idempotent, so this is safe even if init() rejected.
+      renderer.destroy();
       // Clear BCF global refs to prevent memory leaks
       clearGlobalRefs();
     };
@@ -687,6 +870,135 @@ export function Viewport({
   const drawing2D = useViewerStore((s) => s.drawing2D);
   const show3DOverlay = useViewerStore((s) => s.drawing2DDisplayOptions.show3DOverlay);
   const showHiddenLines = useViewerStore((s) => s.drawing2DDisplayOptions.showHiddenLines);
+
+  // ===== IfcAnnotation symbolic overlay =====
+  // Renders IfcAnnotation 2D drawing curves as a standalone 3D line overlay
+  // that's visible regardless of whether a section cut is active. Each
+  // segment is lifted to its containing storey's elevation, so a multi-
+  // storey model shows all storeys' annotations layered correctly in 3D
+  // (issue #653). Parsing is lazy and only runs while the toggle is on.
+  const ifcAnnotationsVisible = useViewerStore((s) => s.typeVisibility.ifcAnnotations);
+  // Issue #862: IfcGrid is a separate toggle from IfcAnnotation. Default
+  // is on so existing users see no change; when the user disables it the
+  // grid axes + bubble tags drop out without affecting dimension/leader
+  // annotation rendering.
+  const ifcGridVisible = useViewerStore((s) => s.typeVisibility.ifcGrid);
+  // For annotations whose storey can't be resolved (or whose authored
+  // elevation is 0 because the storey Z lives on the placement instead),
+  // lift to the middle of the model's vertical span so they don't end up
+  // buried inside ground-floor geometry.
+  const annotationFallbackY = useMemo(() => {
+    const bounds = coordinateInfo?.shiftedBounds;
+    if (!bounds) return 0;
+    const min = bounds.min.y;
+    const max = bounds.max.y;
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return 0;
+    return (min + max) * 0.5;
+  }, [coordinateInfo]);
+
+  // Issue #862: section-clip grid lines so dense-grid models stay
+  // readable when a horizontal cut is active. Use a 1.5 m band on each
+  // side of the cut so the cut storey's grids are visible but storeys
+  // 1.5 m+ away are hidden (matches typical residential floor heights).
+  // Only applies to the floor-plan axis (`'down'`) — vertical cuts
+  // don't clip grids since grid lines are inherently vertical.
+  const gridSectionClip = useMemo<SectionClipForGrid | undefined>(() => {
+    if (!sectionPlane.enabled || sectionPlane.axis !== 'down' || !sectionRange) {
+      return undefined;
+    }
+    const posWorld = sectionRange.min + (sectionPlane.position / 100) * (sectionRange.max - sectionRange.min);
+    const GRID_CLIP_HALF_BAND_M = 1.5;
+    return {
+      enabled: true,
+      posWorld,
+      viewDepth: GRID_CLIP_HALF_BAND_M,
+      axis: sectionPlane.axis,
+    };
+  }, [sectionPlane.enabled, sectionPlane.axis, sectionPlane.position, sectionRange]);
+
+  const annotationVertices3D = useSymbolicAnnotations({
+    enabled: ifcAnnotationsVisible,
+    gridEnabled: ifcGridVisible,
+    gridSectionClip,
+    fallbackY: annotationFallbackY,
+  });
+  const { texts: annotationTexts3D, fills: annotationFills3D } = useSymbolicAnnotationsRichData({
+    enabled: ifcAnnotationsVisible,
+    gridEnabled: ifcGridVisible,
+    gridSectionClip,
+    fallbackY: annotationFallbackY,
+  });
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    if (annotationVertices3D.length === 0) {
+      renderer.clearAnnotationLines3D();
+    } else {
+      renderer.uploadAnnotationLines3D(annotationVertices3D);
+    }
+  }, [annotationVertices3D, isInitialized]);
+
+  // IfcAlignment centerlines render as thin lines (not a ribbon mesh), always
+  // on — see useAlignmentLines3D. Upload/clear mirrors the annotation overlay;
+  // a separate renderer buffer keeps alignment visibility independent.
+  const alignmentVertices3D = useAlignmentLines3D();
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    if (alignmentVertices3D.length === 0) {
+      renderer.clearAlignmentLines3D();
+    } else {
+      renderer.uploadAlignmentLines3D(alignmentVertices3D);
+    }
+  }, [alignmentVertices3D, isInitialized]);
+
+  // Structural-grid (IfcGridAxis) lines, gated by the `ifcGrid` type-visibility
+  // toggle (issue #967). Parsed once per source + cached; only the upload/clear
+  // is toggled so flipping visibility doesn't re-parse.
+  const gridVertices3D = useGridLines3D();
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    if (!ifcGridVisible || gridVertices3D.length === 0) {
+      renderer.clearGridLines3D();
+    } else {
+      renderer.uploadGridLines3D(gridVertices3D);
+    }
+  }, [gridVertices3D, ifcGridVisible, isInitialized]);
+
+  // Upload IfcAnnotation text + fill data for the WebGPU symbolic overlay
+  // pipelines. Map the hook's per-annotation records into the SymbolicFillInput
+  // / SymbolicTextInput shape the renderer expects. Empty arrays clear cleanly.
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    renderer.uploadAnnotationFills3D(
+      annotationFills3D.map((f) => ({
+        points: f.points,
+        holesOffsets: f.holesOffsets,
+        worldY: f.worldY,
+        color: f.color,
+      })),
+    );
+  }, [annotationFills3D, isInitialized]);
+
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer || !isInitialized) return;
+    renderer.uploadAnnotationTexts3D(
+      annotationTexts3D.map((t) => ({
+        worldPos: t.worldPos,
+        dirX: t.dirX,
+        dirZ: t.dirZ,
+        height: t.height,
+        content: t.content,
+        alignment: t.alignment,
+        billboard: t.billboard,
+        color: t.color,
+        targetPx: t.targetPx,
+      })),
+    );
+  }, [annotationTexts3D, isInitialized]);
 
   // ===== Streaming progress =====
   const isStreaming = useViewerStore((state) => state.geometryStreamingActive);
@@ -702,6 +1014,10 @@ export function Viewport({
   // The animation loop reads this to skip post-processing during rapid camera movement.
   const isInteractingRef = useRef(false);
 
+  // Rectangle-select drag state — populated by useMouseControls during
+  // a Ctrl/⌘ + LMB drag, consumed by RectSelectionOverlay below.
+  const [rectSelection, setRectSelection] = useState<RectSelectionRect | null>(null);
+
   // ===== Extracted hooks =====
   useMouseControls({
     canvasRef,
@@ -713,6 +1029,8 @@ export function Viewport({
     snapEnabledRef,
     edgeLockStateRef,
     measurementConstraintEdgeRef,
+    sectionPickModeRef,
+    modelBoundsRef,
     hiddenEntitiesRef,
     isolatedEntitiesRef,
     selectedEntityIdRef,
@@ -736,6 +1054,7 @@ export function Viewport({
     handlePickForSelection: (pickResult) => handlePickForSelectionRef.current(pickResult),
     setHoverState,
     clearHover,
+    setRectSelection,
     openContextMenu,
     startMeasurement,
     updateMeasurement,
@@ -754,6 +1073,9 @@ export function Viewport({
     calculateScale,
     getPickOptions,
     hasPendingMeasurements,
+    setSectionPlaneFromFace,
+    setSectionPickMode,
+    setSectionPickPreview,
     HOVER_SNAP_THROTTLE_MS,
     SLOW_RAYCAST_THRESHOLD_MS,
     hoverThrottleMs,
@@ -818,7 +1140,9 @@ export function Viewport({
     clearColorRef,
     sectionPlaneRef,
     sectionRangeRef,
+    modelBoundsRef,
     visualEnhancementRef,
+    environmentRef,
     selectedEntityIdsRef,
     coordinateInfoRef,
     isInteractingRef,
@@ -834,16 +1158,34 @@ export function Viewport({
     isInitialized,
     geometry,
     geometryVersion,
+    geometryContentVersion,
     coordinateInfo,
     isStreaming,
+    modelCount: modelIdToIndex?.size ?? 0,
     geometryBoundsRef,
     pendingColorUpdates,
     pendingMeshColorUpdates,
+    pendingMeshRemovals,
+    pendingMeshTranslations,
     clearPendingColorUpdates,
     clearPendingMeshColorUpdates,
+    clearPendingMeshRemovals,
+    clearPendingMeshTranslations,
     clearColorRef,
     releaseGeometryAfterFinalize: releaseGeometryAfterStream,
     onGeometryReleased,
+  });
+
+  usePointCloudSync({
+    rendererRef,
+    isInitialized,
+    pointClouds,
+    hasMeshes: (geometry?.length ?? 0) > 0,
+  });
+
+  usePointCloudLifecycle({
+    rendererRef,
+    isInitialized,
   });
 
   useRenderUpdates({
@@ -891,13 +1233,34 @@ export function Viewport({
       : undefined;
 
   return (
-    <canvas
-      ref={canvasRef}
-      data-viewport="main"
-      tabIndex={-1}
-      className={`w-full h-full block ${cesiumActive ? 'relative z-[1]' : ''}`}
-      style={canvasStyle}
-      onPointerDown={focusViewportForKeyboardShortcuts}
-    />
+    <div className="relative w-full h-full">
+      <canvas
+        ref={canvasRef}
+        data-viewport="main"
+        tabIndex={-1}
+        className={`w-full h-full block ${cesiumActive ? 'relative z-[1]' : ''}`}
+        style={{ touchAction: 'none', ...canvasStyle }}
+        onPointerDown={focusViewportForKeyboardShortcuts}
+      />
+      {initError && (
+        <div className="absolute inset-0 flex items-center justify-center bg-background/90 z-50 p-4">
+          <div className="text-center max-w-sm space-y-3">
+            <div className="mx-auto w-12 h-12 rounded-full bg-destructive/10 flex items-center justify-center">
+              <svg className="h-6 w-6 text-destructive" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+              </svg>
+            </div>
+            <p className="font-semibold text-sm">3D Rendering Failed</p>
+            <p className="text-xs text-muted-foreground">{initError}</p>
+            <p className="text-xs text-muted-foreground">
+              Try using Chrome 113+, Edge 113+, or Safari 18+ with WebGPU support.
+            </p>
+          </div>
+        </div>
+      )}
+      {/* Rectangle-select drag visual. Pointer-events:none so the
+          canvas keeps receiving pointer events during the drag. */}
+      <RectSelectionOverlay rect={rectSelection} />
+    </div>
   );
 }

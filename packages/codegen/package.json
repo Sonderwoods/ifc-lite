@@ -1,8 +1,13 @@
 {
   "name": "@ifc-lite/codegen",
-  "version": "1.15.2",
+  "version": "1.15.3",
   "description": "TypeScript code generator from IFC EXPRESS schemas",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LTplus-AG/ifc-lite.git",
+    "directory": "packages/codegen"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -22,11 +27,11 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "commander": "^11.1.0"
+    "commander": "^15.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
-    "typescript": "^5.3.3",
-    "vitest": "^1.0.4"
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.0"
   }
 }

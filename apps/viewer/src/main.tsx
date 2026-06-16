@@ -6,23 +6,23 @@
  * Application entry point
  */
 
+// MUST be the first import: disables React 19.2's dev-mode component-render
+// Performance tracking before react-dom caches `supportsUserTiming`, so large-IFC
+// geometry/dataStore props don't blow its recursive prop-diff to a RangeError/OOM
+// (the load "stops halfway" stall). See disable-react-dev-perf-track.ts.
+import './disable-react-dev-perf-track';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { ClerkProvider } from '@clerk/clerk-react';
 import { App } from './App';
 import './index.css';
 import 'maplibre-gl/dist/maplibre-gl.css';
-
-const clerkPublishableKey = (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY as string | undefined)?.trim();
+// Wire the placement-edit helpers' parser-backed source reader. Pure
+// side-effect import; keeps `@ifc-lite/parser` out of placement-edit
+// itself so its overlay-path logic stays unit-testable.
+import './lib/placement-edit.boot';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    {clerkPublishableKey ? (
-      <ClerkProvider publishableKey={clerkPublishableKey}>
-        <App />
-      </ClerkProvider>
-    ) : (
-      <App />
-    )}
+    <App />
   </React.StrictMode>
 );

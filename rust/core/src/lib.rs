@@ -22,7 +22,7 @@
 //! use ifc_lite_core::{EntityScanner, parse_entity, IfcType};
 //!
 //! // Scan for entities
-//! let content = r#"#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);"#;
+//! let content = br#"#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);"#;
 //! let mut scanner = EntityScanner::new(content);
 //!
 //! while let Some((id, type_name, start, end)) = scanner.next_entity() {
@@ -30,7 +30,7 @@
 //! }
 //!
 //! // Parse individual entity
-//! let input = "#123=IFCWALL('guid',$,$,$,$,$,$,$);";
+//! let input = b"#123=IFCWALL('guid',$,$,$,$,$,$,$);";
 //! let (id, ifc_type, attrs) = parse_entity(input).unwrap();
 //! assert_eq!(ifc_type, IfcType::IfcWall);
 //! ```
@@ -61,10 +61,6 @@
 //! - **Tokenization**: ~1,259 MB/s throughput
 //! - **Entity scanning**: ~650 MB/s with SIMD acceleration
 //! - **Number parsing**: 10x faster than std using [lexical-core](https://docs.rs/lexical-core)
-//!
-//! ## Feature Flags
-//!
-//! - `serde`: Enable serialization support for parsed data
 
 pub mod decoder;
 pub mod error;
@@ -75,6 +71,7 @@ pub mod legacy_entities;
 pub mod model_bounds;
 pub mod parser;
 pub mod schema_gen;
+pub(crate) mod schema_helpers;
 pub mod streaming;
 pub mod units;
 
@@ -85,13 +82,17 @@ pub use fast_parse::{
     extract_face_indices_from_entity, extract_first_entity_ref, parse_coordinates_direct,
     parse_indices_direct, process_triangulated_faceset_direct, should_use_fast_path, FastMeshData,
 };
-pub use generated::{has_geometry_by_name, IfcType};
-pub use georef::{GeoRefExtractor, GeoReference, RtcOffset};
+pub use generated::IfcType;
+pub use georef::{GeoRefExtractor, GeoRefSource, GeoReference, RtcOffset};
 pub use legacy_entities::{
     get_legacy_entity_info, is_legacy_entity, map_legacy_to_base_type, LegacyEntityInfo,
 };
 pub use model_bounds::{scan_model_bounds, scan_placement_bounds, ModelBounds};
 pub use parser::{parse_entity, EntityScanner, Token};
 pub use schema_gen::{AttributeValue, DecodedEntity, GeometryCategory, IfcSchema, ProfileCategory};
+pub use schema_helpers::{has_geometry_by_name, is_simple_geometry_type};
 pub use streaming::{parse_stream, ParseEvent, StreamConfig};
-pub use units::{extract_length_unit_scale, get_si_prefix_multiplier};
+pub use units::{
+    extract_length_unit_scale, extract_plane_angle_to_radians, get_si_prefix_multiplier,
+    try_extract_length_unit_scale,
+};

@@ -7,7 +7,7 @@
 //! Lazily decode IFC entities from byte offsets without loading entire file into memory.
 
 use crate::error::{Error, Result};
-use crate::parser::parse_entity;
+use crate::parser::{parse_entity, EntityScanner};
 use crate::schema_gen::{AttributeValue, DecodedEntity};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
@@ -15,74 +15,33 @@ use std::sync::Arc;
 /// Pre-built entity index type
 pub type EntityIndex = FxHashMap<u32, (usize, usize)>;
 
-/// Build entity index from content - O(n) scan using SIMD-accelerated search
-/// Returns index mapping entity IDs to byte offsets
+/// Build an entity index from content.
+///
+/// This intentionally shares `EntityScanner`'s HEADER skipping and quoted-string
+/// semantics so scan iteration and decoder lookup cannot disagree on malformed
+/// headers or semicolons embedded inside STEP strings.
 #[inline]
-pub fn build_entity_index(content: &str) -> EntityIndex {
-    let bytes = content.as_bytes();
-    let len = bytes.len();
-
-    // Pre-allocate with estimated capacity (roughly 1 entity per 50 bytes)
-    let estimated_entities = len / 50;
+pub fn build_entity_index<T>(content: &T) -> EntityIndex
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    let content = content.as_ref();
+    let estimated_entities = content.len() / 50;
     let mut index = FxHashMap::with_capacity_and_hasher(estimated_entities, Default::default());
-
-    let mut pos = 0;
-
-    while pos < len {
-        // Find next '#' using SIMD-accelerated search
-        let remaining = &bytes[pos..];
-        let hash_offset = match memchr::memchr(b'#', remaining) {
-            Some(offset) => offset,
-            None => break,
-        };
-
-        let start = pos + hash_offset;
-        pos = start + 1;
-
-        // Parse entity ID (inline for speed)
-        let id_start = pos;
-        while pos < len && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        let id_end = pos;
-
-        // Skip whitespace before '=' (handles both `#45=` and `#45 = ` formats)
-        while pos < len && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-
-        if id_end > id_start && pos < len && bytes[pos] == b'=' {
-            // Fast integer parsing without allocation
-            let id = parse_u32_inline(bytes, id_start, id_end);
-
-            // Find end of entity (;) using SIMD
-            let entity_content = &bytes[pos..];
-            if let Some(semicolon_offset) = memchr::memchr(b';', entity_content) {
-                pos += semicolon_offset + 1; // Include semicolon
-                index.insert(id, (start, pos));
-            } else {
-                break; // No semicolon found, malformed
-            }
-        }
+    let mut scanner = EntityScanner::new(content);
+    while let Some((id, _type_name, start, end)) = scanner.next_entity() {
+        index.insert(id, (start, end));
     }
 
     index
 }
 
-/// Fast u32 parsing without string allocation
-#[inline]
-fn parse_u32_inline(bytes: &[u8], start: usize, end: usize) -> u32 {
-    let mut result: u32 = 0;
-    for &byte in &bytes[start..end] {
-        let digit = byte.wrapping_sub(b'0');
-        result = result.wrapping_mul(10).wrapping_add(digit as u32);
-    }
-    result
-}
-
-/// Entity decoder for lazy parsing - uses Arc for efficient cache sharing
+/// Entity decoder for lazy parsing from raw IFC bytes.
+///
+/// String attributes are decoded lossily when tokens become `AttributeValue`s;
+/// structural scanning and byte offsets always use the original source bytes.
 pub struct EntityDecoder<'a> {
-    content: &'a str,
+    content: &'a [u8],
     /// Cache of decoded entities (entity_id -> `Arc<DecodedEntity>`)
     /// Using Arc avoids expensive clones on cache hits
     cache: FxHashMap<u32, Arc<DecodedEntity>>,
@@ -93,36 +52,64 @@ pub struct EntityDecoder<'a> {
     /// Cache of cartesian point coordinates for FacetedBrep optimization
     /// Only populated when using get_polyloop_coords_cached
     point_cache: FxHashMap<u32, (f64, f64, f64)>,
+    /// Lazy-cached multiplier converting file plane-angle units to radians.
+    /// Populated on first call to [`Self::plane_angle_to_radians`]. Spec
+    /// default (and Renga-style files) is 1.0 (RADIAN); degree-unit files
+    /// resolve to π/180.
+    plane_angle_to_radians_cache: Option<f64>,
+    /// Lazy-cached multiplier converting file length units to metres.
+    /// Populated on first call to [`Self::length_unit_scale`]. 1.0 for metre
+    /// files, 0.001 for millimetre files, etc. Used to express absolute
+    /// tolerances (e.g. curve-tessellation chord deviation) in file units.
+    length_unit_scale_cache: Option<f64>,
 }
 
 impl<'a> EntityDecoder<'a> {
     /// Create new decoder
-    pub fn new(content: &'a str) -> Self {
+    pub fn new<T>(content: &'a T) -> Self
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let content = content.as_ref();
         Self {
             content,
             cache: FxHashMap::default(),
             entity_index: None,
             point_cache: FxHashMap::default(),
+            plane_angle_to_radians_cache: None,
+            length_unit_scale_cache: None,
         }
     }
 
     /// Create decoder with pre-built index (faster for repeated lookups)
-    pub fn with_index(content: &'a str, index: EntityIndex) -> Self {
+    pub fn with_index<T>(content: &'a T, index: EntityIndex) -> Self
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let content = content.as_ref();
         Self {
             content,
             cache: FxHashMap::default(),
             entity_index: Some(Arc::new(index)),
             point_cache: FxHashMap::default(),
+            plane_angle_to_radians_cache: None,
+            length_unit_scale_cache: None,
         }
     }
 
     /// Create decoder with shared Arc index (for parallel processing)
-    pub fn with_arc_index(content: &'a str, index: Arc<EntityIndex>) -> Self {
+    pub fn with_arc_index<T>(content: &'a T, index: Arc<EntityIndex>) -> Self
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        let content = content.as_ref();
         Self {
             content,
             cache: FxHashMap::default(),
             entity_index: Some(index),
             point_cache: FxHashMap::default(),
+            plane_angle_to_radians_cache: None,
+            length_unit_scale_cache: None,
         }
     }
 
@@ -137,17 +124,35 @@ impl<'a> EntityDecoder<'a> {
 
     /// Decode entity at byte offset
     /// Returns cached entity if already decoded
+    ///
+    /// Validates the `(start, end)` span against `self.content.len()` before
+    /// slicing. Out-of-range or inverted spans return `Error::parse` instead
+    /// of panicking — callers (e.g. `decode_and_cache`, `decode_at_with_id`,
+    /// the streaming pre-pass shard mergers) hand us spans derived from
+    /// untrusted/streamed entity-index data, and a malformed span must not
+    /// take down the whole worker.
     #[inline]
     pub fn decode_at(&mut self, start: usize, end: usize) -> Result<DecodedEntity> {
+        let content_len = self.content.len();
+        if start > end || end > content_len {
+            return Err(Error::parse(
+                0,
+                format!(
+                    "decode_at: invalid byte span ({}, {}) for content length {}",
+                    start, end, content_len,
+                ),
+            ));
+        }
         let line = &self.content[start..end];
         let (id, ifc_type, tokens) = parse_entity(line).map_err(|e| {
-            // Add debug info about what failed to parse
+            // Add bounded, lossy debug info without requiring the source to be UTF-8.
+            let cut = line.len().min(100);
             Error::parse(
                 0,
                 format!(
                     "Failed to parse entity: {:?}, input: {:?}",
                     e,
-                    &line[..line.len().min(100)]
+                    String::from_utf8_lossy(&line[..cut])
                 ),
             )
         })?;
@@ -207,6 +212,85 @@ impl<'a> EntityDecoder<'a> {
         self.decode_at(start, end)
     }
 
+    /// Multiplier that converts file plane-angle units to radians.
+    ///
+    /// Lazy-resolved on first call by scanning for IFCPROJECT and reading
+    /// its IFCUNITASSIGNMENT. Cached for subsequent calls. Returns `1.0`
+    /// when no plane-angle unit is declared (IFC spec default = RADIAN).
+    ///
+    /// Use this at curve-sampling time wherever an `IfcParameterValue` is
+    /// interpreted as an angle (IfcCircle / IfcEllipse trim parameters).
+    /// Without it, `value.to_radians()` is correct only for DEGREE files
+    /// and silently shrinks arcs on RADIAN files (issue #820).
+    pub fn plane_angle_to_radians(&mut self) -> f64 {
+        if let Some(cached) = self.plane_angle_to_radians_cache {
+            return cached;
+        }
+
+        let mut scanner = crate::parser::EntityScanner::new(self.content);
+        let mut project_id: Option<u32> = None;
+        while let Some((id, type_name, _, _)) = scanner.next_entity() {
+            if type_name == "IFCPROJECT" {
+                project_id = Some(id);
+                break;
+            }
+        }
+
+        let scale = match project_id {
+            Some(pid) => crate::units::extract_plane_angle_to_radians(self, pid).unwrap_or(1.0),
+            None => 1.0,
+        };
+        self.plane_angle_to_radians_cache = Some(scale);
+        scale
+    }
+
+    /// Multiplier that converts file length units to metres (1.0 for metre
+    /// files, 0.001 for millimetre files, …). Lazy-resolved on first call by
+    /// scanning for IFCPROJECT and reading its IFCUNITASSIGNMENT, then cached.
+    /// Returns `1.0` when no length unit is declared.
+    ///
+    /// Use this to express an *absolute* metric tolerance in file units —
+    /// e.g. a curve-tessellation chord-deviation budget that stays constant in
+    /// millimetres whether the file is authored in mm or m.
+    pub fn length_unit_scale(&mut self) -> f64 {
+        if let Some(cached) = self.length_unit_scale_cache {
+            return cached;
+        }
+
+        let mut scanner = crate::parser::EntityScanner::new(self.content);
+        let mut project_id: Option<u32> = None;
+        while let Some((id, type_name, _, _)) = scanner.next_entity() {
+            if type_name == "IFCPROJECT" {
+                project_id = Some(id);
+                break;
+            }
+        }
+
+        let scale = match project_id {
+            Some(pid) => crate::units::try_extract_length_unit_scale(self, pid).unwrap_or(1.0),
+            None => 1.0,
+        };
+        self.length_unit_scale_cache = Some(scale);
+        scale
+    }
+
+    /// Pre-seed the unit-scale caches so [`Self::length_unit_scale`] and
+    /// [`Self::plane_angle_to_radians`] return immediately without the full-file
+    /// `IFCPROJECT` scan.
+    ///
+    /// Both lazy resolvers walk the whole DATA section to locate the (singleton)
+    /// `IFCPROJECT`. That scan is `O(file size)` and `IFCPROJECT` legally sits
+    /// anywhere — IfcOpenShell emits it near the *end*, so on a large model the
+    /// scan touches tens of MB. The cache is per-decoder, and the parallel
+    /// geometry pipeline builds a fresh decoder per element, so without seeding
+    /// every arc-bearing element re-pays the scan (≈135 ms each on a 75 MB
+    /// file). The orchestrator resolves both scales once on a warm shared
+    /// decoder and seeds each worker decoder here.
+    pub fn seed_unit_scales(&mut self, length_unit_scale: f64, plane_angle_to_radians: f64) {
+        self.length_unit_scale_cache = Some(length_unit_scale);
+        self.plane_angle_to_radians_cache = Some(plane_angle_to_radians);
+    }
+
     /// Resolve entity reference (follow #ID)
     /// Returns None for null/derived values
     #[inline]
@@ -246,6 +330,51 @@ impl<'a> EntityDecoder<'a> {
         self.cache.reserve(additional);
     }
 
+    /// Inject a pre-warmed Arc-shared cache into this decoder's local cache.
+    ///
+    /// Used by the de-normalized parallel path: a serial pre-pass builds a
+    /// shared `Arc<FxHashMap<u32, Arc<DecodedEntity>>>` containing all
+    /// entities reachable from the jobs. Each rayon task then injects
+    /// that shared cache into its own decoder via this method, so the
+    /// per-task hot path hits in-WASM-heap Arc handles instead of
+    /// SAB-imported atomic memory.
+    ///
+    /// Cost: one Arc::clone per cached entry (atomic refcount bump).
+    /// For a typical 100K-entry cache × 9 rayon tasks = 900K atomics
+    /// total, ~90 ms wall (incurred ONCE at task setup; the parallel
+    /// hot path then runs lock-free against the populated cache).
+    pub fn inject_shared_cache(&mut self, shared: &FxHashMap<u32, Arc<DecodedEntity>>) {
+        self.cache.reserve(shared.len());
+        for (&id, entity) in shared.iter() {
+            self.cache.insert(id, Arc::clone(entity));
+        }
+    }
+
+    /// Decode + cache without returning. Used by the pre-warm pass to
+    /// populate a shared cache. Returns the cached Arc so the caller
+    /// can chase references without re-decoding.
+    pub fn decode_and_cache(
+        &mut self,
+        id: u32,
+        start: usize,
+        end: usize,
+    ) -> Result<Arc<DecodedEntity>> {
+        if let Some(arc) = self.cache.get(&id) {
+            return Ok(Arc::clone(arc));
+        }
+        let _ = self.decode_at(start, end)?;
+        Ok(Arc::clone(self.cache.get(&id).ok_or_else(|| {
+            Error::parse(0, "decode_at didn't populate cache".to_string())
+        })?))
+    }
+
+    /// Drain the populated cache out of this decoder for sharing across
+    /// rayon tasks. After calling this, the decoder is empty (cache
+    /// moved out); callers typically then drop the decoder.
+    pub fn drain_cache(&mut self) -> FxHashMap<u32, Arc<DecodedEntity>> {
+        std::mem::take(&mut self.cache)
+    }
+
     /// Clear all caches to free memory
     pub fn clear_cache(&mut self) {
         self.cache.clear();
@@ -267,14 +396,6 @@ impl<'a> EntityDecoder<'a> {
     /// Returns the full entity line including type and attributes
     #[inline]
     pub fn get_raw_bytes(&mut self, entity_id: u32) -> Option<&'a [u8]> {
-        self.build_index();
-        let (start, end) = self.entity_index.as_ref()?.get(&entity_id).copied()?;
-        Some(&self.content.as_bytes()[start..end])
-    }
-
-    /// Get raw content string for an entity
-    #[inline]
-    pub fn get_raw_content(&mut self, entity_id: u32) -> Option<&'a str> {
         self.build_index();
         let (start, end) = self.entity_index.as_ref()?.get(&entity_id).copied()?;
         Some(&self.content[start..end])
@@ -612,7 +733,7 @@ impl<'a> EntityDecoder<'a> {
         // Ensure index is built once
         self.build_index();
         let index = self.entity_index.as_ref()?;
-        let bytes_full = self.content.as_bytes();
+        let bytes_full = self.content;
 
         // Get polyloop raw bytes
         let (start, end) = index.get(&entity_id).copied()?;
@@ -699,7 +820,7 @@ impl<'a> EntityDecoder<'a> {
         // Ensure index is built once
         self.build_index();
         let index = self.entity_index.as_ref()?;
-        let bytes_full = self.content.as_bytes();
+        let bytes_full = self.content;
 
         // Get polyloop raw bytes
         let (start, end) = index.get(&entity_id).copied()?;
@@ -845,7 +966,7 @@ fn parse_float_inline(bytes: &[u8], offset: &mut usize) -> Option<f64> {
     }
 
     // Parse float using fast_float
-    match fast_float::parse_partial::<f64, _>(&bytes[i..]) {
+    match fast_float2::parse_partial::<f64, _>(&bytes[i..]) {
         Ok((value, consumed)) if consumed > 0 => {
             *offset += i + consumed;
             Some(value)
@@ -872,7 +993,7 @@ fn parse_next_float(bytes: &[u8], offset: &mut usize) -> Option<f64> {
     }
 
     // Parse float using fast_float
-    match fast_float::parse_partial::<f64, _>(&bytes[i..]) {
+    match fast_float2::parse_partial::<f64, _>(&bytes[i..]) {
         Ok((value, consumed)) if consumed > 0 => {
             *offset += i + consumed;
             Some(value)
@@ -930,6 +1051,40 @@ mod tests {
         assert_eq!(decoder.cache_size(), 1);
         let cached = decoder.get_cached(5).unwrap();
         assert_eq!(cached.id, 5);
+    }
+
+    #[test]
+    fn test_build_entity_index_matches_scanner_header_semantics() {
+        let content = "ISO-10303-21;\nHEADER;\n\
+FILE_DESCRIPTION(('ViewDefinition [ReferenceView]'),'2;1');\n\
+FILE_NAME('26-IFC\\X2\\00B1\\X0\\2#.ifc','2026-04-29T18:21:27',$,$,'CATIA','CATIA',$);\n\
+FILE_SCHEMA(('IFC4'));\nENDSEC;\n\
+DATA;\n\
+#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\n\
+#2=IFCWALL('guid2',$,$,$,'Wall; with semicolon',$,$,$);\n\
+ENDSEC;\nEND-ISO-10303-21;\n";
+
+        let index = build_entity_index(content);
+
+        assert_eq!(index.len(), 2);
+        assert!(!index.contains_key(&26));
+        let (start, end) = index.get(&2).copied().unwrap();
+        assert_eq!(
+            &content[start..end],
+            "#2=IFCWALL('guid2',$,$,$,'Wall; with semicolon',$,$,$);"
+        );
+    }
+
+    #[test]
+    fn test_decode_by_id_handles_quoted_semicolon_from_shared_index() {
+        let content = "#1=IFCWALL('guid',$,$,$,'Wall; with semicolon',$,$,$);\n";
+        let mut decoder = EntityDecoder::new(content);
+
+        let wall = decoder.decode_by_id(1).unwrap();
+
+        assert_eq!(wall.id, 1);
+        assert_eq!(wall.ifc_type, IfcType::IfcWall);
+        assert_eq!(wall.get_string(4), Some("Wall; with semicolon"));
     }
 
     #[test]

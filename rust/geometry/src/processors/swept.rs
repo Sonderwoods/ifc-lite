@@ -4,10 +4,88 @@
 
 //! Swept geometry processors - SweptDiskSolid and RevolvedAreaSolid.
 
-use crate::{profiles::ProfileProcessor, Error, Mesh, Point3, Result, Vector3};
+use crate::{
+    extrusion::apply_transform, profiles::ProfileProcessor, scale_segments, Error, Mesh, Point3,
+    Result, TessellationQuality, Vector3,
+};
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcSchema, IfcType};
+use nalgebra::Matrix4;
 
+use super::helpers::parse_axis2_placement_3d;
+use super::tessellated::PolygonalFaceSetProcessor;
 use crate::router::GeometryProcessor;
+
+/// Build a rotation-minimising frame (RMF) for sweeping a circular cross-section
+/// along `curve_points`. Returns `(tangents, perp1s, perp2s)`, each of length
+/// `curve_points.len()`.
+///
+/// The previous implementation re-picked the cross-section's `up` vector at
+/// every sample based on `tangent.x.abs() < 0.9`. When two consecutive tangents
+/// straddled that threshold, `up` flipped, swapping the sign of `perp1` between
+/// rings — visible as a twisted / flat-ribbon tube at sharp bends.
+///
+/// RMF instead picks `up` ONCE for the first sample, then propagates the frame
+/// by rotating it from `tangents[i-1]` onto `tangents[i]` (the minimum rotation
+/// that aligns them). When consecutive tangents are parallel the frame stays
+/// untouched.
+fn build_tube_rmf(
+    curve_points: &[Point3<f64>],
+) -> (Vec<Vector3<f64>>, Vec<Vector3<f64>>, Vec<Vector3<f64>>) {
+    let n = curve_points.len();
+    let mut tangents = Vec::with_capacity(n);
+    let mut perp1s = Vec::with_capacity(n);
+    let mut perp2s = Vec::with_capacity(n);
+    if n < 2 {
+        return (tangents, perp1s, perp2s);
+    }
+
+    for i in 0..n {
+        let t = if i == 0 {
+            (curve_points[1] - curve_points[0]).normalize()
+        } else if i == n - 1 {
+            (curve_points[i] - curve_points[i - 1]).normalize()
+        } else {
+            ((curve_points[i + 1] - curve_points[i - 1]) / 2.0).normalize()
+        };
+        tangents.push(t);
+    }
+
+    let up0 = if tangents[0].x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let mut perp1 = tangents[0].cross(&up0).normalize();
+    let mut perp2 = tangents[0].cross(&perp1).normalize();
+    perp1s.push(perp1);
+    perp2s.push(perp2);
+
+    for i in 1..n {
+        let prev = tangents[i - 1];
+        let curr = tangents[i];
+        let cos_a = prev.dot(&curr).clamp(-1.0, 1.0);
+        let axis = prev.cross(&curr);
+        let axis_norm = axis.norm();
+        // Skip rotation when tangents are (nearly) parallel — frame is preserved.
+        // Anti-parallel (cos_a ≈ -1) leaves axis ill-defined, but a 180° turn
+        // between consecutive samples on a swept-disk directrix is physically
+        // implausible; we keep the previous frame and accept the degraded case.
+        if axis_norm > 1e-9 && cos_a < 1.0 - 1e-12 {
+            let axis = axis / axis_norm;
+            let sin_a = (1.0 - cos_a * cos_a).max(0.0).sqrt();
+            // Rodrigues' rotation of `perp1` around `axis` by angle = acos(cos_a)
+            perp1 = perp1 * cos_a
+                + axis.cross(&perp1) * sin_a
+                + axis * axis.dot(&perp1) * (1.0 - cos_a);
+            perp1 = perp1.normalize();
+            perp2 = curr.cross(&perp1).normalize();
+        }
+        perp1s.push(perp1);
+        perp2s.push(perp2);
+    }
+
+    (tangents, perp1s, perp2s)
+}
 
 /// SweptDiskSolid processor
 /// Handles IfcSweptDiskSolid - sweeps a circular profile along a curve
@@ -29,6 +107,7 @@ impl GeometryProcessor for SweptDiskSolidProcessor {
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
         _schema: &IfcSchema,
+        quality: TessellationQuality,
     ) -> Result<Mesh> {
         // IfcSweptDiskSolid attributes:
         // 0: Directrix (IfcCurve) - the path to sweep along
@@ -48,48 +127,71 @@ impl GeometryProcessor for SweptDiskSolidProcessor {
         // Get inner radius if hollow
         let _inner_radius = entity.get_float(2);
 
+        // StartParam / EndParam (optional IfcParameterValue). Per IFC spec, when the
+        // directrix is an IfcCompositeCurve the curve is parameterised so that segment
+        // index `i` covers parameter range [i, i+1]. Without honoring these, files that
+        // intend e.g. only the first segment to be swept render every segment — the
+        // common rebar case where a 2 m bar reads as 12 m with hooks unfolded.
+        let start_param = entity.get_float(3);
+        let end_param = entity.get_float(4);
+
         // Resolve the directrix curve
         let directrix = decoder
             .resolve_ref(directrix_attr)?
             .ok_or_else(|| Error::geometry("Failed to resolve Directrix".to_string()))?;
 
-        // Get points along the curve
-        let curve_points = self
-            .profile_processor
-            .get_curve_points(&directrix, decoder)?;
+        // Get points along the curve, honoring trim parameters where the directrix's
+        // parameterisation is well-defined and obvious from the entity:
+        //   - IfcCompositeCurve (and IfcCompositeCurveOnSurface): segment-index based,
+        //     each segment contributes 1.0 to the parameter.
+        //   - IfcPolyline: point-index based, each segment between consecutive points
+        //     contributes 1.0 to the parameter.
+        // Other directrix types (IfcLine, IfcCircle, IfcTrimmedCurve, IfcBSplineCurve)
+        // have length-, angle-, or knot-based parameterisations and fall back to the
+        // full sampler. Files using those with explicit StartParam/EndParam will still
+        // render the full curve — flagged as a known limitation.
+        // The lower-level trimmed samplers below don't take a `quality`
+        // argument; set it on the profile processor so any arcs they sample
+        // honour the requested detail level.
+        self.profile_processor.set_tessellation_quality(quality);
+        let has_trim = start_param.is_some() || end_param.is_some();
+        let curve_points = if has_trim
+            && directrix.ifc_type.is_subtype_of(IfcType::IfcCompositeCurve)
+        {
+            self.profile_processor
+                .get_composite_curve_points_trimmed(
+                    &directrix,
+                    decoder,
+                    start_param,
+                    end_param,
+                )?
+        } else if has_trim && directrix.ifc_type == IfcType::IfcPolyline {
+            self.profile_processor
+                .get_polyline_points_trimmed(&directrix, decoder, start_param, end_param)?
+        } else {
+            self.profile_processor
+                .get_curve_points(&directrix, decoder, quality)?
+        };
 
         if curve_points.len() < 2 {
             return Ok(Mesh::new()); // Not enough points
         }
 
         // Generate tube mesh by sweeping circle along curve
-        let segments = 24; // Number of segments around the circle
+        // 24 segments around the circle at Medium; scaled by quality.
+        let segments = scale_segments(24, 8, 96, quality);
         let mut positions = Vec::new();
         let mut indices = Vec::new();
+
+        // Build a rotation-minimising frame across all sample points up-front.
+        // (Per-iteration `up` selection caused frame flips at sharp bends.)
+        let (_, perp1s, perp2s) = build_tube_rmf(&curve_points);
 
         // For each point on the curve, create a ring of vertices
         for i in 0..curve_points.len() {
             let p = curve_points[i];
-
-            // Calculate tangent direction
-            let tangent = if i == 0 {
-                (curve_points[1] - curve_points[0]).normalize()
-            } else if i == curve_points.len() - 1 {
-                (curve_points[i] - curve_points[i - 1]).normalize()
-            } else {
-                ((curve_points[i + 1] - curve_points[i - 1]) / 2.0).normalize()
-            };
-
-            // Create perpendicular vectors using cross product
-            // First, find a vector not parallel to tangent
-            let up = if tangent.x.abs() < 0.9 {
-                Vector3::new(1.0, 0.0, 0.0)
-            } else {
-                Vector3::new(0.0, 1.0, 0.0)
-            };
-
-            let perp1 = tangent.cross(&up).normalize();
-            let perp2 = tangent.cross(&perp1).normalize();
+            let perp1 = perp1s[i];
+            let perp2 = perp2s[i];
 
             // Create ring of vertices
             for j in 0..segments {
@@ -156,8 +258,8 @@ impl GeometryProcessor for SweptDiskSolidProcessor {
             positions,
             normals: Vec::new(),
             indices,
-            rtc_applied: false,
-        })
+            rtc_applied: false, 
+            origin: [0.0; 3],        })
     }
 
     fn supported_types(&self) -> Vec<IfcType> {
@@ -191,43 +293,54 @@ impl GeometryProcessor for RevolvedAreaSolidProcessor {
         entity: &DecodedEntity,
         decoder: &mut EntityDecoder,
         _schema: &IfcSchema,
+        quality: TessellationQuality,
     ) -> Result<Mesh> {
-        // IfcRevolvedAreaSolid attributes:
-        // 0: SweptArea (IfcProfileDef) - the 2D profile to revolve
-        // 1: Position (IfcAxis2Placement3D) - placement of the solid
-        // 2: Axis (IfcAxis1Placement) - the axis of revolution
+        // IfcRevolvedAreaSolid attributes (inherits IfcSweptAreaSolid):
+        // 0: SweptArea (IfcProfileDef) - 2D profile in xy plane of Position
+        // 1: Position (IfcAxis2Placement3D) - solid's local coord system
+        // 2: Axis (IfcAxis1Placement) - revolution axis in xy plane of Position
         // 3: Angle (IfcPlaneAngleMeasure) - revolution angle in radians
 
         let profile_attr = entity
             .get(0)
             .ok_or_else(|| Error::geometry("RevolvedAreaSolid missing SweptArea".to_string()))?;
-
         let profile = decoder
             .resolve_ref(profile_attr)?
             .ok_or_else(|| Error::geometry("Failed to resolve SweptArea".to_string()))?;
 
-        // Get axis placement (attribute 2)
+        // Position transform: maps Position-local coords -> object coords.
+        // Optional in some files; default to identity.
+        let position_transform = if let Some(pos_attr) = entity.get(1) {
+            if !pos_attr.is_null() {
+                if let Some(pos_entity) = decoder.resolve_ref(pos_attr)? {
+                    parse_axis2_placement_3d(&pos_entity, decoder)?
+                } else {
+                    Matrix4::identity()
+                }
+            } else {
+                Matrix4::identity()
+            }
+        } else {
+            Matrix4::identity()
+        };
+
         let axis_attr = entity
             .get(2)
             .ok_or_else(|| Error::geometry("RevolvedAreaSolid missing Axis".to_string()))?;
-
         let axis_placement = decoder
             .resolve_ref(axis_attr)?
             .ok_or_else(|| Error::geometry("Failed to resolve Axis".to_string()))?;
 
-        // Get angle (attribute 3)
         let angle = entity
             .get_float(3)
             .ok_or_else(|| Error::geometry("RevolvedAreaSolid missing Angle".to_string()))?;
 
-        // Get the 2D profile points
-        let profile_2d = self.profile_processor.process(&profile, decoder)?;
+        let profile_2d = self.profile_processor.process(&profile, decoder, quality)?;
         if profile_2d.outer.is_empty() {
             return Ok(Mesh::new());
         }
 
-        // Parse axis placement to get axis point and direction
-        // IfcAxis1Placement: Location, Axis (optional)
+        // IfcAxis1Placement: 0=Location (IfcCartesianPoint), 1=Axis (IfcDirection, optional)
         let axis_location = {
             let loc_attr = axis_placement
                 .get(0)
@@ -255,138 +368,165 @@ impl GeometryProcessor for RevolvedAreaSolidProcessor {
                     let coords = dir.get(0).and_then(|v| v.as_list()).ok_or_else(|| {
                         Error::geometry("Axis direction missing coordinates".to_string())
                     })?;
-                    Vector3::new(
+                    let raw = Vector3::new(
                         coords.first().and_then(|v| v.as_float()).unwrap_or(0.0),
                         coords.get(1).and_then(|v| v.as_float()).unwrap_or(1.0),
                         coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0),
-                    )
-                    .normalize()
+                    );
+                    if raw.norm() < 1e-12 {
+                        Vector3::new(0.0, 1.0, 0.0)
+                    } else {
+                        raw.normalize()
+                    }
                 } else {
-                    Vector3::new(0.0, 1.0, 0.0) // Default Y axis
+                    Vector3::new(0.0, 1.0, 0.0)
                 }
             } else {
-                Vector3::new(0.0, 1.0, 0.0) // Default Y axis
+                Vector3::new(0.0, 1.0, 0.0)
             }
         };
 
-        // Generate revolved mesh
-        // Number of segments depends on angle
         let full_circle = angle.abs() >= std::f64::consts::PI * 1.99;
+        // 24 segments for a full revolve at Medium; ~12 per 180° (min 8) for a
+        // partial arc. Both scaled by quality; the high upper bound preserves
+        // the original uncapped partial-arc count at Medium.
         let segments = if full_circle {
-            24 // Full revolution
+            scale_segments(24, 8, 96, quality)
         } else {
-            ((angle.abs() / std::f64::consts::PI * 12.0).ceil() as usize).max(4)
+            let base = (angle.abs() / std::f64::consts::PI * 12.0).ceil() as usize;
+            scale_segments(base, 8, 4096, quality)
         };
 
         let profile_points = &profile_2d.outer;
         let num_profile_points = profile_points.len();
 
-        let mut positions = Vec::new();
+        let ring_count = if full_circle { segments } else { segments + 1 };
+        let mut positions = Vec::with_capacity(ring_count * num_profile_points * 3);
         let mut indices = Vec::new();
 
-        // For each segment around the revolution
-        for i in 0..=segments {
-            let t = if full_circle && i == segments {
-                0.0 // Close the loop exactly
+        // Rotate each profile vertex around the axis line in Position-local coords.
+        for i in 0..ring_count {
+            let t = if full_circle {
+                std::f64::consts::TAU * i as f64 / segments as f64
             } else {
                 angle * i as f64 / segments as f64
             };
 
-            // Rotation matrix around axis
             let cos_t = t.cos();
             let sin_t = t.sin();
-            let (ax, ay, az) = (axis_direction.x, axis_direction.y, axis_direction.z);
+            let k = axis_direction;
 
-            // Rodrigues' rotation formula components
-            let k_matrix = |v: Vector3<f64>| -> Vector3<f64> {
-                Vector3::new(
-                    ay * v.z - az * v.y,
-                    az * v.x - ax * v.z,
-                    ax * v.y - ay * v.x,
-                )
-            };
+            for p2d in profile_points {
+                // Lift profile vertex into Position-local 3D (xy plane, z=0)
+                let p_local = Point3::new(p2d.x, p2d.y, 0.0);
 
-            // For each point in the profile
-            for (j, p2d) in profile_points.iter().enumerate() {
-                // Profile point in 3D (assume profile is in XY plane, rotated around Y axis)
-                // The 2D profile X becomes distance from axis, Y becomes height along axis
-                let radius = p2d.x;
-                let height = p2d.y;
+                // Decompose v = (p_local - axis_location) into parallel + perpendicular
+                // to the axis, then rotate only the perpendicular component by t.
+                let v = p_local - axis_location;
+                let v_par_len = v.dot(&k);
+                let v_par = k * v_par_len;
+                let v_perp = v - v_par;
+                let v_perp_rot = v_perp * cos_t + k.cross(&v_perp) * sin_t;
 
-                // Initial position before rotation (in the plane containing the axis)
-                let v = Vector3::new(radius, 0.0, 0.0);
+                let pos_local = axis_location + v_par + v_perp_rot;
 
-                // Rodrigues' rotation: v_rot = v*cos(t) + (k x v)*sin(t) + k*(k.v)*(1-cos(t))
-                let k_cross_v = k_matrix(v);
-                let k_dot_v = ax * v.x + ay * v.y + az * v.z;
+                positions.push(pos_local.x as f32);
+                positions.push(pos_local.y as f32);
+                positions.push(pos_local.z as f32);
+            }
+        }
 
-                let v_rot =
-                    v * cos_t + k_cross_v * sin_t + axis_direction * k_dot_v * (1.0 - cos_t);
+        // Side quads. The last ring connects back to the first only when the
+        // sweep closes the loop (full revolution).
+        let segment_quads = segments;
+        for i in 0..segment_quads {
+            let ring_a = i;
+            let ring_b = (i + 1) % ring_count;
+            for j in 0..num_profile_points {
+                let j_next = (j + 1) % num_profile_points;
+                let a = (ring_a * num_profile_points + j) as u32;
+                let b = (ring_b * num_profile_points + j) as u32;
+                let c = (ring_b * num_profile_points + j_next) as u32;
+                let d = (ring_a * num_profile_points + j_next) as u32;
+                indices.push(a);
+                indices.push(b);
+                indices.push(c);
+                indices.push(a);
+                indices.push(c);
+                indices.push(d);
+            }
+        }
 
-                // Final position = axis_location + height along axis + rotated radius
-                let pos = axis_location + axis_direction * height + v_rot;
+        // End caps for a partial revolution.
+        //
+        // Originally a fan from the profile centroid to consecutive
+        // boundary points. That assumption only holds for CONVEX
+        // profiles — for a concave profile (I-beam, L-beam, hollow
+        // rectangle …) the centroid lies outside the polygon in some
+        // regions, the fan triangles cross each other, and the cap
+        // renders as a bow-tie/X artifact (issue #846 follow-up: PR
+        // #848 sweep landed correctly but the I-beam cross-section came
+        // out as a zigzag because of this fan path).
+        //
+        // Use earcut on the 2D profile boundary instead. The resulting
+        // triangle indices are in [0..num_profile_points) — they map
+        // 1:1 onto the ring vertices we already emitted, so the cap
+        // just reuses those positions (no new vertices except the side-
+        // wall winding requires flipping one of the two caps so its
+        // outward normal points away from the swept volume).
+        if !full_circle && num_profile_points >= 3 {
+            let profile_flat: Vec<f64> = profile_points
+                .iter()
+                .flat_map(|p| [p.x, p.y])
+                .collect();
+            let cap_indices = crate::triangulation::safe_earcut(&profile_flat, &[], 2)
+                .map_err(|e| Error::geometry(format!(
+                    "Revolved profile cap triangulation failed: {e}"
+                )))?;
 
-                positions.push(pos.x as f32);
-                positions.push(pos.y as f32);
-                positions.push(pos.z as f32);
-
-                // Create triangles (except for the last segment if it connects back)
-                if i < segments && j < num_profile_points - 1 {
-                    let current = (i * num_profile_points + j) as u32;
-                    let next_seg = ((i + 1) * num_profile_points + j) as u32;
-                    let current_next = current + 1;
-                    let next_seg_next = next_seg + 1;
-
-                    // Two triangles per quad
-                    indices.push(current);
-                    indices.push(next_seg);
-                    indices.push(next_seg_next);
-
-                    indices.push(current);
-                    indices.push(next_seg_next);
-                    indices.push(current_next);
+            for (ring_idx, flip) in [(0usize, true), (segments, false)] {
+                let base = (ring_idx * num_profile_points) as u32;
+                for tri in cap_indices.chunks_exact(3) {
+                    let a = base + tri[0] as u32;
+                    let b = base + tri[1] as u32;
+                    let c = base + tri[2] as u32;
+                    if flip {
+                        indices.push(a);
+                        indices.push(c);
+                        indices.push(b);
+                    } else {
+                        indices.push(a);
+                        indices.push(b);
+                        indices.push(c);
+                    }
                 }
             }
         }
 
-        // Add end caps if not a full revolution
-        if !full_circle {
-            // Start cap
-            let start_center_idx = (positions.len() / 3) as u32;
-            let start_center = axis_location
-                + axis_direction
-                    * (profile_points.iter().map(|p| p.y).sum::<f64>()
-                        / profile_points.len() as f64);
-            positions.push(start_center.x as f32);
-            positions.push(start_center.y as f32);
-            positions.push(start_center.z as f32);
-
-            for j in 0..num_profile_points - 1 {
-                indices.push(start_center_idx);
-                indices.push(j as u32 + 1);
-                indices.push(j as u32);
-            }
-
-            // End cap
-            let end_center_idx = (positions.len() / 3) as u32;
-            let end_base = (segments * num_profile_points) as u32;
-            positions.push(start_center.x as f32);
-            positions.push(start_center.y as f32);
-            positions.push(start_center.z as f32);
-
-            for j in 0..num_profile_points - 1 {
-                indices.push(end_center_idx);
-                indices.push(end_base + j as u32);
-                indices.push(end_base + j as u32 + 1);
-            }
-        }
-
-        Ok(Mesh {
+        let mut mesh = Mesh {
             positions,
             normals: Vec::new(),
             indices,
-            rtc_applied: false,
-        })
+            rtc_applied: false, 
+            origin: [0.0; 3],        };
+
+        // Apply Position to lift Position-local coords into object coords.
+        apply_transform(&mut mesh, &position_transform);
+
+        // Profile-boundary creases (e.g. flange-to-web on an I-beam) are
+        // all sharp 90° edges, but the swept mesh shares vertices between
+        // adjacent side quads — so per-vertex normal averaging smooths the
+        // shading across every crease and the cross-section reads as a
+        // smooth blob. Flat-shade the whole revolved solid (each triangle
+        // gets its own three vertices with the face normal) so the
+        // shading matches the actual geometry.
+        let flat =
+            PolygonalFaceSetProcessor::build_flat_shaded_mesh(&mesh.positions, &mesh.indices);
+        mesh.positions = flat.positions;
+        mesh.normals = flat.normals;
+        mesh.indices = flat.indices;
+
+        Ok(mesh)
     }
 
     fn supported_types(&self) -> Vec<IfcType> {
@@ -397,5 +537,61 @@ impl GeometryProcessor for RevolvedAreaSolidProcessor {
 impl Default for RevolvedAreaSolidProcessor {
     fn default() -> Self {
         Self::new(IfcSchema::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rmf_is_constant_on_a_straight_line() {
+        // Three collinear samples → tangents identical → frame must not change.
+        let pts = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let (tangents, perp1s, perp2s) = build_tube_rmf(&pts);
+        assert_eq!(tangents.len(), 3);
+        for i in 1..3 {
+            assert!((tangents[i] - tangents[0]).norm() < 1e-9);
+            assert!((perp1s[i] - perp1s[0]).norm() < 1e-9);
+            assert!((perp2s[i] - perp2s[0]).norm() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn rmf_does_not_flip_at_sharp_bends() {
+        // L-shape (0,0,0) → (1,0,0) → (1,1,0). The previous implementation
+        // re-picked `up` per cross-section based on `tangent.x.abs() < 0.9`:
+        // at i=0 tangent is +X (|x|=1, picks up=Y) → perp1 = +Z; at i=1 the
+        // midpoint tangent is (1/√2, 1/√2, 0) (|x|≈0.71 < 0.9, picks up=X)
+        // → perp1 = -Z. The sign flip mirrors the cross-section ring and
+        // produces a twisted/flat-ribbon tube. RMF must propagate +Z through.
+        let pts = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+        ];
+        let (_, perp1s, _) = build_tube_rmf(&pts);
+        assert_eq!(perp1s.len(), 3);
+        for (i, p) in perp1s.iter().enumerate() {
+            assert!(
+                p.z > 0.5,
+                "perp1 at i={i} flipped or rotated out of +Z half-space: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rmf_handles_degenerate_inputs() {
+        let empty: Vec<Point3<f64>> = Vec::new();
+        let (t, p1, p2) = build_tube_rmf(&empty);
+        assert!(t.is_empty() && p1.is_empty() && p2.is_empty());
+
+        let single = vec![Point3::new(0.0, 0.0, 0.0)];
+        let (t, p1, p2) = build_tube_rmf(&single);
+        assert!(t.is_empty() && p1.is_empty() && p2.is_empty());
     }
 }

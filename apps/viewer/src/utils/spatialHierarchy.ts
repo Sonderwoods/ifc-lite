@@ -12,6 +12,7 @@ import {
   IfcTypeEnum,
   RelationshipType,
   isBuildingLikeSpatialType,
+  isSpaceLikeSpatialType,
   isSpatialStructureType,
   isStoreyLikeSpatialType,
   type SpatialHierarchy,
@@ -65,13 +66,26 @@ export function rebuildSpatialHierarchy(
       'forward'
     );
 
-    // Filter out spatial structure elements — keep unknown types (custom/newer IFC classes).
-    // getTypeEnum() returns IfcTypeEnum.Unknown for both missing and unrecognized entities;
-    // isSpatialStructureType(Unknown) is false, so unknown types pass through correctly.
-    const containedElements = rawContainedElements.filter((id) => {
+    // Split contained refs into real (non-spatial) elements vs spatial-structure
+    // elements. Keep unknown types as elements (custom/newer IFC classes):
+    // getTypeEnum() returns IfcTypeEnum.Unknown for both missing and unrecognized
+    // entities, and isSpatialStructureType(Unknown) is false.
+    //
+    // A contained spatial element — an IfcSpace / IfcSpatialZone attached to a
+    // storey via IfcRelContainedInSpatialStructure, which is what Revit Family +
+    // Dynamo emit instead of IfcRelAggregates — is a tree NODE, not a contained
+    // product. Promote it to a spatial child so it shows in the hierarchy; without
+    // this it was filtered out here and vanished from the tree (#1075).
+    const containedElements: number[] = [];
+    const containedSpatialChildren: number[] = [];
+    for (const id of rawContainedElements) {
       const elemType = entities.getTypeEnum(id);
-      return !isSpatialStructureType(elemType);
-    });
+      if (isSpatialStructureType(elemType) && elemType !== IfcTypeEnum.IfcProject) {
+        containedSpatialChildren.push(id);
+      } else {
+        containedElements.push(id);
+      }
+    }
 
     // Get aggregated children via IfcRelAggregates
     const aggregatedChildren = relationships.getRelated(
@@ -80,14 +94,20 @@ export function rebuildSpatialHierarchy(
       'forward'
     );
 
-    // Filter to spatial structure types and recurse - O(1) per child now!
+    // Spatial child nodes come from BOTH aggregation and containment. Dedupe so a
+    // space referenced by both relationships isn't built twice. O(1) per child.
     const childNodes: SpatialNode[] = [];
-    for (const childId of aggregatedChildren) {
+    const spatialChildIds = new Set<number>();
+    const addSpatialChild = (childId: number) => {
+      if (spatialChildIds.has(childId)) return;
       const childType = entities.getTypeEnum(childId);
       if (childType && isSpatialStructureType(childType) && childType !== IfcTypeEnum.IfcProject) {
+        spatialChildIds.add(childId);
         childNodes.push(buildNode(childId));
       }
-    }
+    };
+    for (const childId of aggregatedChildren) addSpatialChild(childId);
+    for (const childId of containedSpatialChildren) addSpatialChild(childId);
 
     // Add elements to appropriate maps
     if (isStoreyLikeSpatialType(typeEnum)) {
@@ -96,13 +116,45 @@ export function rebuildSpatialHierarchy(
       byBuilding.set(expressId, containedElements);
     } else if (typeEnum === IfcTypeEnum.IfcSite) {
       bySite.set(expressId, containedElements);
-    } else if (typeEnum === IfcTypeEnum.IfcSpace) {
+    } else if (isSpaceLikeSpatialType(typeEnum)) {
+      // IfcSpace and IfcSpatialZone both roll up their contained elements here.
       bySpace.set(expressId, containedElements);
     }
 
     if (isStoreyLikeSpatialType(typeEnum)) {
       for (const elementId of containedElements) {
         elementToStorey.set(elementId, expressId);
+        // Propagate storey assignment to aggregated descendants (e.g. IfcBuildingElementPart
+        // children of an IfcWall). Without this, parts have no reverse-lookup entry even
+        // though the renderer emits them as standalone meshes.
+        // Cycle guard: malformed IFC files can have aggregate cycles.
+        // Direct storey containment wins — only set the descendant mapping if not already set.
+        const stack: number[] = [elementId];
+        const seen = new Set<number>([elementId]);
+        while (stack.length > 0) {
+          const current = stack.pop() as number;
+          const aggregatedKids = relationships.getRelated(
+            current,
+            RelationshipType.Aggregates,
+            'forward'
+          );
+          for (const kid of aggregatedKids) {
+            if (seen.has(kid)) continue;
+            seen.add(kid);
+            if (!elementToStorey.has(kid)) {
+              elementToStorey.set(kid, expressId);
+            }
+            stack.push(kid);
+          }
+        }
+      }
+      // Map the storey's spatial children (IfcSpace / IfcSpatialZone) to it too,
+      // so a selected space resolves "which storey it's on" in properties — the
+      // space itself is a child node, not in containedElements (#1075).
+      for (const childId of spatialChildIds) {
+        if (!elementToStorey.has(childId)) {
+          elementToStorey.set(childId, expressId);
+        }
       }
     }
 
@@ -171,6 +223,65 @@ export function rebuildSpatialHierarchy(
   };
 }
 
+/** Depth-first search for a spatial node by express id. */
+function findSpatialNode(node: SpatialNode, expressId: number): SpatialNode | null {
+  if (node.expressId === expressId) return node;
+  for (const child of node.children) {
+    const hit = findSpatialNode(child, expressId);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Register a freshly-authored element into an ALREADY-BUILT spatial hierarchy,
+ * in place, so it's a first-class citizen the instant it's created — visible in
+ * the spatial tree under its storey and resolving its storey assignment.
+ *
+ * Authored entities live in the store's mutation overlay, not the columnar parse
+ * the hierarchy was built from at load, so a full `rebuildSpatialHierarchy` can't
+ * see them (and would be O(n) per add anyway). This patches the maps + tree
+ * directly, mirroring how each relationship type lands a child:
+ *   - A spatial-structure element (IfcSpace / IfcSpatialZone, linked by
+ *     IfcRelAggregates) becomes a child NODE of the storey.
+ *   - Any other element (slab / wall / … linked by IfcRelContainedInSpatialStructure)
+ *     joins the storey's contained-element list (what the tree reads via byStorey).
+ * Idempotent. A later export+reparse rebuilds the hierarchy from the real
+ * relationships, so this is purely the live-session bridge.
+ */
+export function registerAuthoredElement(
+  hierarchy: SpatialHierarchy,
+  storeyExpressId: number,
+  entityId: number,
+  ifcTypeName: string,
+  name: string,
+): void {
+  hierarchy.elementToStorey.set(entityId, storeyExpressId);
+
+  const upper = ifcTypeName.toUpperCase();
+  if (upper === 'IFCSPACE' || upper === 'IFCSPATIALZONE') {
+    if (!hierarchy.bySpace.has(entityId)) hierarchy.bySpace.set(entityId, []);
+    const storeyNode = findSpatialNode(hierarchy.project, storeyExpressId);
+    if (storeyNode && !storeyNode.children.some((c) => c.expressId === entityId)) {
+      storeyNode.children.push({
+        expressId: entityId,
+        type: upper === 'IFCSPATIALZONE' ? IfcTypeEnum.IfcSpatialZone : IfcTypeEnum.IfcSpace,
+        name: name || (upper === 'IFCSPATIALZONE' ? 'IfcSpatialZone' : 'IfcSpace'),
+        children: [],
+        elements: [],
+      });
+    }
+    return;
+  }
+
+  const existing = hierarchy.byStorey.get(storeyExpressId);
+  if (existing) {
+    if (!existing.includes(entityId)) existing.push(entityId);
+  } else {
+    hierarchy.byStorey.set(storeyExpressId, [entityId]);
+  }
+}
+
 /**
  * Entity index type for property/quantity set lookup
  */
@@ -185,7 +296,21 @@ export interface EntityIndex {
 export interface OnDemandMaps {
   onDemandPropertyMap: Map<number, number[]>;
   onDemandQuantityMap: Map<number, number[]>;
+  /** element/type expressId -> associated material definition expressId. */
+  onDemandMaterialMap: Map<number, number>;
 }
+
+/** IFC material *definition* classes that can be the RelatingMaterial of an
+ *  IfcRelAssociatesMaterial — the source nodes of AssociatesMaterial edges. */
+const MATERIAL_DEF_TYPES = new Set([
+  'IFCMATERIAL',
+  'IFCMATERIALLAYERSET',
+  'IFCMATERIALLAYERSETUSAGE',
+  'IFCMATERIALPROFILESET',
+  'IFCMATERIALPROFILESETUSAGE',
+  'IFCMATERIALCONSTITUENTSET',
+  'IFCMATERIALLIST',
+]);
 
 /**
  * Rebuild on-demand property/quantity maps from relationships and entity types
@@ -205,6 +330,7 @@ export function rebuildOnDemandMaps(
 ): OnDemandMaps {
   const onDemandPropertyMap = new Map<number, number[]>();
   const onDemandQuantityMap = new Map<number, number[]>();
+  const onDemandMaterialMap = new Map<number, number>();
 
   // Use entityIndex.byType if available (needed for cache loads where entity table
   // doesn't include IfcPropertySet/IfcElementQuantity entities)
@@ -265,8 +391,33 @@ export function rebuildOnDemandMaps(
     }
   }
 
+  // Process material associations (FORWARD: material definition -> elements),
+  // mirroring the columnar parser's onDemandMaterialMap. Needed so cache-loaded
+  // models populate the Materials tab + per-material totals, which read this map
+  // (the relationship-graph fallback only covers single-element lookups, not the
+  // model-wide usage index). Requires entityIndex.byType to enumerate material
+  // definitions — the cached graph preserves AssociatesMaterial edges.
+  let materialDefCount = 0;
+  if (entityIndex?.byType) {
+    for (const [typeKey, ids] of entityIndex.byType) {
+      if (!MATERIAL_DEF_TYPES.has(typeKey.toUpperCase())) continue;
+      for (const materialId of ids) {
+        materialDefCount += 1;
+        const associated = relationships.getRelated(
+          materialId,
+          RelationshipType.AssociatesMaterial,
+          'forward'
+        );
+        for (const entityId of associated) {
+          // Last association wins, matching the columnar parser's `.set` build.
+          onDemandMaterialMap.set(entityId, materialId);
+        }
+      }
+    }
+  }
+
   console.log(
-    `[spatialHierarchy] Rebuilt on-demand maps: ${propertySets.length} psets, ${quantitySets.length} qsets -> ${onDemandPropertyMap.size} entities with properties, ${onDemandQuantityMap.size} with quantities`
+    `[spatialHierarchy] Rebuilt on-demand maps: ${propertySets.length} psets, ${quantitySets.length} qsets, ${materialDefCount} material defs -> ${onDemandPropertyMap.size} entities with properties, ${onDemandQuantityMap.size} with quantities, ${onDemandMaterialMap.size} with materials`
   );
-  return { onDemandPropertyMap, onDemandQuantityMap };
+  return { onDemandPropertyMap, onDemandQuantityMap, onDemandMaterialMap };
 }

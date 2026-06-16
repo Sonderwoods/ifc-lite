@@ -3,9 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * CesiumOverlay — renders a CesiumJS globe behind the WebGPU canvas,
- * providing real-world 3D context (terrain, buildings, imagery) for
- * georeferenced IFC models.
+ * CesiumOverlay — renders Google Photorealistic 3D Tiles behind the WebGPU
+ * canvas, providing real-world 3D context for georeferenced IFC models.
  *
  * Architecture:
  *   - A separate <div> behind the WebGPU <canvas> (z-index layering)
@@ -26,6 +25,13 @@ import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
 import type { CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
 import { getGlobalRenderer } from '@/hooks/useBCF';
 import { createCesiumBridge, type CesiumBridge } from '@/lib/geo/cesium-bridge';
+import {
+  computeCesiumPlacement,
+  shouldPreferOrthometricTerrain,
+} from '@/lib/geo/cesium-placement';
+import { getEffectiveHorizontalScale, resolveMapUnitToMetreScale } from '@/lib/geo/geo-scale';
+import { applySolarScene, SunPathDome } from '@/lib/geo/cesium-sun';
+import { sunPosition, sunTimes } from '@ifc-lite/solar';
 
 // Lazy-loaded Cesium module and CSS
 let cesiumPromise: Promise<typeof import('cesium')> | null = null;
@@ -69,7 +75,20 @@ function buildMergedGLB(meshes: import('@ifc-lite/geometry').MeshData[]): Uint8A
   for (const m of meshes) {
     if (!m.positions?.length || !m.indices?.length) continue;
     const nv = m.positions.length / 3;
-    positions.set(m.positions, vertOff * 3);
+    // Positions are in the element's local frame (world = origin + position);
+    // fold the per-mesh origin while merging so the GLB is world-space. No-op
+    // when origin is absent/[0,0,0].
+    const ox = m.origin?.[0] ?? 0, oy = m.origin?.[1] ?? 0, oz = m.origin?.[2] ?? 0;
+    if (ox !== 0 || oy !== 0 || oz !== 0) {
+      for (let i = 0; i < nv; i++) {
+        const s = (vertOff + i) * 3, t = i * 3;
+        positions[s] = m.positions[t] + ox;
+        positions[s + 1] = m.positions[t + 1] + oy;
+        positions[s + 2] = m.positions[t + 2] + oz;
+      }
+    } else {
+      positions.set(m.positions, vertOff * 3);
+    }
     // Vertex colors from mesh color
     const r = Math.round((m.color?.[0] ?? 0.7) * 255);
     const g = Math.round((m.color?.[1] ?? 0.7) * 255);
@@ -167,55 +186,72 @@ function buildModelMatrix(
   Cesium: typeof import('cesium'),
   bridge: CesiumBridge,
   mapConversion: MapConversion | undefined,
+  projectedCRS: ProjectedCRS | undefined,
   coordinateInfo: CoordinateInfo | undefined,
-  clamp: boolean,
-  terrainH: number | null,
+  lengthUnitScale: number,
 ) {
-  const hScale = mapConversion?.scale ?? 1.0;
+  // GLB vertices are in viewer-space metres (geometry engine converts during
+  // extraction). IfcMapConversion.Scale is defined per IFC spec relative to
+  // the project length unit, so applying it raw to metre-converted geometry
+  // double-scales the model — see issue #595. Use the effective scale.
+  const mapUnitScale = resolveMapUnitToMetreScale(projectedCRS?.mapUnitScale, lengthUnitScale);
+  const hScale = getEffectiveHorizontalScale(mapConversion?.scale, mapUnitScale, lengthUnitScale);
   const absc = mapConversion?.xAxisAbscissa ?? 1.0;
   const ordi = mapConversion?.xAxisOrdinate ?? 0.0;
   const bounds = coordinateInfo?.originalBounds;
+  // Viewer bounds are already in metres (geometry engine converts from IFC native unit)
   const mvx = bounds ? (bounds.min.x + bounds.max.x) / 2 : 0;
   const mvy = bounds ? (bounds.min.y + bounds.max.y) / 2 : 0;
   const mvz = bounds ? (bounds.min.z + bounds.max.z) / 2 : 0;
 
-  let placementHeight = bridge.modelOrigin.height;
-  if (clamp && terrainH !== null) {
-    const minY = bounds?.min.y ?? 0;
-    const bottomOffset = mvy - minY;
-    placementHeight = terrainH + bottomOffset;
-  }
-
+  // bridge.modelOrigin.height is the placement altitude — Effect 2 already
+  // baked terrain clamping (when applicable) into it before constructing the
+  // bridge, so there's no per-frame clamp adjustment to make here.
   const origin = Cesium.Cartesian3.fromDegrees(
-    bridge.modelOrigin.longitude, bridge.modelOrigin.latitude, placementHeight,
+    bridge.modelOrigin.longitude, bridge.modelOrigin.latitude, bridge.modelOrigin.height,
   );
   const enuToEcef = Cesium.Transforms.eastNorthUpToFixedFrame(origin);
+  // No lengthUnitScale here — viewer-space GLB vertices are already in metres.
   const sa = hScale * absc, so = hScale * ordi;
+  const tx = -(sa * mvx + so * mvz);
+  const ty = -(so * mvx - sa * mvz);
+  const tz = -mvy;
   const ifcToEnu = new Cesium.Matrix4(
-    sa, -so, 0, -(sa * mvx + so * mvz),
-    so,  sa, 0, -(so * mvx - sa * mvz),
-    0,   0,  1, -mvy,
-    0,   0,  0, 1,
+    sa, 0,  so, tx,
+    so, 0, -sa, ty,
+    0,  1,  0,  tz,
+    0,  0,  0,  1,
   );
   return Cesium.Matrix4.multiply(enuToEcef, ifcToEnu, new Cesium.Matrix4());
 }
 
 export interface CesiumOverlayProps {
   mapConversion?: MapConversion;
+  cameraMapConversion?: MapConversion;
   projectedCRS?: ProjectedCRS;
   coordinateInfo?: CoordinateInfo;
   geometryResult?: GeometryResult | null;
+  /** IFC project length unit → metres (e.g. 0.001 for mm models). Default 1. */
+  lengthUnitScale?: number;
+  /** IfcBuildingStorey elevations (express id → metres, viewer-Y aligned).
+   *  Used to clamp the model's ground-floor storey to terrain instead of
+   *  the lowest geometry vertex (which can be a basement or foundation). */
+  storeyElevations?: Map<number, number>;
 }
 
 export function CesiumOverlay({
   mapConversion,
+  cameraMapConversion,
   projectedCRS,
   coordinateInfo,
   geometryResult,
+  lengthUnitScale = 1,
+  storeyElevations,
 }: CesiumOverlayProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<InstanceType<typeof import('cesium').Viewer> | null>(null);
   const bridgeRef = useRef<CesiumBridge | null>(null);
+  const cameraBridgeRef = useRef<CesiumBridge | null>(null);
   const rafRef = useRef<number | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -226,21 +262,47 @@ export function CesiumOverlay({
   const dataSource = useViewerStore((s) => s.cesiumDataSource);
   const ionToken = useViewerStore((s) => s.cesiumIonToken);
   const terrainEnabled = useViewerStore((s) => s.cesiumTerrainEnabled);
-  const terrainClamp = useViewerStore((s) => s.cesiumTerrainClamp);
-  const terrainHeight = useViewerStore((s) => s.cesiumTerrainHeight);
+  const terrainClipY = useViewerStore((s) => s.cesiumTerrainClipY);
   const setCesiumTerrainHeight = useViewerStore((s) => s.setCesiumTerrainHeight);
+  const setCesiumTerrainSource = useViewerStore((s) => s.setCesiumTerrainSource);
   const setCesiumTerrainClipY = useViewerStore((s) => s.setCesiumTerrainClipY);
   const setCesiumGlbLoaded = useViewerStore((s) => s.setCesiumGlbLoaded);
 
-  // Use refs so the camera sync loop always reads the latest values
-  const terrainClampRef = useRef(terrainClamp);
-  const terrainHeightRef = useRef(terrainHeight);
-  terrainClampRef.current = terrainClamp;
-  terrainHeightRef.current = terrainHeight;
+  // Solar study state — drives the sun-path dome + shadow study.
+  const solarEnabled = useViewerStore((s) => s.solarEnabled);
+  const solarDateMs = useViewerStore((s) => s.solarDateMs);
+  const solarShowSunPath = useViewerStore((s) => s.solarShowSunPath);
+  const solarShowShadows = useViewerStore((s) => s.solarShowShadows);
+  const setSolarSunInfo = useViewerStore((s) => s.setSolarSunInfo);
+  // Environment sky toggle — atmosphere + sun + fog in geo mode.
+  const envSkyEnabled = useViewerStore((s) => s.envSkyEnabled);
+  // Re-run the solar effect once the deferred GLB load completes, so the IFC
+  // model's shadow mode is applied even when the study was enabled before the
+  // model finished loading into Cesium.
+  const cesiumGlbLoaded = useViewerStore((s) => s.cesiumGlbLoaded);
 
   // Track the Cesium model (IFC geometry loaded as glTF for correct world positioning)
-  const cesiumModelRef = useRef<{ modelMatrix: any; destroy?: () => void } | null>(null);
+  const cesiumModelRef = useRef<{ modelMatrix: any; shadows?: any; destroy?: () => void } | null>(null);
   const glbCacheRef = useRef<{ meshCount: number; glb: Uint8Array } | null>(null);
+  // Active 3D context tileset (Google Photorealistic / OSM buildings) — kept so
+  // solar mode can toggle its shadow casting/receiving.
+  const tilesetRef = useRef<{ shadows?: any } | null>(null);
+  // Active sun-path dome entity collection (null when solar study is off).
+  const sunPathDomeRef = useRef<SunPathDome | null>(null);
+  // UTC calendar day the dome's static geometry (day-arc, analemmas) was built
+  // for. Intra-day time scrubs only move the sun marker; a new day rebuilds.
+  const sunPathDomeDayRef = useRef<string | null>(null);
+  // Whether the solar study has ever touched Cesium scene state. Guards us
+  // from mutating the default (non-solar) lighting on plain mount.
+  const solarTouchedSceneRef = useRef(false);
+
+  // Last-known placement altitude (in metres) used to keep the user's WORLD
+  // camera position stable across bridge rebuilds. When the user toggles the
+  // clamp or edits OrthogonalHeight, the model placement changes and the
+  // entire viewer→ECEF frame translates with it; we offset the IFC viewer's
+  // camera Y by the inverse so the user perceives the model moving instead
+  // of the camera being dragged along.
+  const prevPlacementRef = useRef<number | null>(null);
 
   // ─── Effect 1: Create/destroy the Cesium viewer (heavy, rare) ───────────
   // Only depends on cesiumEnabled, ionToken, terrainEnabled, dataSource.
@@ -284,10 +346,14 @@ export function CesiumOverlay({
 
         if (cancelled) { viewer.destroy(); return; }
 
-        // Disable Cesium's user input — the IFC viewer controls the camera.
-        // Keep collision detection off since we set the camera programmatically.
+        // Disable Cesium's user input — the IFC viewer drives the camera,
+        // and any input Cesium intercepts (even a stray wheel/touch event
+        // past pointer-events:none) interferes with our orbit/zoom and
+        // produces "stuck to terrain" symptoms. enableInputs is the
+        // master kill-switch; the per-mode flags below are belt-and-braces.
         const scene = viewer.scene;
         const sscc = scene.screenSpaceCameraController;
+        sscc.enableInputs = false;
         sscc.enableRotate = false;
         sscc.enableTranslate = false;
         sscc.enableZoom = false;
@@ -310,7 +376,9 @@ export function CesiumOverlay({
           bottomContainer.style.right = 'auto';
         }
 
-        // Disable skybox/atmosphere/fog for transparent compositing
+        // Disable skybox/atmosphere/fog for transparent compositing.
+        // (The Sun & Sky panel's Sky toggle re-enables atmosphere/sun/fog
+        // via Effect 4b.)
         if (scene.skyBox) (scene.skyBox as any).show = false;
         if (scene.sun) scene.sun.show = false;
         if (scene.moon) scene.moon.show = false;
@@ -319,18 +387,22 @@ export function CesiumOverlay({
         scene.globe.showGroundAtmosphere = false;
         scene.backgroundColor = Cesium.Color.TRANSPARENT;
         scene.globe.baseColor = Cesium.Color.TRANSPARENT;
-
-        // Add imagery
-        try {
-          const imageryProvider = await Cesium.IonImageryProvider.fromAssetId(2);
-          viewer.imageryLayers.addImageryProvider(imageryProvider);
-        } catch {
-          viewer.imageryLayers.addImageryProvider(
-            new Cesium.OpenStreetMapImageryProvider({
-              url: 'https://a.tile.openstreetmap.org/',
-            })
-          );
+        if (dataSource === 'osm-buildings') {
+          // OSM massing context: keep the globe with the satellite base map —
+          // the extruded buildings sit ON TOP of the imagery, and the globe
+          // is what receives their cast shadows during a sun study.
+          scene.globe.show = true;
+          scene.globe.shadows = Cesium.ShadowMode.RECEIVE_ONLY;
+          try {
+            const imagery = await Cesium.createWorldImageryAsync();
+            if (!cancelled) viewer.imageryLayers.addImageryProvider(imagery);
+          } catch { /* imagery unavailable — buildings still render */ }
+        } else {
+          // Photorealistic tiles bring their own ground; the globe would
+          // z-fight underneath them.
+          scene.globe.show = false;
         }
+        if (cancelled) { viewer.destroy(); return; }
 
         // Add terrain
         if (terrainEnabled && ionToken) {
@@ -341,7 +413,7 @@ export function CesiumOverlay({
         }
 
         // Add data source layer
-        await addDataSourceLayer(Cesium, viewer, dataSource, ionToken);
+        tilesetRef.current = await addDataSourceLayer(Cesium, viewer, dataSource, ionToken);
 
         if (cancelled) { viewer.destroy(); return; }
 
@@ -370,102 +442,182 @@ export function CesiumOverlay({
       // so Effect 2c must re-load the GLB into the next viewer instance.
       cesiumModelRef.current = null;
       bridgeRef.current = null;
+      // The destroyed viewer also took the tileset + sun-path entities.
+      tilesetRef.current = null;
+      sunPathDomeRef.current = null;
+      sunPathDomeDayRef.current = null;
+      solarTouchedSceneRef.current = false;
       setStatus('idle');
     };
   }, [cesiumEnabled, ionToken, terrainEnabled, dataSource]);
 
-  // ─── Effect 2: Rebuild coordinate bridge when georef changes (fast) ─────
-  // This is the live-edit handler. When the user changes EPSG, eastings,
-  // northings, rotation, etc., we rebuild the bridge and fly to the new spot.
+  // ─── Effect 2: Build the coordinate bridge with terrain-aware placement ─
+  // Precomputes the model placement (floored to the visible surface when
+  // necessary) BEFORE
+  // building the bridge that the GLB and camera will share. This way the
+  // model loads into Cesium at its final altitude — no post-load shifting,
+  // no camera/model frame divergence, no compensation gymnastics.
+  //
+  // Sequence:
+  //   1. Build a tentative bridge to recover the model's WGS84 lat/lon.
+  //   2. Query terrain at that lat/lon (sync first, async with retry next).
+  //   3. Auto-floor the model if its authored base sits below the visible surface.
+  //   4. Rebuild the bridge with placementHeight baked into its enuToEcef
+  //      origin so model matrix and camera frame share a single altitude.
+  //   5. Push terrain-derived state (height, clip Y) and
+  //      install the bridge.
   useEffect(() => {
     if (status !== 'ready' || !mapConversion || !projectedCRS) {
       bridgeRef.current = null;
+      cameraBridgeRef.current = null;
+      prevPlacementRef.current = null;
       return;
     }
 
     let cancelled = false;
 
     (async () => {
-      const bridge = await createCesiumBridge(mapConversion, projectedCRS, coordinateInfo);
-      if (cancelled) return;
+      const Cesium = cesiumModule;
+      const viewer = viewerRef.current;
+      if (!Cesium || !viewer) return;
 
-      if (!bridge) {
+      const cameraConversion = cameraMapConversion ?? mapConversion;
+      const usesSeparateCameraBridge = cameraConversion !== mapConversion;
+      const cameraTentative = await createCesiumBridge(
+        cameraConversion, projectedCRS, coordinateInfo, lengthUnitScale,
+      );
+      if (cancelled) return;
+      if (!cameraTentative) {
         bridgeRef.current = null;
+        cameraBridgeRef.current = null;
         return;
       }
 
-      const prevBridge = bridgeRef.current;
-      bridgeRef.current = bridge;
-      // Bump version so terrain query effect re-runs now that bridge is ready
-      setBridgeVersion((v) => v + 1);
+      // Query terrain at the model's location. queryTerrainHeight tries
+      // Cesium's sync sources first (globe.getHeight, scene.sampleHeight),
+      // then Open-Meteo as a fast network fallback that works even with
+      // Google Photorealistic 3D Tiles (where there's no Cesium terrain
+      // provider for getHeight to read). Cached per-session.
+      const preferOrthometricTerrain = shouldPreferOrthometricTerrain(projectedCRS);
+      let terrainSample = null;
+      try {
+        terrainSample = await cameraTentative.queryTerrainHeight(Cesium, viewer, {
+          cacheNamespace: [
+            terrainEnabled ? 'terrain' : 'ellipsoid',
+            dataSource,
+            preferOrthometricTerrain ? 'orthometric' : 'visual-surface',
+          ].join(':'),
+          preferOrthometric: preferOrthometricTerrain,
+        });
+      }
+      catch (err) { console.warn('[CesiumOverlay] terrain query failed:', err); }
+      if (cancelled) return;
+      const terrainH = terrainSample?.height ?? null;
+      const modelTentative = usesSeparateCameraBridge
+        ? await createCesiumBridge(mapConversion, projectedCRS, coordinateInfo, lengthUnitScale)
+        : cameraTentative;
+      if (cancelled) return;
+      if (!modelTentative) {
+        bridgeRef.current = null;
+        return;
+      }
+      // Placement is purely IFC-authored — no terrain/storey clamp. The
+      // tentative bridges already carry the model's authored altitude
+      // (IfcMapConversion.OrthogonalHeight + geometry origin), so they ARE
+      // the final bridges. computeCesiumPlacement is still called for the
+      // clip-plane Y; placementHeight == ifcOriginHeight.
+      const placement = computeCesiumPlacement({
+        coordinateInfo,
+        projectedCRS,
+        ifcOriginHeight: modelTentative.modelOrigin.height,
+        terrainHeight: terrainH,
+        storeyElevations,
+      });
+      const cameraPlacement = usesSeparateCameraBridge
+        ? computeCesiumPlacement({
+            coordinateInfo,
+            projectedCRS,
+            ifcOriginHeight: cameraTentative.modelOrigin.height,
+            terrainHeight: terrainH,
+            storeyElevations,
+          })
+        : placement;
 
-      // Fly to the new model location (smooth animation)
-      const viewer = viewerRef.current;
-      const Cesium = cesiumModule;
-      if (viewer && Cesium) {
-        const { modelOrigin } = bridge;
+      // The model bridge is the tentative one — placement == authored origin.
+      const bridge = modelTentative;
 
-        const isFirstPosition = !prevBridge;
-        const target = Cesium.Cartesian3.fromDegrees(
-          modelOrigin.longitude, modelOrigin.latitude, modelOrigin.height,
+      if (terrainSample) {
+        setCesiumTerrainHeight(terrainH);
+        setCesiumTerrainSource(
+          `${terrainSample.source}${terrainSample.reference === 'orthometric' ? ' (orthometric)' : ''}`,
         );
+        // terrainClipY stays in viewer-space; it represents the world terrain
+        // altitude expressed in the camera bridge's committed frame. Draft
+        // placement edits must not move this floor, or the camera will drift.
+        setCesiumTerrainClipY(cameraPlacement.terrainClipY);
+      } else {
+        // Failed re-query (offline, API down) — clear stale store fields so
+        // the clip plane doesn't drift relative to the new bridge.
+        setCesiumTerrainHeight(null);
+        setCesiumTerrainSource(null);
+        setCesiumTerrainClipY(null);
+      }
 
-        if (isFirstPosition) {
-          // First time: instant jump to isometric view
-          const hpr = new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-45), 300);
-          viewer.camera.lookAt(target, hpr);
-          viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
-          viewer.scene.requestRender();
-        } else if (prevBridge) {
-          // Georef edit: just re-render, the camera sync loop will pick
-          // up the new bridge on the next frame. No dramatic fly animation.
-          viewer.scene.requestRender();
+      // World-camera stability: when this rebuild changes the placement
+      // altitude (surface floor or OrthogonalHeight edited), shift the IFC
+      // viewer-space camera Y by the inverse delta so the user's WORLD
+      // camera ECEF position stays put. Without this, the entire frame
+      // translates with the model and edits feel like the camera is
+      // moving instead of the model — exactly what the user reported.
+      const prevPlacement = prevPlacementRef.current;
+      if (!usesSeparateCameraBridge) {
+        prevPlacementRef.current = placement.placementHeight;
+      }
+      if (!usesSeparateCameraBridge && prevPlacement !== null) {
+        const dh = placement.placementHeight - prevPlacement;
+        // 5 cm threshold — rejects float jitter from cached terrain reads
+        // re-flowing through the same effect, while a real placement edit
+        // is always far larger.
+        if (Math.abs(dh) > 0.05) {
+          const renderer = getGlobalRenderer();
+          if (renderer) {
+            const cam = renderer.getCamera();
+            const pos = cam.getPosition();
+            cam.setPosition(pos.x, pos.y - dh, pos.z);
+          }
         }
       }
+
+      // Camera bridge: the separate camera-tentative when a placement draft
+      // is previewing (camera holds the base frame while the model moves),
+      // otherwise the model bridge itself. Both are already at their
+      // authored altitude — no placement-override rebuild.
+      const cameraBridge = usesSeparateCameraBridge ? cameraTentative : bridge;
+
+      bridgeRef.current = bridge;
+      cameraBridgeRef.current = cameraBridge;
+      setBridgeVersion((v) => v + 1);
     })();
 
     return () => { cancelled = true; };
-  }, [status, mapConversion, projectedCRS, coordinateInfo]);
-
-  // ─── Effect 2b: Query terrain height when bridge is ready ───────────────
-  // Also re-queries when terrainClamp is toggled on (in case first query failed)
-  useEffect(() => {
-    if (status !== 'ready') return;
-    const bridge = bridgeRef.current;
-    const viewer = viewerRef.current;
-    const Cesium = cesiumModule;
-    if (!bridge || !viewer || !Cesium) return;
-
-    let cancelled = false;
-
-    // Query immediately, then retry after a delay if terrain tiles weren't loaded yet
-    // Compute model center Y in viewer space for terrain clip offset
-    const bounds = coordinateInfo?.originalBounds;
-    const modelVY = bounds ? (bounds.min.y + bounds.max.y) / 2 : 0;
-    const modelMinY = bounds ? bounds.min.y : 0;
-
-    const doQuery = () => {
-      bridge.queryTerrainHeight(Cesium, viewer).then((h) => {
-        if (!cancelled && h !== null) {
-          setCesiumTerrainHeight(h);
-          // Compute terrain clip Y in viewer space:
-          // terrain is at height h (meters). Model origin is at bridge.modelOrigin.height.
-          // In viewer Y-up, the bottom of the model is at modelMinY.
-          // Terrain clip Y = modelMinY + (terrainHeight - modelOriginHeight)
-          // This places the clip plane at the terrain surface relative to model geometry.
-          const terrainClipY = modelMinY + (h - bridge.modelOrigin.height);
-          setCesiumTerrainClipY(terrainClipY);
-        }
-      });
-    };
-
-    // First attempt
-    doQuery();
-    // Retry after 5s in case terrain tiles were still loading
-    const retryTimer = setTimeout(doQuery, 5000);
-
-    return () => { cancelled = true; clearTimeout(retryTimer); };
-  }, [status, terrainEnabled, terrainClamp, bridgeVersion]);
+    // terrainEnabled and ionToken intentionally omitted — Effect 1 already
+    // owns those (it destroys/recreates the viewer when they change), and
+    // listing them here would cause a redundant bridge rebuild while the
+    // viewer is being torn down.
+  }, [
+    status,
+    mapConversion,
+    cameraMapConversion,
+    projectedCRS,
+    coordinateInfo,
+    lengthUnitScale,
+    terrainEnabled,
+    dataSource,
+    storeyElevations,
+    setCesiumTerrainHeight,
+    setCesiumTerrainSource,
+    setCesiumTerrainClipY,
+  ]);
 
   // ─── Effect 2c: Load GLB into Cesium (only when geometry changes) ───────
   // This is the heavy operation — only re-runs when geometry actually changes.
@@ -509,14 +661,21 @@ export function CesiumOverlay({
         if (cancelled) return;
 
         // Build initial model matrix
-        const modelMatrix = buildModelMatrix(Cesium, bridge, mapConversion, coordinateInfo, terrainClampRef.current, terrainHeightRef.current);
+        const modelMatrix = buildModelMatrix(Cesium, bridge, mapConversion, projectedCRS, coordinateInfo, lengthUnitScale);
 
         const blob = new Blob([glbBytes as BlobPart], { type: 'model/gltf-binary' });
         const glbUrl = URL.createObjectURL(blob);
         let model: { modelMatrix: any; destroy?: () => void } | null = null;
         try {
           model = await Cesium.Model.fromGltfAsync({
-            url: glbUrl, modelMatrix, shadows: Cesium.ShadowMode.DISABLED,
+            url: glbUrl,
+            modelMatrix,
+            shadows: Cesium.ShadowMode.DISABLED,
+            // The generated GLB stores viewer-space vertices and buildModelMatrix
+            // already maps viewer axes into ENU. Avoid Cesium's default glTF
+            // Y-up/Z-forward correction or the model is rotated onto its side.
+            upAxis: Cesium.Axis.Z,
+            forwardAxis: Cesium.Axis.X,
           });
         } finally {
           URL.revokeObjectURL(glbUrl);
@@ -549,7 +708,7 @@ export function CesiumOverlay({
   }, [status, bridgeVersion, geometryResult]);
 
   // ─── Effect 2d: Update model matrix (instant, no reload) ────────────────
-  // When terrain clamp, terrain height, or georef changes, just update the
+  // When terrain placement or georef changes, just update the
   // existing model's matrix — no GLB re-export, no flicker.
   useEffect(() => {
     const model = cesiumModelRef.current;
@@ -558,10 +717,140 @@ export function CesiumOverlay({
     const Cesium = cesiumModule;
     if (!model || !bridge || !viewer || !Cesium) return;
 
-    const newMatrix = buildModelMatrix(Cesium, bridge, mapConversion, coordinateInfo, terrainClamp, terrainHeight);
+    const newMatrix = buildModelMatrix(Cesium, bridge, mapConversion, projectedCRS, coordinateInfo, lengthUnitScale);
     model.modelMatrix = newMatrix;
     viewer.scene.requestRender();
-  }, [terrainClamp, terrainHeight, mapConversion, coordinateInfo]);
+    // Depend on bridgeVersion so the matrix is rebuilt with the *new* bridge
+    // after async createCesiumBridge replaces it. Placement is baked into
+    // bridge.modelOrigin.height by Effect 2.
+  }, [mapConversion, projectedCRS, coordinateInfo, lengthUnitScale, bridgeVersion]);
+
+  // ─── Effect 4: Solar study — sun-path dome + shadows ────────────────────
+  // Drives Cesium's sun/lighting/shadow map from the studied instant, builds
+  // (and live-updates) the 3D sun-path dome anchored at the model origin, and
+  // publishes the resolved sun position/times back to the store for the panel.
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    const bridge = bridgeRef.current;
+    const Cesium = cesiumModule;
+    if (status !== 'ready' || !viewer || !bridge || !Cesium) return;
+
+    // Never mutate the default Cesium lighting until the study is first
+    // enabled — a plain georeferenced model shouldn't have its context
+    // re-lit just because this effect mounts with solar off.
+    if (!solarEnabled && !solarTouchedSceneRef.current) return;
+    solarTouchedSceneRef.current = true;
+
+    const date = new Date(solarDateMs);
+    const { latitude, longitude, height } = bridge.modelOrigin;
+
+    // Cast/receive shadows on the IFC model and the context tileset.
+    const shadowMode = solarEnabled && solarShowShadows
+      ? Cesium.ShadowMode.ENABLED
+      : Cesium.ShadowMode.DISABLED;
+    if (cesiumModelRef.current) cesiumModelRef.current.shadows = shadowMode;
+    if (tilesetRef.current) tilesetRef.current.shadows = shadowMode;
+
+    applySolarScene(Cesium, viewer, {
+      date,
+      enabled: solarEnabled,
+      shadows: solarShowShadows,
+      showSun: envSkyEnabled,
+    });
+
+    if (solarEnabled) {
+      // Publish the readout for the panel.
+      const times = sunTimes(date, latitude, longitude);
+      const sp = sunPosition(date, latitude, longitude);
+      setSolarSunInfo({
+        latitude,
+        longitude,
+        azimuth: sp.azimuth,
+        altitude: sp.altitude,
+        sunriseMs: times.sunrise ? times.sunrise.getTime() : null,
+        sunsetMs: times.sunset ? times.sunset.getTime() : null,
+        solarNoonMs: times.solarNoon.getTime(),
+      });
+
+      if (solarShowSunPath) {
+        const dayKey = `${date.getUTCFullYear()}-${date.getUTCMonth()}-${date.getUTCDate()}:${latitude.toFixed(4)},${longitude.toFixed(4)}`;
+        try {
+          if (!sunPathDomeRef.current || sunPathDomeDayRef.current !== dayKey) {
+            // New day or site → rebuild static geometry (day arc + analemmas).
+            sunPathDomeRef.current?.destroy();
+            const bounds = coordinateInfo?.originalBounds;
+            // Size the dome to roughly the model footprint, but clamp to an
+            // architectural scale: with many federated models the combined
+            // bounds can span kilometres, which would push the dome arcs so
+            // far out they read as nothing. Half-diagonal ≈ bounding radius.
+            const rawRadius = bounds
+              ? 0.5 * Math.hypot(
+                  bounds.max.x - bounds.min.x,
+                  bounds.max.y - bounds.min.y,
+                  bounds.max.z - bounds.min.z,
+                )
+              : 80;
+            const radius = Math.min(250, Math.max(40, rawRadius));
+            sunPathDomeRef.current = new SunPathDome(Cesium, viewer, {
+              origin: { latitude, longitude, height },
+              radius,
+              date,
+              showAnalemmas: true,
+            });
+            sunPathDomeDayRef.current = dayKey;
+          } else {
+            // Same day, new time → just move the sun marker + beam.
+            sunPathDomeRef.current.update(date);
+          }
+        } catch (err) {
+          console.warn('[CesiumOverlay] sun-path dome build/update failed:', err);
+        }
+      } else if (sunPathDomeRef.current) {
+        sunPathDomeRef.current.destroy();
+        sunPathDomeRef.current = null;
+        sunPathDomeDayRef.current = null;
+      }
+    } else if (sunPathDomeRef.current) {
+      sunPathDomeRef.current.destroy();
+      sunPathDomeRef.current = null;
+      sunPathDomeDayRef.current = null;
+    }
+
+    viewer.scene.requestRender();
+  }, [
+    status,
+    bridgeVersion,
+    cesiumGlbLoaded,
+    solarEnabled,
+    solarDateMs,
+    solarShowSunPath,
+    solarShowShadows,
+    envSkyEnabled,
+    coordinateInfo,
+    setSolarSunInfo,
+  ]);
+
+  // ─── Effect 4b: Sky — atmosphere + sun + fog ────────────────────────────
+  // The environment panel's Sky toggle. Init disables all of these for
+  // transparent compositing; this effect re-enables them on demand. The
+  // area outside the atmosphere stays transparent (skyBox off), so space
+  // composites over the app background like the rest of the overlay.
+  useEffect(() => {
+    const viewer = viewerRef.current;
+    const Cesium = cesiumModule;
+    if (status !== 'ready' || !viewer || !Cesium) return;
+    const scene = viewer.scene;
+    if (scene.skyAtmosphere) scene.skyAtmosphere.show = envSkyEnabled;
+    scene.fog.enabled = envSkyEnabled;
+    // Haze on the satellite base map (no-op while the globe is hidden).
+    scene.globe.showGroundAtmosphere = envSkyEnabled && scene.globe.show;
+    // Sun billboard only when the solar effect isn't already managing it
+    // (applySolarScene runs with showSun and wins on solar state changes).
+    if (scene.sun && !solarTouchedSceneRef.current) {
+      scene.sun.show = envSkyEnabled;
+    }
+    scene.requestRender();
+  }, [status, envSkyEnabled]);
 
   // ─── Effect 3: Camera sync loop ─────────────────────────────────────────
   useEffect(() => {
@@ -576,21 +865,32 @@ export function CesiumOverlay({
       if (cancelled) return;
 
       const bridge = bridgeRef.current;
+      const cameraBridge = cameraBridgeRef.current ?? bridge;
       const renderer = getGlobalRenderer();
       const Cesium = cesiumModule;
-      if (!viewer || !bridge || !renderer || !Cesium) {
+      if (!viewer || !bridge || !cameraBridge || !renderer || !Cesium) {
         rafRef.current = requestAnimationFrame(syncCamera);
         return;
       }
 
       const camera = renderer.getCamera();
-      const camPos = camera.getPosition();
-      const camTarget = camera.getTarget();
+      let camPos = camera.getPosition();
+      let camTarget = camera.getTarget();
       const camUp = camera.getUp();
       const fov = camera.getFOV();
 
-      // Sync Cesium camera (no terrain offset — model matrix handles clamping)
-      bridge.syncCamera(Cesium, viewer, camPos, camTarget, camUp, fov);
+      if (terrainClipY !== null) {
+        const minCameraY = terrainClipY + 0.05;
+        if (camPos.y < minCameraY) {
+          const dy = minCameraY - camPos.y;
+          camPos = { ...camPos, y: minCameraY };
+          camTarget = { ...camTarget, y: camTarget.y + dy };
+        }
+      }
+
+      // bridge.modelOrigin.height already has the placement baked in, so the
+      // camera frame and the model matrix share the same enuToEcef origin altitude.
+      cameraBridge.syncCamera(Cesium, viewer, camPos, camTarget, camUp, fov);
 
       rafRef.current = requestAnimationFrame(syncCamera);
     }
@@ -604,7 +904,7 @@ export function CesiumOverlay({
         rafRef.current = null;
       }
     };
-  }, [status]);
+  }, [status, terrainClipY]);
 
   if (!cesiumEnabled || !mapConversion || !projectedCRS) {
     return null;
@@ -633,40 +933,43 @@ export function CesiumOverlay({
 }
 
 /**
- * Add the selected 3D data source layer to the Cesium viewer.
+ * Add the selected 3D context layer to the Cesium viewer. Returns the created
+ * tileset so callers can toggle its shadow casting/receiving for solar
+ * studies (`null` if none could be created).
  */
 async function addDataSourceLayer(
   Cesium: typeof import('cesium'),
   viewer: InstanceType<typeof import('cesium').Viewer>,
   dataSource: string,
   ionToken: string,
-) {
+): Promise<InstanceType<typeof import('cesium').Cesium3DTileset> | null> {
   try {
     switch (dataSource) {
       case 'osm-buildings': {
-        if (!ionToken) return;
-        const tileset = await Cesium.Cesium3DTileset.fromIonAssetId(96188);
+        // OpenStreetMap Buildings — flat-shaded extruded footprints, the grey
+        // massing context used for sun-path / overshadowing studies.
+        const tileset = await Cesium.createOsmBuildingsAsync();
         viewer.scene.primitives.add(tileset);
-        break;
+        return tileset;
       }
-      case 'google-photorealistic': {
+      case 'google-photorealistic':
+      default: {
         try {
           const tileset = await Cesium.createGooglePhotorealistic3DTileset();
           viewer.scene.primitives.add(tileset);
+          return tileset;
         } catch {
           if (ionToken) {
             const tileset = await Cesium.Cesium3DTileset.fromIonAssetId(2275207);
             viewer.scene.primitives.add(tileset);
+            return tileset;
           }
+          return null;
         }
-        break;
       }
-      case 'bing-aerial':
-      default:
-        // No 3D tileset for Bing — imagery is added separately via imageryLayers
-        break;
     }
   } catch (err) {
     console.warn('[CesiumOverlay] Failed to add data source:', dataSource, err);
+    return null;
   }
 }

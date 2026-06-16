@@ -98,6 +98,11 @@ export interface LensSlice {
   lensPanelVisible: boolean;
   /** Computed: globalId → hex color for entities matched by active lens */
   lensColorMap: Map<number, string>;
+  /** The exact RGBA overlay the active lens last pushed to the shared color
+   *  channel, or null when no lens is active. Lets another channel owner
+   *  (e.g. the compare overlay) hand control back to the lens on teardown
+   *  instead of clearing it. */
+  lensAppliedColors: Map<number, [number, number, number, number]> | null;
   /** Computed: globalIds to hide via lens rules */
   lensHiddenIds: Set<number>;
   /** Computed: ruleId → matched entity count for the active lens */
@@ -117,6 +122,7 @@ export interface LensSlice {
   toggleLensPanel: () => void;
   setLensPanelVisible: (visible: boolean) => void;
   setLensColorMap: (map: Map<number, string>) => void;
+  setLensAppliedColors: (map: Map<number, [number, number, number, number]> | null) => void;
   setLensHiddenIds: (ids: Set<number>) => void;
   setLensRuleCounts: (counts: Map<string, number>) => void;
   setLensRuleEntityIds: (ids: Map<string, number[]>) => void;
@@ -128,6 +134,13 @@ export interface LensSlice {
   getActiveLens: () => Lens | null;
   /** Import lenses from parsed JSON array */
   importLenses: (lenses: Lens[]) => void;
+  /**
+   * Replace the entire saved-lens set (custom + builtin overrides). Used
+   * when activating a flavor: the flavor's stored lens snapshot becomes
+   * the new viewer state. Builtins missing from `lenses` are restored
+   * from defaults so the user never ends up with an empty lens panel.
+   */
+  setSavedLenses: (lenses: Lens[]) => void;
   /** Export all lenses (builtins + custom) as serializable array */
   exportLenses: () => Lens[];
   /** Create and activate an auto-color lens from a data column spec */
@@ -140,6 +153,7 @@ export const createLensSlice: StateCreator<LensSlice, [], [], LensSlice> = (set,
   activeLensId: null,
   lensPanelVisible: false,
   lensColorMap: new Map(),
+  lensAppliedColors: null,
   lensHiddenIds: new Set(),
   lensRuleCounts: new Map(),
   lensRuleEntityIds: new Map(),
@@ -176,6 +190,7 @@ export const createLensSlice: StateCreator<LensSlice, [], [], LensSlice> = (set,
   setLensPanelVisible: (lensPanelVisible) => set({ lensPanelVisible }),
 
   setLensColorMap: (lensColorMap) => set({ lensColorMap }),
+  setLensAppliedColors: (lensAppliedColors) => set({ lensAppliedColors }),
   setLensHiddenIds: (lensHiddenIds) => set({ lensHiddenIds }),
   setLensRuleCounts: (lensRuleCounts) => set({ lensRuleCounts }),
   setLensRuleEntityIds: (lensRuleEntityIds) => set({ lensRuleEntityIds }),
@@ -209,6 +224,27 @@ export const createLensSlice: StateCreator<LensSlice, [], [], LensSlice> = (set,
       return out;
     });
   },
+
+  setSavedLenses: (lenses) => set((state) => {
+    // Keep builtins available even if the incoming snapshot dropped
+    // them — otherwise switching flavors could leave the user with no
+    // BY IFC CLASS / STRUCTURAL / etc. The incoming list takes
+    // precedence (it may carry user overrides).
+    const incomingIds = new Set(lenses.map((l) => l.id));
+    const builtinsToKeep = BUILTIN_LENSES
+      .filter((b) => !incomingIds.has(b.id))
+      .map((b) => ({ ...b }));
+    const next = [...builtinsToKeep, ...lenses];
+    saveLenses(next);
+    // If the previously active lens id is gone, clear the pointer so
+    // the viewer doesn't try to render a missing rule set.
+    const activeStillThere = state.activeLensId !== null
+      && next.some((l) => l.id === state.activeLensId);
+    return {
+      savedLenses: next,
+      activeLensId: activeStillThere ? state.activeLensId : null,
+    };
+  }),
 
   activateAutoColorFromColumn: (spec, label) => set((state) => {
     const lensId = AUTO_COLOR_FROM_LIST_ID;

@@ -4,7 +4,34 @@ Detailed architecture of geometry processing in IFClite.
 
 ## Overview
 
-The geometry pipeline transforms IFC shape representations into GPU-ready triangle meshes:
+The geometry pipeline transforms IFC shape representations into GPU-ready triangle meshes.
+
+**One pipeline, two orchestrations.** Since the 2026-06 unification series
+(#1080 → #1088 → #1084 → shared prepass), per-element mesh production and
+prepass resolution exist exactly once, in `ifc-lite-processing`:
+
+- **`processing::element::produce_element_meshes`** — THE per-element decision
+  tree (type-product geometry #957, submesh-aware void cuts, per-item #858
+  palette splits, single-mesh fallback chain). Run by the native rayon loop
+  (server/CLI) and by the browser's `processGeometryBatch` per job. The only
+  sanctioned behavioural fork is `TypeGeometryMode` (an export suppresses
+  instanced type geometry; the viewer emits it tagged for its Model/Types
+  switch).
+- **`processing::prepass`** — the shared post-scan resolver (styled-item
+  precedence, IfcIndexedColourMap #663/#858, the #407 material chain, voids
+  with #845 aggregate propagation) plus `resolve_unit_scales` (length AND
+  plane-angle, resolved once with a documented fallback ladder for
+  late-in-file `IFCPROJECT`) and the flat wire codecs for the JS boundary.
+  The scan loops stay per-orchestration (native scan with properties/quick
+  metadata; browser `buildPrePassOnce`/`buildPrePassStreaming` with
+  incremental job emission), but they only span-stash — all semantics resolve
+  in the shared module.
+
+Geometry/styling fixes belong in those two modules; re-inlining logic in
+`processor.rs` or `gpu_meshes.rs` re-creates the historic both-sides drift
+(#858, #913, #957, #961 each had to be fixed twice before the unification).
+
+The per-representation processing below is shared by construction:
 
 ```mermaid
 flowchart TB
@@ -406,51 +433,30 @@ graph LR
 | BALANCED | 16 | Medium | Default |
 | HIGH | 32 | More | Detailed viewing |
 
-## Instancing
+## Mapped Representations
 
-### MappedItem Processing
+IFC reuses geometry via `IfcMappedItem` (a source `IfcRepresentationMap` plus a
+per-instance placement transform). The engine **expands** each mapped item into
+its own tessellated mesh — the source geometry is tessellated once and the
+result is transformed per placement. There is no GPU-instancing path: the
+renderer instead groups the resulting meshes by colour into a small number of
+batched draw calls (see the rendering guide), which keeps draw-call counts low
+without a separate instance buffer.
 
 ```mermaid
 flowchart TB
     subgraph Definition["Mapped Representation"]
-        Source["Source Geometry"]
-        Transform["Transform Matrix"]
-    end
-
-    subgraph Detection["Instance Detection"]
-        Hash["Hash source ID"]
-        Lookup["Lookup in cache"]
+        Source["Source Geometry (IfcRepresentationMap)"]
+        Transform["Per-instance placement transform"]
     end
 
     subgraph Output["Output"]
-        Reuse["Reuse existing mesh"]
-        Transforms["Instance transforms[]"]
+        Mesh["Tessellated mesh (transform applied)"]
+        Batch["Renderer batches by colour"]
     end
 
-    Definition --> Detection
-    Detection -->|"Cache hit"| Reuse
-    Detection -->|"Cache miss"| Source
-    Source --> Reuse
-    Reuse --> Transforms
-```
-
-### Instance Data Structure
-
-```typescript
-interface InstancedMesh {
-  baseMesh: Mesh;
-  transforms: Matrix4[];
-  expressIds: number[];
-}
-
-// GPU instancing data
-interface InstanceData {
-  positions: Float32Array;    // Shared geometry
-  normals: Float32Array;
-  indices: Uint32Array;
-  instanceMatrices: Float32Array;  // Per-instance transforms
-  instanceColors: Float32Array;    // Per-instance colors
-}
+    Definition --> Mesh
+    Mesh --> Batch
 ```
 
 ## Streaming Pipeline
@@ -498,6 +504,45 @@ async function processGeometryBatches(
   }
 }
 ```
+
+## CSG Kernel
+
+ONE kernel: the in-tree **pure-Rust exact mesh-arrangement kernel**
+(`rust/geometry/src/kernel/`), on every target — native (server, CLI, SDK)
+and `wasm32-unknown-unknown` (viewer) alike. The kernel architecture
+(exact predicate cascade, conforming arrangement, winding classification,
+deterministic output ordering) is documented in the module docs under
+`rust/geometry/src/kernel/`.
+
+Key properties:
+
+- **Exact**: every in/out and on-plane decision routes through exact
+  geometric predicates (Shewchuk adaptive floats escalating to exact
+  rational arithmetic), so coplanar faces, shared seams and
+  flush-cap cuts are decided correctly, not by epsilon.
+- **Platform-deterministic**: identical output bytes on x86_64, aarch64
+  and wasm32 (pinned by the determinism manifests in
+  `rust/geometry/tests/`).
+- **No operand cap**: arbitrary operand sizes; cost is bounded by the
+  pre-arrangement complexity budget in the void router rather than a
+  hard polygon cap.
+- **N-ary union**: `kernel::mesh_bridge::union_many` unions all cutter
+  prisms in ONE arrangement (issue #960 segmented-roof seams).
+- **Failure surface**: on any kernel failure the host mesh is returned
+  un-cut and a structured `BoolFailure` record is emitted (drainable via
+  `GeometryRouter::take_csg_failures`). The regression gates assert
+  `total_failures == 0` on `AC20-FZK-Haus.ifc`,
+  `C20-Institute-Var-2.ifc` and `AC-20-Smiley-West-10-Bldg.ifc`.
+
+History (June 2026): two earlier kernels — the legacy BSP port of
+csg.js (`bsp_csg.rs`, 128-polygon operand cap, server/wasm default) and
+the Manifold C++ kernel (`manifold_kernel.rs` + `manifold-csg-sys`,
+viewer/native feature) — were deleted in the kernel consolidation
+once the pure-Rust kernel reached parity. With them went the whole
+C++ cross-toolchain (cmake, LLVM-20/libc++, emsdk on Vercel) and the
+`manifold-csg`/`manifold-csg-wasm-uu` Cargo features; the geometry crate
+builds with `default = []` everywhere. There is no kernel selection —
+build-time or runtime.
 
 ## Performance Metrics
 

@@ -99,6 +99,41 @@ pub fn get_legacy_entity_info(entity_name: &str) -> Option<LegacyEntityInfo> {
             has_geometry: false,
         }),
 
+        // IFC2x3 names that have no IFC4x3 enum variant. They map to the
+        // closest modern equivalent; both carry geometry.
+        "IFCEQUIPMENTELEMENT" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcDistributionElement,
+            has_geometry: true,
+        }),
+        "IFCELECTRICALDISTRIBUTIONPOINT" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcDistributionElement,
+            has_geometry: true,
+        }),
+
+        // === IFC4.3 stratum subtypes (issue #860) ===
+        //
+        // The schema enum exposes the abstract base `IfcGeotechnicalStratum`
+        // but not the three concrete leaves (`IfcSolidStratum`,
+        // `IfcVoidStratum`, `IfcWaterStratum`). Without these, infrastructure
+        // models with terrain / soil layers (e.g. the user's UT_Tin_in_MGA_56
+        // fixture) come back as `IfcType::Unknown(...)` and
+        // `has_geometry_by_name` returns false — the geometry pipeline skips
+        // them silently. Map each subtype to the base so its `Body`
+        // representation (typically `IfcTriangulatedFaceSet`) is processed by
+        // the same code path as any other geotechnical product.
+        "IFCSOLIDSTRATUM" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcGeotechnicalStratum,
+            has_geometry: true,
+        }),
+        "IFCVOIDSTRATUM" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcGeotechnicalStratum,
+            has_geometry: true,
+        }),
+        "IFCWATERSTRATUM" => Some(LegacyEntityInfo {
+            base_type: IfcType::IfcGeotechnicalStratum,
+            has_geometry: true,
+        }),
+
         _ => None,
     }
 }

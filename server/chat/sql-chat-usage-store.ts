@@ -21,7 +21,7 @@ interface UsageRow {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const DB_TIMEOUT_MS = 8_000;
+const DB_TIMEOUT_MS = 15_000;
 
 class UsageStoreTimeoutError extends Error {
   constructor(operation: string) {
@@ -61,18 +61,6 @@ function getNextCycleResetFromAnchor(anchorAt: number, nowMs: number = Date.now(
   return next.getTime();
 }
 
-function buildCreditSnapshot(config: ChatConfig, row: UsageRow): UsageSnapshot {
-  const used = Math.max(0, Math.round(row.credits_used ?? 0));
-  const resetAt = Math.ceil((row.reset_at ?? Date.now()) / 1000);
-  return {
-    type: 'credits',
-    used,
-    limit: config.proMonthlyCredits,
-    pct: Math.min(100, Math.round((used / config.proMonthlyCredits) * 100)),
-    resetAt,
-  };
-}
-
 function buildFreeSnapshot(config: ChatConfig, row: UsageRow): UsageSnapshot {
   const used = Math.max(0, row.free_requests_used ?? 0);
   const resetAt = Math.ceil((row.free_reset_at ?? (Date.now() + DAY_MS)) / 1000);
@@ -96,99 +84,57 @@ export class SqlChatUsageStore implements ChatUsageStore {
     this.readyPromise = this.bootstrapSchema();
   }
 
-  async getUsageSnapshot(userId: string, tier: UsageTier): Promise<UsageSnapshot> {
+  async getUsageSnapshot(userId: string, _tier: UsageTier): Promise<UsageSnapshot> {
     const row = await this.loadNormalizedRow(userId);
-    return tier === 'pro'
-      ? buildCreditSnapshot(this.config, row)
-      : buildFreeSnapshot(this.config, row);
+    return buildFreeSnapshot(this.config, row);
   }
 
   async consumeFreeRequest(userId: string): Promise<UsageReservationResult> {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const row = await this.loadNormalizedRow(userId);
-      const snapshot = buildFreeSnapshot(this.config, row);
-      if (snapshot.used >= this.config.freeDailyLimit) {
-        return { allowed: false, snapshot };
-      }
-      const nextCount = (row.free_requests_used ?? 0) + 1;
-      const updated = await withTimeout(this.sql`
-        UPDATE llm_chat_usage
-        SET free_requests_used = ${nextCount},
-            updated_at = ${Date.now()}
-        WHERE user_id = ${userId}
-          AND free_requests_used = ${row.free_requests_used ?? 0}
-          AND free_reset_at = ${row.free_reset_at ?? 0}
-        RETURNING user_id, credits_used, billing_anchor_at, reset_at, free_requests_used, free_reset_at
-      ` as unknown as Promise<UsageRow[]>, 'consumeFreeRequest update');
-      if (updated[0]) {
-        return { allowed: true, snapshot: buildFreeSnapshot(this.config, updated[0]) };
-      }
-    }
+    // Normalize first so the daily reset is applied before the conditional debit.
+    await this.loadNormalizedRow(userId);
 
-    const snapshot = await this.getUsageSnapshot(userId, 'free');
-    return { allowed: snapshot.used < this.config.freeDailyLimit, snapshot };
-  }
-
-  async reserveProCredits(userId: string, credits: number): Promise<UsageReservationResult> {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const row = await this.loadNormalizedRow(userId);
-      const snapshot = buildCreditSnapshot(this.config, row);
-      if (snapshot.used + credits > this.config.proMonthlyCredits) {
-        return { allowed: false, snapshot };
-      }
-      const nextCredits = (row.credits_used ?? 0) + credits;
-      const updated = await withTimeout(this.sql`
-        UPDATE llm_chat_usage
-        SET credits_used = ${nextCredits},
-            updated_at = ${Date.now()}
-        WHERE user_id = ${userId}
-          AND credits_used = ${row.credits_used ?? 0}
-          AND reset_at = ${row.reset_at ?? 0}
-        RETURNING user_id, credits_used, billing_anchor_at, reset_at, free_requests_used, free_reset_at
-      ` as unknown as Promise<UsageRow[]>, 'reserveProCredits update');
-      if (updated[0]) {
-        return { allowed: true, snapshot: buildCreditSnapshot(this.config, updated[0]) };
-      }
-    }
-
-    const snapshot = await this.getUsageSnapshot(userId, 'pro');
-    return { allowed: snapshot.used + credits <= this.config.proMonthlyCredits, snapshot };
-  }
-
-  async releaseProCredits(userId: string, credits: number): Promise<void> {
-    await this.ensureReady();
-    await withTimeout(this.sql`
+    // Single atomic conditional increment: the admit decision and the debit are
+    // the same statement, so a row is returned iff the request was both allowed
+    // and consumed. This removes the CAS retry loop and the non-consuming
+    // fallback path that could grant a request without recording it.
+    const updated = await withTimeout(this.sql`
       UPDATE llm_chat_usage
-      SET credits_used = GREATEST(0, credits_used - ${credits}),
+      SET free_requests_used = free_requests_used + 1,
           updated_at = ${Date.now()}
       WHERE user_id = ${userId}
-    ` as Promise<unknown>, 'releaseProCredits');
+        AND free_requests_used < ${this.config.freeDailyLimit}
+      RETURNING user_id, credits_used, billing_anchor_at, reset_at, free_requests_used, free_reset_at
+    ` as unknown as Promise<UsageRow[]>, 'consumeFreeRequest update');
+
+    if (updated[0]) {
+      return { allowed: true, snapshot: buildFreeSnapshot(this.config, updated[0]) };
+    }
+
+    // Zero rows means the limit was already reached: deny without consuming.
+    const snapshot = await this.getUsageSnapshot(userId, 'free');
+    return { allowed: false, snapshot };
   }
 
   private async bootstrapSchema(): Promise<void> {
+    // Single round-trip schema bootstrap. Combining the CREATE + ALTERs into one
+    // DO block keeps cold starts within the per-query timeout budget on Neon.
     await withTimeout(this.sql`
-      CREATE TABLE IF NOT EXISTS llm_chat_usage (
-        user_id TEXT PRIMARY KEY,
-        credits_used DOUBLE PRECISION NOT NULL DEFAULT 0,
-        billing_anchor_at BIGINT NOT NULL DEFAULT 0,
-        reset_at BIGINT NOT NULL DEFAULT 0,
-        free_requests_used INTEGER NOT NULL DEFAULT 0,
-        free_reset_at BIGINT NOT NULL DEFAULT 0,
-        updated_at BIGINT NOT NULL DEFAULT 0
-      )
-    ` as Promise<unknown>, 'bootstrap create table');
-    await withTimeout(this.sql`
-      ALTER TABLE llm_chat_usage
-      ADD COLUMN IF NOT EXISTS billing_anchor_at BIGINT
-    ` as Promise<unknown>, 'bootstrap billing_anchor_at');
-    await withTimeout(this.sql`
-      ALTER TABLE llm_chat_usage
-      ADD COLUMN IF NOT EXISTS free_requests_used INTEGER NOT NULL DEFAULT 0
-    ` as Promise<unknown>, 'bootstrap free_requests_used');
-    await withTimeout(this.sql`
-      ALTER TABLE llm_chat_usage
-      ADD COLUMN IF NOT EXISTS free_reset_at BIGINT NOT NULL DEFAULT 0
-    ` as Promise<unknown>, 'bootstrap free_reset_at');
+      DO $$
+      BEGIN
+        CREATE TABLE IF NOT EXISTS llm_chat_usage (
+          user_id TEXT PRIMARY KEY,
+          credits_used DOUBLE PRECISION NOT NULL DEFAULT 0,
+          billing_anchor_at BIGINT NOT NULL DEFAULT 0,
+          reset_at BIGINT NOT NULL DEFAULT 0,
+          free_requests_used INTEGER NOT NULL DEFAULT 0,
+          free_reset_at BIGINT NOT NULL DEFAULT 0,
+          updated_at BIGINT NOT NULL DEFAULT 0
+        );
+        ALTER TABLE llm_chat_usage ADD COLUMN IF NOT EXISTS billing_anchor_at BIGINT;
+        ALTER TABLE llm_chat_usage ADD COLUMN IF NOT EXISTS free_requests_used INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE llm_chat_usage ADD COLUMN IF NOT EXISTS free_reset_at BIGINT NOT NULL DEFAULT 0;
+      END $$;
+    ` as Promise<unknown>, 'bootstrap schema');
   }
 
   private async ensureReady(): Promise<void> {
@@ -202,7 +148,9 @@ export class SqlChatUsageStore implements ChatUsageStore {
     const initialResetAt = getNextCycleResetFromAnchor(initialAnchorAt, now);
     const initialFreeResetAt = now + DAY_MS;
 
-    await withTimeout(this.sql`
+    // Single round-trip upsert: insert the default row if missing, otherwise
+    // no-op update so RETURNING always yields the current row.
+    const rows = await withTimeout(this.sql`
       INSERT INTO llm_chat_usage (
         user_id,
         credits_used,
@@ -221,15 +169,9 @@ export class SqlChatUsageStore implements ChatUsageStore {
         ${initialFreeResetAt},
         ${now}
       )
-      ON CONFLICT (user_id) DO NOTHING
-    ` as Promise<unknown>, 'loadNormalizedRow insert');
-
-    const rows = await withTimeout(this.sql`
-      SELECT user_id, credits_used, billing_anchor_at, reset_at, free_requests_used, free_reset_at
-      FROM llm_chat_usage
-      WHERE user_id = ${userId}
-      LIMIT 1
-    ` as unknown as Promise<UsageRow[]>, 'loadNormalizedRow select');
+      ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+      RETURNING user_id, credits_used, billing_anchor_at, reset_at, free_requests_used, free_reset_at
+    ` as unknown as Promise<UsageRow[]>, 'loadNormalizedRow upsert');
     const row = rows[0];
     if (!row) {
       throw new Error('Failed to load llm_chat_usage row');

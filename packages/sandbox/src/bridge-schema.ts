@@ -24,9 +24,12 @@ import { buildModelNamespace } from './bridge-model.js';
 import { buildQueryNamespace } from './bridge-query.js';
 import { buildViewerNamespace } from './bridge-viewer.js';
 import { buildMutateNamespace } from './bridge-mutate.js';
+import { buildStoreNamespace } from './bridge-store.js';
 import { buildCreateMethods } from './bridge-create.js';
 import { buildFilesNamespace } from './bridge-files.js';
 import { buildExportNamespace } from './bridge-export.js';
+import { buildScheduleNamespace } from './bridge-schedule.js';
+import { buildClashNamespace } from './bridge-clash.js';
 
 // ============================================================================
 // Schema Types
@@ -141,6 +144,9 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
   // ── bim.mutate ─────────────────────────────────────────────
   buildMutateNamespace(),
 
+  // ── bim.store ──────────────────────────────────────────────
+  buildStoreNamespace(),
+
   // ── bim.lens ───────────────────────────────────────────────
   {
     name: 'lens',
@@ -173,6 +179,12 @@ export const NAMESPACE_SCHEMAS: NamespaceSchema[] = [
 
   // ── bim.files ──────────────────────────────────────────────
   buildFilesNamespace(),
+
+  // ── bim.schedule ───────────────────────────────────────────
+  buildScheduleNamespace(),
+
+  // ── bim.clash ──────────────────────────────────────────────
+  buildClashNamespace(),
 
   // ── bim.export ─────────────────────────────────────────────
   buildExportNamespace(),
@@ -210,14 +222,21 @@ function buildNamespace(
 
   for (const method of schema.methods) {
     const fn = vm.newFunction(method.name, (...handles: QuickJSHandle[]) => {
-      // Unmarshal arguments
-      const nativeArgs = unmarshalArgs(vm, handles, method.args);
-
-      // Call the SDK
-      const result = method.call(sdk, nativeArgs, context);
-
-      // Marshal return value
-      return marshalReturn(vm, result, method.returns);
+      // Host-side errors (capability denials, SDK exceptions, type
+      // errors) MUST be re-thrown as a plain `Error` with a string
+      // message. Throwing a custom Error subclass — or any non-plain
+      // object — across the QuickJS native-callback boundary leaves
+      // the realm in a corrupt state: a subsequent handle access
+      // throws "Lifetime not alive". Normalising to a plain Error
+      // here keeps the failure a clean, catchable script exception.
+      try {
+        const nativeArgs = unmarshalArgs(vm, handles, method.args);
+        const result = method.call(sdk, nativeArgs, context);
+        return marshalReturn(vm, result, method.returns);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`bim.${schema.name}.${method.name}: ${msg}`);
+      }
     });
     vm.setProp(nsHandle, method.name, fn);
     fn.dispose();
@@ -284,32 +303,58 @@ function marshalReturn(vm: QuickJSContext, value: unknown, type: ReturnType): Qu
   }
 }
 
+/**
+ * Cycle/depth limits for `marshalValue` — protect the host renderer from a
+ * sandboxed script that hands back a cyclic or pathologically deep object
+ * graph. Values past the depth limit serialise to `null`.
+ */
+const MARSHAL_MAX_DEPTH = 64;
+
 /** Recursively convert a native JS value to a QuickJS handle */
 export function marshalValue(vm: QuickJSContext, value: unknown): QuickJSHandle {
+  return marshalValueWithGuard(vm, value, 0, new WeakSet());
+}
+
+function marshalValueWithGuard(
+  vm: QuickJSContext,
+  value: unknown,
+  depth: number,
+  stack: WeakSet<object>,
+): QuickJSHandle {
   if (value === null || value === undefined) return vm.null;
   if (typeof value === 'string') return vm.newString(value);
   if (typeof value === 'number') return vm.newNumber(value);
   if (typeof value === 'boolean') return value ? vm.true : vm.false;
 
-  if (Array.isArray(value)) {
-    const arr = vm.newArray();
-    for (let i = 0; i < value.length; i++) {
-      const item = marshalValue(vm, value[i]);
-      vm.setProp(arr, i, item);
-      item.dispose();
-    }
-    return arr;
-  }
+  if (depth >= MARSHAL_MAX_DEPTH) return vm.null;
+  if (typeof value !== 'object') return vm.null;
 
-  if (typeof value === 'object') {
-    const obj = vm.newObject();
-    for (const [k, v] of Object.entries(value)) {
-      const handle = marshalValue(vm, v);
-      vm.setProp(obj, k, handle);
+  // Cycle guard: only objects on the *current ancestor chain* count as a
+  // cycle. Removing on exit means an acyclic graph that legitimately
+  // shares a sub-object across siblings (e.g. `{ a: shared, b: shared }`)
+  // still serialises both occurrences fully.
+  const obj = value as object;
+  if (stack.has(obj)) return vm.null;
+  stack.add(obj);
+  try {
+    if (Array.isArray(value)) {
+      const arr = vm.newArray();
+      for (let i = 0; i < value.length; i++) {
+        const item = marshalValueWithGuard(vm, value[i], depth + 1, stack);
+        vm.setProp(arr, i, item);
+        item.dispose();
+      }
+      return arr;
+    }
+
+    const out = vm.newObject();
+    for (const [k, v] of Object.entries(obj)) {
+      const handle = marshalValueWithGuard(vm, v, depth + 1, stack);
+      vm.setProp(out, k, handle);
       handle.dispose();
     }
-    return obj;
+    return out;
+  } finally {
+    stack.delete(obj);
   }
-
-  return vm.null;
 }

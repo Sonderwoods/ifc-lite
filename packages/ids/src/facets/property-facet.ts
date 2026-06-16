@@ -13,9 +13,145 @@ import type {
 } from '../types.js';
 import type { FacetCheckResult } from './index.js';
 import { matchConstraint, formatConstraint, type MatchOptions } from '../constraints/index.js';
+import { ifcMeasureToXsdTypes, literalCastsUnderAnyType } from '../constraints/xsd-cast.js';
 
 /** IFC data type names (IFCLABEL, IFCREAL, etc.) are case-insensitive */
 const DATATYPE_OPTS: MatchOptions = { caseInsensitive: true };
+
+/**
+ * Failure-detail string caches. During applicability filtering every
+ * non-matching entity takes a failure path, and these name lists were
+ * re-joined per specification — millions of identical joins per run.
+ * The validator's cached accessor returns stable array instances per
+ * entity, so a WeakMap keyed on them holds exactly one string each.
+ */
+const PSET_NAMES_CACHE = new WeakMap<PropertySetInfo[], string>();
+const PROP_NAMES_CACHE = new WeakMap<PropertySetInfo, string>();
+const QUALIFIED_PROP_NAMES_CACHE = new WeakMap<PropertySetInfo, string>();
+
+function availablePsetNames(propertySets: PropertySetInfo[]): string {
+  let names = PSET_NAMES_CACHE.get(propertySets);
+  if (names === undefined) {
+    names = propertySets.map((p) => p.name).join(', ');
+    PSET_NAMES_CACHE.set(propertySets, names);
+  }
+  return names;
+}
+
+function availablePropertyNames(pset: PropertySetInfo): string {
+  let names = PROP_NAMES_CACHE.get(pset);
+  if (names === undefined) {
+    names = pset.properties.map((p) => p.name).join(', ');
+    PROP_NAMES_CACHE.set(pset, names);
+  }
+  return names;
+}
+
+function qualifiedPropertyNames(pset: PropertySetInfo): string {
+  let names = QUALIFIED_PROP_NAMES_CACHE.get(pset);
+  if (names === undefined) {
+    names = pset.properties.map((p) => `${pset.name}.${p.name}`).join(', ');
+    QUALIFIED_PROP_NAMES_CACHE.set(pset, names);
+  }
+  return names;
+}
+
+/**
+ * Per-literal XSD-cast gate cache. `literalCastsUnderAnyType` parses the
+ * IDS literal against the XSD types of the stored measure on every
+ * check; the outcome depends only on (literal, measure name).
+ */
+const CAST_GATE_CACHE = new WeakMap<object, Map<string, boolean>>();
+
+function passesCastGate(
+  value: { value: string },
+  dataType: string | undefined
+): boolean {
+  let byType = CAST_GATE_CACHE.get(value);
+  if (!byType) {
+    byType = new Map();
+    CAST_GATE_CACHE.set(value, byType);
+  }
+  const key = dataType ?? '';
+  let passes = byType.get(key);
+  if (passes === undefined) {
+    const xsdTypes = ifcMeasureToXsdTypes(dataType);
+    passes = xsdTypes.length === 0 || literalCastsUnderAnyType(value.value, xsdTypes);
+    byType.set(key, passes);
+  }
+  return passes;
+}
+
+/**
+ * Diagnostics-free verdict for a single property — the exact `passed`
+ * boolean `checkSingleProperty` would compute.
+ */
+function singlePropertyPasses(
+  facet: IDSPropertyFacet,
+  prop: PropertySetInfo['properties'][number]
+): boolean {
+  // "No value" fails any check, including existence-only ones.
+  if (prop.value === null || prop.value === undefined || prop.value === '') {
+    return false;
+  }
+
+  if (facet.dataType && prop.dataType) {
+    if (!matchConstraint(facet.dataType, prop.dataType, DATATYPE_OPTS)) {
+      return false;
+    }
+  }
+
+  if (facet.value) {
+    if (facet.value.type === 'simpleValue' && !passesCastGate(facet.value, prop.dataType)) {
+      return false;
+    }
+    const candidateValues =
+      prop.values && prop.values.length > 0 ? prop.values : [prop.value];
+    return candidateValues.some((v) => matchConstraint(facet.value!, v));
+  }
+
+  return true;
+}
+
+/**
+ * Diagnostics-free verdict for a property facet — the exact `passed`
+ * boolean `checkPropertyFacet` would compute, with zero failure-object
+ * or display-string allocation. Used by applicability filtering, which
+ * evaluates this for every candidate entity per specification and
+ * consumes ONLY the boolean.
+ *
+ * Pass/fail semantics mirrored from `checkPropertyFacet`: at least one
+ * pset must match the propertySet constraint, and EVERY matching pset
+ * must contain at least one baseName-matching property with ALL
+ * matching properties satisfying the value/dataType constraints. Any
+ * semantic change there MUST be mirrored here; the differential test in
+ * validation-scale.test.ts pins the equivalence.
+ */
+export function propertyFacetPasses(
+  facet: IDSPropertyFacet,
+  expressId: number,
+  accessor: IFCDataAccessor
+): boolean {
+  const propertySets = accessor.getPropertySets(expressId);
+  if (propertySets.length === 0) return false;
+
+  let anyMatchingPset = false;
+
+  for (const pset of propertySets) {
+    if (!matchConstraint(facet.propertySet, pset.name)) continue;
+    anyMatchingPset = true;
+
+    let anyMatchingProp = false;
+    for (const prop of pset.properties) {
+      if (!matchConstraint(facet.baseName, prop.name)) continue;
+      anyMatchingProp = true;
+      if (!singlePropertyPasses(facet, prop)) return false;
+    }
+    if (!anyMatchingProp) return false;
+  }
+
+  return anyMatchingPset;
+}
 
 /**
  * Check if an entity matches a property facet
@@ -46,7 +182,7 @@ export function checkPropertyFacet(
   );
 
   if (matchingPsets.length === 0) {
-    const availablePsets = propertySets.map((p) => p.name).join(', ');
+    const availablePsets = availablePsetNames(propertySets);
     return {
       passed: false,
       actualValue: availablePsets || '(none)',
@@ -61,33 +197,52 @@ export function checkPropertyFacet(
     };
   }
 
-  // Check each matching property set for the property
-  // Track the most specific failure so we can return it instead of a generic PROPERTY_MISSING
-  let lastFailure: FacetCheckResult | undefined;
+  // Per IDS spec, when the property-set baseName matches multiple sets
+  // (pattern / enumeration cases), ALL of them must satisfy the
+  // requirement. A single-set match collapses to the same iteration
+  // with one element, so the semantics are uniform.
+  let lastPass: FacetCheckResult | undefined;
+  let firstFailure: FacetCheckResult | undefined;
 
   for (const pset of matchingPsets) {
     const result = checkPropertyInPset(facet, pset);
     if (result.passed) {
-      return result;
+      lastPass = result;
+      continue;
     }
-    // Keep the most specific failure (value/datatype mismatch over property-missing)
-    if (
-      !lastFailure ||
-      (result.failure?.type !== 'PROPERTY_MISSING' && lastFailure.failure?.type === 'PROPERTY_MISSING')
+    if (!firstFailure) {
+      firstFailure = result;
+    } else if (
+      firstFailure.failure?.type === 'PROPERTY_MISSING' &&
+      result.failure?.type !== 'PROPERTY_MISSING'
     ) {
-      lastFailure = result;
+      // Prefer the more specific failure for reporting.
+      firstFailure = result;
     }
   }
 
-  // Return the most specific failure if we have one (e.g., value or datatype mismatch)
-  if (lastFailure && lastFailure.failure?.type !== 'PROPERTY_MISSING') {
-    return lastFailure;
+  if (firstFailure) {
+    if (firstFailure.failure?.type !== 'PROPERTY_MISSING') {
+      return firstFailure;
+    }
+    // Only PROPERTY_MISSING failures with no passing pset → fall
+    // through to the generic missing-property error below so the
+    // available-property list reflects every pset we checked.
+    if (!lastPass) {
+      // proceed to PROPERTY_MISSING fallthrough below
+    } else {
+      // Some psets passed and some are missing the property —
+      // iteration must report the missing-pset failure.
+      return firstFailure;
+    }
+  } else if (lastPass) {
+    return lastPass;
   }
 
   // Property not found in any matching pset
   const psetNames = matchingPsets.map((p) => p.name).join(', ');
   const availableProps = matchingPsets
-    .flatMap((pset) => pset.properties.map((p) => `${pset.name}.${p.name}`))
+    .map((pset) => qualifiedPropertyNames(pset))
     .join(', ');
 
   return {
@@ -129,31 +284,38 @@ function checkPropertyInPset(
         expected: formatConstraint(facet.baseName),
         context: {
           propertySet: pset.name,
-          availableProperties: pset.properties.map((p) => p.name).join(', '),
+          availableProperties: availablePropertyNames(pset),
         },
       },
     };
   }
 
-  // Check each matching property — try all, return first pass, track best failure
-  let bestFailure: FacetCheckResult | undefined;
+  // Per IDS spec: when the baseName constraint matches multiple
+  // properties (pattern / enumeration cases), ALL of them must satisfy
+  // the value constraint — not just one. Iterate every matching
+  // property and only report `pass` if every check passes.
+  let lastPass: FacetCheckResult | undefined;
+  let firstFailure: FacetCheckResult | undefined;
 
   for (const prop of matchingProps) {
     const result = checkSingleProperty(facet, pset, prop);
     if (result.passed) {
-      return result;
+      lastPass = result;
+      continue;
     }
-
-    // Prefer value/bounds/datatype failures over generic missing
-    if (
-      !bestFailure ||
-      (result.failure?.type !== 'PROPERTY_MISSING' && bestFailure.failure?.type === 'PROPERTY_MISSING')
+    if (!firstFailure) {
+      firstFailure = result;
+    } else if (
+      firstFailure.failure?.type === 'PROPERTY_MISSING' &&
+      result.failure?.type !== 'PROPERTY_MISSING'
     ) {
-      bestFailure = result;
+      // Prefer the more specific failure when reporting back.
+      firstFailure = result;
     }
   }
 
-  return bestFailure!;
+  if (firstFailure) return firstFailure;
+  return lastPass!;
 }
 
 /**
@@ -164,8 +326,35 @@ function checkSingleProperty(
   pset: PropertySetInfo,
   prop: PropertySetInfo['properties'][number]
 ): FacetCheckResult {
-  // Check data type if specified (IFC type names are case-insensitive)
-  if (facet.dataType) {
+  // Per IDS spec, a property whose stored value is "no value" (null,
+  // undefined, empty string, or IfcLogical UNKNOWN) fails ANY check —
+  // including a name-only existence check. Detect those up front so
+  // the rest of the function can assume `prop.value` is meaningful.
+  if (
+    prop.value === null ||
+    prop.value === undefined ||
+    prop.value === ''
+  ) {
+    return {
+      passed: false,
+      actualValue: '(empty)',
+      expectedValue: facet.value
+        ? formatConstraint(facet.value)
+        : `property "${pset.name}.${prop.name}" must have a value`,
+      failure: {
+        type: 'PROPERTY_VALUE_MISMATCH',
+        field: `${pset.name}.${prop.name}`,
+        actual: '(empty)',
+        expected: facet.value ? formatConstraint(facet.value) : 'a non-empty value',
+      },
+    };
+  }
+  // Check data type if specified (IFC type names are case-insensitive).
+  // Skip the gate when the property carries no `dataType` AT ALL — for
+  // multi-typed table values (`IfcPropertyTableValue`) we deliberately
+  // omit a single representative type so the value match against the
+  // expanded `values[]` array can still satisfy the requirement.
+  if (facet.dataType && prop.dataType) {
     if (!matchConstraint(facet.dataType, prop.dataType, DATATYPE_OPTS)) {
       return {
         passed: false,
@@ -185,7 +374,14 @@ function checkSingleProperty(
   if (facet.value) {
     const propValue = prop.value;
 
-    if (propValue === null || propValue === undefined) {
+    if (
+      propValue === null ||
+      propValue === undefined ||
+      // Per IDS spec: empty strings and IfcLogical UNKNOWN values are
+      // treated as "no value" — they fail any value check, including
+      // a name-only check that the property exists with a value.
+      propValue === ''
+    ) {
       return {
         passed: false,
         actualValue: '(empty)',
@@ -199,20 +395,61 @@ function checkSingleProperty(
       };
     }
 
-    if (!matchConstraint(facet.value, propValue)) {
+    // Strict XSD-cast gate: the IDS literal MUST cast successfully
+    // under at least one of the IFC measure's XSD types. Mirrors the
+    // attribute facet's check — an `IFCINTEGER` slot rejects `42.0`,
+    // an `IFCBOOLEAN` slot rejects numeric literals, etc. The shared
+    // `ifcMeasureToXsdTypes` mapping turns the parser-side measure
+    // name into the XSD types the cast helper understands.
+    if (facet.value.type === 'simpleValue') {
+      const xsdTypes = ifcMeasureToXsdTypes(prop.dataType);
+      if (
+        xsdTypes.length > 0 &&
+        !literalCastsUnderAnyType(facet.value.value, xsdTypes)
+      ) {
+        return {
+          passed: false,
+          actualValue: String(propValue),
+          expectedValue: formatConstraint(facet.value),
+          failure: {
+            type: 'PROPERTY_VALUE_MISMATCH',
+            field: `${pset.name}.${prop.name}`,
+            actual: String(propValue),
+            expected: formatConstraint(facet.value),
+          },
+        };
+      }
+    }
+
+    // Multi-valued IFC properties (IfcPropertyEnumeratedValue,
+    // IfcPropertyListValue) pass if ANY individual value satisfies the
+    // constraint, per upstream ifctester semantics.
+    const candidateValues =
+      prop.values && prop.values.length > 0 ? prop.values : [propValue];
+
+    const anyMatch = candidateValues.some((v) =>
+      matchConstraint(facet.value!, v)
+    );
+
+    if (!anyMatch) {
       const failureType =
         facet.value.type === 'bounds'
           ? 'PROPERTY_OUT_OF_BOUNDS'
           : 'PROPERTY_VALUE_MISMATCH';
 
+      const actualDisplay =
+        prop.values && prop.values.length > 0
+          ? prop.values.join(', ')
+          : String(propValue);
+
       return {
         passed: false,
-        actualValue: String(propValue),
+        actualValue: actualDisplay,
         expectedValue: formatConstraint(facet.value),
         failure: {
           type: failureType,
           field: `${pset.name}.${prop.name}`,
-          actual: String(propValue),
+          actual: actualDisplay,
           expected: formatConstraint(facet.value),
         },
       };

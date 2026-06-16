@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, normalizePath } from 'vite';
 import react from '@vitejs/plugin-react';
 import wasm from 'vite-plugin-wasm';
 import topLevelAwait from 'vite-plugin-top-level-await';
@@ -223,12 +223,16 @@ export default defineConfig({
     (() => {
       const cesiumPkg = path.dirname(require.resolve('cesium/package.json'));
       const cesiumBuild = path.join(cesiumPkg, 'Build', 'Cesium');
+      // vite-plugin-static-copy globs `src` with tinyglobby, which treats `\` as
+      // an escape char — so the raw Windows paths from path.join match nothing
+      // ("No file was found to copy"). normalizePath -> forward slashes fixes it
+      // cross-platform (no-op on POSIX).
       return viteStaticCopy({
         targets: [
-          { src: path.join(cesiumBuild, 'Workers'), dest: 'cesium' },
-          { src: path.join(cesiumBuild, 'ThirdParty'), dest: 'cesium' },
-          { src: path.join(cesiumBuild, 'Assets'), dest: 'cesium' },
-          { src: path.join(cesiumBuild, 'Widgets'), dest: 'cesium' },
+          { src: normalizePath(path.join(cesiumBuild, 'Workers')), dest: 'cesium' },
+          { src: normalizePath(path.join(cesiumBuild, 'ThirdParty')), dest: 'cesium' },
+          { src: normalizePath(path.join(cesiumBuild, 'Assets')), dest: 'cesium' },
+          { src: normalizePath(path.join(cesiumBuild, 'Widgets')), dest: 'cesium' },
         ],
       });
     })(),
@@ -243,6 +247,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      '@ifc-lite/parser/browser': path.resolve(__dirname, '../../packages/parser/src/browser.ts'),
       '@ifc-lite/parser': path.resolve(__dirname, '../../packages/parser/src'),
       '@ifc-lite/geometry': path.resolve(__dirname, '../../packages/geometry/src'),
       '@ifc-lite/renderer': path.resolve(__dirname, '../../packages/renderer/src'),
@@ -253,6 +258,7 @@ export default defineConfig({
       '@ifc-lite/export': path.resolve(__dirname, '../../packages/export/src'),
       '@ifc-lite/cache': path.resolve(__dirname, '../../packages/cache/src'),
       '@ifc-lite/ifcx': path.resolve(__dirname, '../../packages/ifcx/src'),
+      '@ifc-lite/pointcloud': path.resolve(__dirname, '../../packages/pointcloud/src'),
       '@ifc-lite/wasm': path.resolve(__dirname, '../../packages/wasm/pkg/ifc-lite.js'),
       '@ifc-lite/sdk': path.resolve(__dirname, '../../packages/sdk/src'),
       '@ifc-lite/create': path.resolve(__dirname, '../../packages/create/src'),
@@ -265,9 +271,6 @@ export default defineConfig({
       '@ifc-lite/encoding': path.resolve(__dirname, '../../packages/encoding/src'),
       '@ifc-lite/ids': path.resolve(__dirname, '../../packages/ids/src'),
       '@ifc-lite/lists': path.resolve(__dirname, '../../packages/lists/src'),
-      '@tauri-apps/api/core': path.resolve(__dirname, './src/services/tauri-core-stub.ts'),
-      '@tauri-apps/plugin-dialog': path.resolve(__dirname, './src/services/tauri-dialog-stub.ts'),
-      '@tauri-apps/plugin-fs': path.resolve(__dirname, './src/services/tauri-fs-stub.ts'),
     },
   },
   server: {
@@ -299,6 +302,12 @@ export default defineConfig({
     target: 'esnext',
     chunkSizeWarningLimit: 6000,
     rollupOptions: {
+      // @ifc-lite/geometry's NativeBridge does a dynamic `import('@tauri-apps/api/event')`
+      // (under isTauri(), never reached on web). Rollup still resolves it
+      // statically, so externalize it to prevent a build failure. ifc-lite no
+      // longer ships a desktop app; downstream desktop builders supply
+      // @tauri-apps in their own host layer.
+      external: ['@tauri-apps/api/event'],
       output: {
         manualChunks(id) {
           if (id.includes('/packages/sandbox/')) return 'sandbox';
@@ -312,6 +321,12 @@ export default defineConfig({
           if (id.includes('/node_modules/apache-arrow/')) return 'arrow';
           if (id.includes('/node_modules/parquet-wasm/')) return 'parquet';
           if (id.includes('/node_modules/cesium/')) return 'cesium';
+          // three.js + addons — only the /mcp landing imports them, keep
+          // the main viewer / pages off the hook.
+          if (
+            id.includes('/node_modules/three/') ||
+            id.includes('/node_modules/.pnpm/three@')
+          ) return 'three';
           return undefined;
         },
       },

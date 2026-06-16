@@ -28,8 +28,9 @@ import {
   Loader2,
   ArrowDown,
   Zap,
+  Wrench,
 } from 'lucide-react';
-import { SignInButton, SignedIn, SignedOut, UserButton } from '@clerk/clerk-react';
+import { PromoteToolDialog } from '@/components/extensions/PromoteToolDialog';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/toast';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -38,6 +39,7 @@ import { buildErrorFeedbackContent } from '@/store/slices/chatSlice';
 import { ChatMessageComponent } from './chat/ChatMessage';
 import { ModelSelector } from './chat/ModelSelector';
 import { fetchUsageSnapshot, streamChat, type StreamMessage, type TextContentPart, type ImageContentPart, type UsageInfo } from '@/lib/llm/stream-client';
+import { streamAnthropicChat, streamOpenAiChat } from '@/lib/llm/stream-direct';
 import { buildStreamMessagesForModel, filterAttachmentsForModel } from '@/lib/llm/message-capabilities';
 import { buildSystemPrompt } from '@/lib/llm/system-prompt';
 import { getModelContext, parseCSV } from '@/lib/llm/context-builder';
@@ -49,12 +51,20 @@ import type { ScriptDiagnostic } from '@/lib/llm/script-diagnostics';
 import { buildRepairSessionKey, getEscalatedRepairScope, pruneMessagesForRepair } from '@/lib/llm/repair-loop';
 import type { ChatMessage, ChatRepairRequest, FileAttachment } from '@/lib/llm/types';
 import { canUsePlainCodeBlockFallback, type ScriptMutationIntent } from '@/lib/llm/script-preservation';
-import { Image as ImageIcon } from 'lucide-react';
-import { isClerkConfigured } from '@/lib/llm/clerk-auth';
-import { buildDesktopUpgradeUrl, hasDesktopFeatureAccess } from '@/lib/desktop-product';
-import { navigateToPath } from '@/services/app-navigation';
+import { Check, Image as ImageIcon, KeyRound } from 'lucide-react';
 import { getModelById } from '@/lib/llm/models';
+import { resolveStreamRoute } from '@/lib/llm/byok-guard';
+import { getApiKeys, hasAnthropicKey, hasOpenaiKey, subscribeApiKeys } from '@/services/api-keys';
+import { ByokKeyModal } from './chat/ByokKeyModal';
+import { ByokStreamingPill } from './chat/ByokStreamingPill';
+import type { BYOKProvider } from '@/lib/llm/clipboard-detect';
 import { useSandbox } from '@/hooks/useSandbox';
+import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
+import {
+  classifyIntent,
+  packBundle,
+  validateBundleResponse,
+} from '@ifc-lite/extensions';
 
 // Environment variable for the proxy URL
 const PROXY_URL = import.meta.env.VITE_LLM_PROXY_URL as string || '/api/chat';
@@ -67,7 +77,6 @@ const EXAMPLE_PROMPTS = [
 ];
 
 const CONTINUE_PROMPT = 'Continue from exactly where your last response stopped. Do not repeat previously generated text.';
-const DEFAULT_PRO_MONTHLY_CREDIT_LIMIT = 1000;
 const USAGE_REFRESH_INTERVAL_MS = 15_000;
 const EST_CHARS_PER_TOKEN = 4;
 const IMAGE_TOKEN_COST_EST = 850;
@@ -80,9 +89,22 @@ const MAX_INLINE_IMAGE_DATA_URL_CHARS = 1_200_000;
 const MAX_ATTACHMENTS_PER_MESSAGE = 6;
 const MAX_TEXT_ATTACHMENT_BYTES = 512_000;
 const MAX_IMAGE_ATTACHMENT_BYTES = 8_000_000;
+/** Anthropic's PDF content-block limit is ~32 MB; keep our upload cap lower. */
+const MAX_PDF_ATTACHMENT_BYTES = 16_000_000;
 
 function createAttachmentId(): string {
   return crypto.randomUUID();
+}
+
+/** Convert an ArrayBuffer (binary file) to raw base64 — no data-URL prefix. */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+  }
+  return btoa(binary);
 }
 
 interface ChatSendOptions {
@@ -188,6 +210,68 @@ interface ChatPanelProps {
 }
 
 export function ChatPanel({ onClose }: ChatPanelProps) {
+  const extensionHost = useOptionalExtensionHost();
+  /** Most recent chat classification; surfaced in the status bar as authoring telemetry. */
+  const [authoringTelemetry, setAuthoringTelemetry] = useState<{
+    intent: 'authoring' | 'fork';
+    startedAt: number;
+  } | null>(null);
+  const setPendingAuthoredBundle = useViewerStore((s) => s.setPendingAuthoredBundle);
+  const setExtensionsPanelVisible = useViewerStore((s) => s.setExtensionsPanelVisible);
+  const setExtensionsRequestedView = useViewerStore((s) => s.setExtensionsRequestedView);
+  const setScriptPanelVisible = useViewerStore((s) => s.setScriptPanelVisible);
+  const chatToolReady = useViewerStore((s) => s.chatToolReady);
+  const setChatToolReady = useViewerStore((s) => s.setChatToolReady);
+  /**
+   * Local: the inline Promote-to-tool dialog (script path). `source`
+   * is snapshotted from the live editor when the dialog opens — the
+   * dialog is modal so the script can't change underneath it, and
+   * snapshotting avoids re-rendering ChatPanel on every keystroke.
+   */
+  const [promoteFromChat, setPromoteFromChat] = useState<{ open: boolean; source: string }>({
+    open: false,
+    source: '',
+  });
+  /** One-shot guard for the "use the Ideas panel" authoring hint toast. */
+  const authoringHintShownRef = useRef(false);
+
+  /**
+   * Try to parse an authoring response as an extension bundle. If it
+   * validates, pack it and surface a toast linking to the Extensions
+   * panel for the user to review and install. Failures stay silent —
+   * the regular chat flow already showed the response.
+   */
+  const handleAuthoringResponse = useCallback(
+    async (fullText: string): Promise<boolean> => {
+      try {
+        const result = validateBundleResponse(fullText);
+        if (!result.ok || !result.manifest || !result.parsed) return false;
+        // Assemble a Bundle from the parsed pieces, pack it, hand it
+        // to the Extensions panel.
+        const files = new Map<string, { path: string; bytes: Uint8Array; text?: string }>();
+        const encoder = new TextEncoder();
+        const manifestText = JSON.stringify(result.manifest, null, 2);
+        files.set('manifest.json', {
+          path: 'manifest.json',
+          bytes: encoder.encode(manifestText),
+          text: manifestText,
+        });
+        for (const [path, text] of Object.entries(result.parsed.files)) {
+          files.set(path, { path, bytes: encoder.encode(text), text });
+        }
+        const bytes = packBundle({ manifest: result.manifest, files });
+        setPendingAuthoredBundle(bytes);
+        // Drive the inline CTA card instead of relying on a toast the
+        // user scrolls past — the bundle is one click from installed.
+        setChatToolReady({ kind: 'bundle', name: result.manifest.name });
+        return true;
+      } catch (err) {
+        console.warn('[ChatPanel] authoring response parse failed:', err);
+        return false;
+      }
+    },
+    [setPendingAuthoredBundle, setChatToolReady],
+  );
   const messages = useViewerStore((s) => s.chatMessages);
   const status = useViewerStore((s) => s.chatStatus);
   const streamingContent = useViewerStore((s) => s.chatStreamingContent);
@@ -211,23 +295,47 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const consumePendingPrompt = useViewerStore((s) => s.consumeChatPendingPrompt);
   const pendingRepairRequest = useViewerStore((s) => s.chatPendingRepairRequest);
   const consumePendingRepairRequest = useViewerStore((s) => s.consumeChatPendingRepairRequest);
-  const authToken = useViewerStore((s) => s.chatAuthToken);
-  const hasPro = useViewerStore((s) => s.chatHasPro);
+  const hasByokKey = useViewerStore((s) => s.chatHasByokKey);
+  const setChatHasByokKey = useViewerStore((s) => s.setChatHasByokKey);
   const usage = useViewerStore((s) => s.chatUsage);
   const setChatUsage = useViewerStore((s) => s.setChatUsage);
-  const desktopEntitlement = useViewerStore((s) => s.desktopEntitlement);
   const { execute } = useSandbox();
-  const canUseAiAssistant = hasDesktopFeatureAccess(desktopEntitlement, 'ai_assistant');
-  const displayUsage: UsageInfo | null = usage ?? (hasPro
-    ? {
-      type: 'credits',
-      used: 0,
-      limit: DEFAULT_PRO_MONTHLY_CREDIT_LIMIT,
-      pct: 0,
-      resetAt: 0,
-      billable: false,
-    }
-    : null);
+
+  // Sync BYOK key availability into the store and track per-provider state
+  const [keyStateAnthropic, setKeyStateAnthropic] = useState(hasAnthropicKey);
+  const [keyStateOpenai, setKeyStateOpenai] = useState(hasOpenaiKey);
+  useEffect(() => {
+    const refresh = () => {
+      const a = hasAnthropicKey();
+      const o = hasOpenaiKey();
+      setKeyStateAnthropic(a);
+      setKeyStateOpenai(o);
+      setChatHasByokKey(a || o);
+    };
+    refresh();
+    return subscribeApiKeys(refresh);
+  }, [setChatHasByokKey]);
+
+  // BYOK key modal — controlled state for both auto-open (on locked-model pick)
+  // and manual open via the header 🔑 button. `provider` selects the initial tab.
+  const [byokModal, setByokModal] = useState<{ open: boolean; provider: BYOKProvider }>({
+    open: false,
+    provider: 'anthropic',
+  });
+  const openByokModal = useCallback((provider: BYOKProvider) => {
+    setByokModal({ open: true, provider });
+  }, []);
+  const closeByokModal = useCallback(() => {
+    setByokModal((s) => ({ ...s, open: false }));
+  }, []);
+
+  // The usage indicator tracks the free-tier proxy quota we enforce server-side.
+  // BYOK routes go directly from the browser to the provider, so the user's
+  // own provider account is what gates them — our quota doesn't apply, and
+  // showing it here is misleading. Hide it whenever the active model is
+  // direct-to-provider.
+  const activeModelSource = getModelById(activeModel)?.source ?? 'proxy';
+  const displayUsage: UsageInfo | null = activeModelSource === 'proxy' ? usage : null;
   const usageResetLabel = displayUsage?.resetAt && displayUsage.resetAt > 0
     ? new Date(displayUsage.resetAt * 1000).toLocaleDateString()
     : '—';
@@ -238,14 +346,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [userScrolledUp, setUserScrolledUp] = useState(false);
   const [lastFinishReason, setLastFinishReason] = useState<string | null>(null);
-  const openUpgradePage = useCallback(() => {
-    navigateToPath(buildDesktopUpgradeUrl());
-  }, []);
-  const promptAiUpgrade = useCallback(() => {
-    setChatError('AI assistant is available with Desktop Pro.');
-    toast.info('AI assistant is available with Desktop Pro');
-    openUpgradePage();
-  }, [openUpgradePage, setChatError]);
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -307,7 +407,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   useEffect(() => {
     let cancelled = false;
     const refreshUsage = async () => {
-      const snapshot = await fetchUsageSnapshot(PROXY_URL, authToken);
+      const snapshot = await fetchUsageSnapshot(PROXY_URL);
       if (!cancelled && snapshot) {
         setChatUsage(snapshot);
       }
@@ -322,7 +422,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [authToken, setChatUsage]);
+  }, [setChatUsage]);
 
   // ── Keyboard shortcuts ──
   useEffect(() => {
@@ -398,8 +498,65 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   // ── Core send logic ──
   const doSend = useCallback(async (text: string, options?: ChatSendOptions) => {
     if (!text.trim() || status === 'streaming' || status === 'sending') return;
-    if (!canUseAiAssistant) {
-      setChatError('AI assistant is available with Desktop Pro.');
+    // Clear any stale post-authoring CTA — this turn re-establishes it
+    // on completion if it's another authoring turn.
+    setChatToolReady(null);
+
+    // Classify the prompt for the action log and to nudge the user
+    // toward plan-first authoring when appropriate. The classifier is
+    // rule-based and content-free metadata only — we record the coarse
+    // intent the message looks like, never the prompt text itself.
+    const classified = options?.intent === 'repair'
+      ? { intent: 'one-shot' as const, confidence: 1, reason: 'repair turn' }
+      : classifyIntent(text, {
+          hasExistingExtension: false,
+          hasLoadedModel: useViewerStore.getState().models.size > 0,
+        });
+    extensionHost?.emitAction('chat.message', {
+      intent: classified.intent === 'out-of-scope' ? 'one-shot' : classified.intent,
+    });
+    // For high-confidence authoring/fork intents, suggest the
+    // plan-first path. Non-blocking — we still send through the
+    // existing chat pipeline so the user always gets a response.
+    if (
+      (classified.intent === 'authoring' || classified.intent === 'fork')
+      && classified.confidence >= 0.75
+      && !options?.intent
+    ) {
+      // Show the "use the Ideas panel" hint at most once per chat
+      // session — a multi-turn authoring conversation shouldn't
+      // re-toast it on every message.
+      if (!authoringHintShownRef.current) {
+        authoringHintShownRef.current = true;
+        toast.info(
+          classified.intent === 'fork'
+            ? 'Heads up: that reads like a fork. Use the Extensions → Ideas panel for diff-based authoring.'
+            : 'Heads up: that reads like an authoring request. The Extensions → Ideas panel offers plan-first authoring.',
+        );
+      }
+      setAuthoringTelemetry({ intent: classified.intent, startedAt: Date.now() });
+    } else if (classified.intent !== 'authoring' && classified.intent !== 'fork') {
+      setAuthoringTelemetry(null);
+    }
+
+    // Authoring turns write code into the Script Editor — open it so
+    // the user watches the tool take shape instead of only seeing
+    // chat text. Chat is *part* of the authoring surface, not a
+    // detour away from it.
+    if (classified.intent === 'authoring' || classified.intent === 'fork') {
+      setScriptPanelVisible(true);
+    }
+
+    // Resolve the stream route BEFORE any user-visible side effects (adding
+    // the user message, clearing attachments, setting sending state). If the
+    // selected BYOK model has no key, bail out now so the chat transcript
+    // doesn't stack orphaned user messages on repeated sends.
+    const route = resolveStreamRoute(activeModel, getApiKeys());
+    if (route.kind === 'missing-key') {
+      openByokModal(route.provider);
+      setChatError(
+        `${route.provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} key required for this model — set it up to continue.`,
+      );
       return;
     }
 
@@ -478,6 +635,19 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     const fileAttachments = supportsFileAttachments
       ? collectActiveFileAttachments(allMessages, filtered.accepted)
       : [];
+    // Personal prompt overlay from the active flavor (RFC §06.4) —
+    // durable user preferences appended to the system prompt. Best
+    // effort: a missing host / flavor / overlay just omits it.
+    let personalOverlay: string | undefined;
+    if (extensionHost) {
+      try {
+        const activeFlavor = await extensionHost.flavors.getActive();
+        const content = activeFlavor?.promptOverlay?.content?.trim();
+        if (content) personalOverlay = content;
+      } catch {
+        // Overlay is non-essential — never block a chat turn on it.
+      }
+    }
     const systemPrompt = buildSystemPrompt(modelContext, fileAttachments, {
       content: liveScriptContext.content,
       revision: liveScriptContext.revision,
@@ -485,6 +655,13 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     }, {
       userPrompt: text.trim(),
       diagnostics: effectiveDiagnostics,
+      // Include the extension-authoring contract when the classifier
+      // flagged the turn as authoring/fork — the LLM gets the manifest
+      // schema, widget DSL, and capability catalogue in context so it
+      // can emit a valid bundle.
+      includeAuthoringContract:
+        classified.intent === 'authoring' || classified.intent === 'fork',
+      personalOverlay,
     });
     const contextWindow = activeModelInfo?.contextWindow ?? 128_000;
     const inputBudget = Math.max(
@@ -588,14 +765,8 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       }
     };
 
-    await streamChat({
-      proxyUrl: PROXY_URL,
-      model: activeModel,
-      messages: streamMessages,
-      system: systemPrompt,
-      authToken,
-      signal: abortController.signal,
-      onChunk: (chunk) => {
+    // ── Shared stream callbacks ──
+    const handleChunk = (chunk: string) => {
         clearPendingAttachmentsOnce();
         accumulated += chunk;
         if (!responseEditState.applyFailed && responseEditState.intent !== 'repair') {
@@ -629,8 +800,8 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         }
         setChatStatus('streaming');
         updateStreaming(accumulated);
-      },
-      onComplete: (fullText) => {
+    };
+    const handleComplete = (fullText: string) => {
         clearPendingAttachmentsOnce();
         const normalizedText = continuationBase
           ? stripContinuationOverlap(continuationBase, fullText)
@@ -771,23 +942,100 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           }
         }
 
+        // Authoring loop: when the classifier flagged this turn as
+        // 'authoring' or 'fork', the response may contain a bundle in
+        // the ifc-extension-* fenced format. If it does, surface the
+        // bundle CTA. If it doesn't but code landed in the editor,
+        // surface the script CTA so "promote to tool" is one click
+        // away — the user never has to hunt for the Promote button.
+        //
+        // Offer the script-path install CTA whenever the assistant
+        // produced runnable code this turn — NOT only on authoring-
+        // classified turns. The classifier tags follow-up messages
+        // ("yes, use Pset_DoorCommon") as one-shot, but that's often
+        // the turn where the final code lands. A one-shot script is
+        // just as promotable as an "authored" one.
+        const offerScriptInstall = () => {
+          if (options?.intent === 'repair') return;
+          const wroteCode = responseEditState.appliedAny || responseEditState.fallbackApplied;
+          const code = useViewerStore.getState().scriptEditorContent;
+          const hasRealCode =
+            code.trim().length > 0 && !/Write your BIM script here/.test(code);
+          if (wroteCode && hasRealCode) {
+            setChatToolReady({ kind: 'script', name: '' });
+          }
+        };
+
+        if (
+          (classified.intent === 'authoring' || classified.intent === 'fork')
+          && !options?.intent
+        ) {
+          // Authoring-classified turn — try the bundle path first; if
+          // no bundle was emitted, fall back to the script CTA.
+          void handleAuthoringResponse(fullText).then((bundleFound) => {
+            if (!bundleFound) offerScriptInstall();
+          });
+        } else {
+          offerScriptInstall();
+        }
+
         commitAssistantTurn();
-      },
-      onUsageInfo: (info: UsageInfo) => {
+    };
+    const handleUsageInfo = (info: UsageInfo) => {
         setChatUsage(info);
-      },
-      onFinishReason: (reason) => {
+    };
+    const handleFinishReason = (reason: string | null) => {
         setLastFinishReason(reason);
         if (reason === 'length') {
           setChatError('Response reached output limit. Click Continue to resume.');
         }
-      },
-      onError: (err) => {
+    };
+    const handleError = (err: Error) => {
         setChatError(err.message);
         setChatAbortController(null);
         commitAssistantTurn();
-      },
-    });
+    };
+
+    // Route to direct provider streaming for BYOK models, or through the proxy
+    // for free models. The route was already resolved (and the missing-key
+    // case handled) at the top of doSend, so this dispatch is total.
+    if (route.kind === 'anthropic') {
+      await streamAnthropicChat(route.apiKey, {
+        model: activeModel,
+        messages: streamMessages,
+        system: systemPrompt,
+        signal: abortController.signal,
+        onChunk: handleChunk,
+        onComplete: handleComplete,
+        onFinishReason: handleFinishReason,
+        onError: handleError,
+      });
+    } else if (route.kind === 'openai') {
+      await streamOpenAiChat(route.apiKey, {
+        model: activeModel,
+        messages: streamMessages,
+        system: systemPrompt,
+        signal: abortController.signal,
+        onChunk: handleChunk,
+        onComplete: handleComplete,
+        onFinishReason: handleFinishReason,
+        onError: handleError,
+      });
+    } else {
+      await streamChat({
+        proxyUrl: PROXY_URL,
+        model: activeModel,
+        messages: streamMessages,
+        system: systemPrompt,
+        signal: abortController.signal,
+        onChunk: handleChunk,
+        onComplete: handleComplete,
+        onFinishReason: handleFinishReason,
+        onError: handleError,
+        onUsageInfo: handleUsageInfo,
+      });
+    }
+
     if (abortController.signal.aborted) {
       commitAssistantTurn();
       const currentState = useViewerStore.getState();
@@ -797,19 +1045,16 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       }
     }
   }, [
-    canUseAiAssistant, status, activeModel, attachments, authToken,
+    status, activeModel, attachments,
     addMessage, setChatStatus, updateStreaming, finalizeAssistant,
     setChatError, setChatAbortController, clearAttachments, setChatUsage, resizeInput,
-    buildRepairPromptFromLiveState, triggerAutoRepair, execute,
+    buildRepairPromptFromLiveState, triggerAutoRepair, execute, extensionHost,
+    setChatToolReady, handleAuthoringResponse, setScriptPanelVisible,
   ]);
 
   const handleSend = useCallback(() => {
-    if (!canUseAiAssistant) {
-      promptAiUpgrade();
-      return;
-    }
     doSend(inputText);
-  }, [canUseAiAssistant, doSend, inputText, promptAiUpgrade]);
+  }, [doSend, inputText]);
 
   // Allow other panels (e.g. ScriptPanel errors) to trigger a chat repair turn.
   useEffect(() => {
@@ -838,10 +1083,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   }, [pendingRepairRequest, status, consumePendingRepairRequest, buildRepairPromptFromLiveState, doSend]);
 
   const handleContinue = useCallback(() => {
-    if (!canUseAiAssistant) {
-      promptAiUpgrade();
-      return;
-    }
     const state = useViewerStore.getState();
     const partial = state.chatStreamingContent.trim();
     const lastAssistant = [...state.chatMessages].reverse().find((m) => m.role === 'assistant');
@@ -854,7 +1095,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     }
     setChatError(null);
     doSend(CONTINUE_PROMPT, { continuationBase });
-  }, [canUseAiAssistant, doSend, finalizeAssistant, promptAiUpgrade, setChatError]);
+  }, [doSend, finalizeAssistant, setChatError]);
 
   const handleStop = useCallback(() => {
     const controller = useViewerStore.getState().chatAbortController;
@@ -879,10 +1120,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
 
   // ── Error feedback (Fix this) ──
   const handleFixError = useCallback((code: string, errorMsg: string) => {
-    if (!canUseAiAssistant) {
-      promptAiUpgrade();
-      return;
-    }
     const diagnostics = useViewerStore.getState().scriptLastDiagnostics;
     const liveCode = useViewerStore.getState().scriptEditorContent;
     const staleCode = code.trim() !== liveCode.trim() ? code : undefined;
@@ -897,7 +1134,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
       requestedRepairScope: getPrimaryRootCause(diagnostics)?.repairScope,
       rootCauseKey: getPrimaryRootCause(diagnostics)?.rootCauseKey,
     });
-  }, [buildRepairPromptFromLiveState, canUseAiAssistant, doSend, promptAiUpgrade]);
+  }, [buildRepairPromptFromLiveState, doSend]);
 
   // ── Clickable example prompts ──
   const handleExampleClick = useCallback((prompt: string) => {
@@ -910,27 +1147,27 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
     if (messages.length <= 2) {
       resetScriptEditorForNewChat();
       clearMessages();
+      setChatToolReady(null);
+      authoringHintShownRef.current = false;
       setInputText('');
       setLastFinishReason(null);
     } else {
       setShowClearConfirm(true);
     }
-  }, [messages.length, clearMessages, resetScriptEditorForNewChat]);
+  }, [messages.length, clearMessages, resetScriptEditorForNewChat, setChatToolReady]);
 
   const confirmClear = useCallback(() => {
     resetScriptEditorForNewChat();
     clearMessages();
+    setChatToolReady(null);
+    authoringHintShownRef.current = false;
     setInputText('');
     setLastFinishReason(null);
     setShowClearConfirm(false);
-  }, [clearMessages, resetScriptEditorForNewChat]);
+  }, [clearMessages, resetScriptEditorForNewChat, setChatToolReady]);
 
   // ── File upload (button + drag-drop + paste) ──
   const processFiles = useCallback(async (files: FileList | File[]) => {
-    if (!canUseAiAssistant) {
-      promptAiUpgrade();
-      return;
-    }
     const model = getModelById(activeModel);
     const supportsImages = model?.supportsImages ?? false;
     const supportsFileAttachments = model?.supportsFileAttachments ?? true;
@@ -969,7 +1206,54 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           remainingSlots -= 1;
           continue;
         }
-        // Only accept text-based files
+        // PDFs are supported by Claude as native document content blocks.
+        // Route them separately from text attachments so the chat request
+        // can emit the correct multimodal block type.
+        if (file.name.match(/\.pdf$/i) || file.type === 'application/pdf') {
+          if (!supportsFileAttachments) {
+            setChatError('Selected model does not support file attachments. Switch model to attach PDFs.');
+            continue;
+          }
+          if (file.size > MAX_PDF_ATTACHMENT_BYTES) {
+            setChatError(`PDF attachments must be smaller than ${Math.round(MAX_PDF_ATTACHMENT_BYTES / 1_000_000)} MB.`);
+            continue;
+          }
+          const buffer = await file.arrayBuffer();
+          const base64 = arrayBufferToBase64(buffer);
+          const attachment: FileAttachment = {
+            id: createAttachmentId(),
+            name: file.name,
+            type: 'application/pdf',
+            size: file.size,
+            pdfBase64: base64,
+            isPdf: true,
+          };
+          addAttachment(attachment);
+          remainingSlots -= 1;
+          continue;
+        }
+        // Excel / ODS binaries — we can't parse them yet, but we don't want
+        // to silently drop them. Register a metadata-only attachment so the
+        // user (and the LLM via the system prompt) know it's there and can
+        // suggest exporting as CSV.
+        if (file.name.match(/\.(xlsx|xls|ods)$/i)) {
+          if (!supportsFileAttachments) {
+            setChatError('Selected model does not support file attachments. Switch model to attach spreadsheets.');
+            continue;
+          }
+          const attachment: FileAttachment = {
+            id: createAttachmentId(),
+            name: file.name,
+            type: file.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            size: file.size,
+            isSpreadsheetBinary: true,
+            textContent: `[Binary spreadsheet ${file.name} (${Math.round(file.size / 1024)} KB). Export to CSV for full content access.]`,
+          };
+          addAttachment(attachment);
+          remainingSlots -= 1;
+          continue;
+        }
+        // Text-based files — CSV, TSV, JSON, TXT
         if (!file.name.match(/\.(csv|json|txt|tsv)$/i)) continue;
         if (!supportsFileAttachments) {
           setChatError('Selected model does not support file attachments. Switch model to attach files.');
@@ -998,7 +1282,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         setChatError(`Could not read ${file.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-  }, [activeModel, addAttachment, attachments.length, canUseAiAssistant, promptAiUpgrade, setChatError]);
+  }, [activeModel, addAttachment, attachments.length, setChatError]);
 
   const handleFileUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -1067,12 +1351,28 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
   const modelSupportsImages = modelForUi?.supportsImages ?? false;
   const modelSupportsFiles = modelForUi?.supportsFileAttachments ?? true;
   const attachmentAccept = [
-    modelSupportsFiles ? '.csv,.json,.txt,.tsv' : '',
+    modelSupportsFiles
+      ? '.csv,.json,.txt,.tsv,.pdf,application/pdf,.xlsx,.xls,.ods,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet'
+      : '',
     modelSupportsImages ? 'image/*' : '',
   ].filter(Boolean).join(',');
   const canAttachInput = modelSupportsFiles || modelSupportsImages;
-  const clerkEnabled = isClerkConfigured();
-  const showUpgradeNudge = Boolean(error && (error.includes('Upgrade to Pro') || error.includes('daily limit')));
+  // Detect when selected model needs a missing BYOK key (reactive state, not raw reads)
+  const modelSource = modelForUi?.source ?? 'proxy';
+  const needsAnthropicKey = modelSource === 'anthropic' && !keyStateAnthropic;
+  const needsOpenaiKey = modelSource === 'openai' && !keyStateOpenai;
+  const needsByokKey = needsAnthropicKey || needsOpenaiKey;
+
+  // Auto-open the BYOK modal when the user picks a locked model. We only fire on
+  // the *transition* into needsByokKey so the modal doesn't keep popping back up
+  // after the user dismisses it without entering a key.
+  const prevNeedsByokRef = useRef(false);
+  useEffect(() => {
+    if (needsByokKey && !prevNeedsByokRef.current) {
+      openByokModal(needsAnthropicKey ? 'anthropic' : 'openai');
+    }
+    prevNeedsByokRef.current = needsByokKey;
+  }, [needsByokKey, needsAnthropicKey, openByokModal]);
   const showSupportEmail = Boolean(error && error.includes('louis@ltplus.com'));
   const canContinue = Boolean(
     !isActive && (streamingContent.trim().length > 0 || lastFinishReason === 'length'),
@@ -1111,8 +1411,36 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           <TooltipContent>Clear</TooltipContent>
         </Tooltip>
 
-        <ModelSelector hasPro={hasPro} />
+        <ModelSelector />
+        <ByokStreamingPill modelId={activeModel} className="ml-1" />
+        {authoringTelemetry && (
+          <span
+            className="ml-1 text-[10px] uppercase tracking-wide font-semibold bg-primary/15 text-primary rounded px-1.5 py-0.5"
+            title={`Authoring contract attached (${authoringTelemetry.intent})`}
+          >
+            {authoringTelemetry.intent === 'fork' ? 'Fork' : 'Authoring'}
+            {' · '}
+            {Math.round((Date.now() - authoringTelemetry.startedAt) / 1000)}s
+          </span>
+        )}
         <div className="flex-1" />
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={() => openByokModal(modelSource === 'openai' ? 'openai' : 'anthropic')}
+              className={keyStateAnthropic || keyStateOpenai ? 'text-emerald-500' : ''}
+              aria-label={keyStateAnthropic || keyStateOpenai ? 'Manage API keys' : 'Add API key for frontier models'}
+            >
+              <KeyRound className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {keyStateAnthropic || keyStateOpenai ? 'Manage API keys' : 'Add API key for frontier models'}
+          </TooltipContent>
+        </Tooltip>
 
         <Tooltip>
           <TooltipTrigger asChild>
@@ -1128,31 +1456,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           <TooltipContent>Auto-run: {autoExecute ? 'ON' : 'OFF'}</TooltipContent>
         </Tooltip>
 
-        {clerkEnabled && (
-          <>
-            <SignedOut>
-              <SignInButton mode="modal">
-                <Button variant="ghost" size="sm" className="h-6 px-2 text-xs text-muted-foreground">
-                  Sign in
-                </Button>
-              </SignInButton>
-            </SignedOut>
-            {!hasPro && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-6 px-2 text-xs text-muted-foreground"
-                onClick={openUpgradePage}
-              >
-                Pro
-              </Button>
-            )}
-            <SignedIn>
-              <UserButton afterSignOutUrl="/" />
-            </SignedIn>
-          </>
-        )}
-
         {onClose && (
           <Button variant="ghost" size="icon-xs" onClick={onClose}>
             <X className="h-3.5 w-3.5" />
@@ -1160,13 +1463,20 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         )}
       </div>
 
-      {!canUseAiAssistant && (
-        <div className="border-b bg-muted/40 px-3 py-2 text-xs text-muted-foreground flex items-center justify-between gap-3">
-          <span>AI assistant is available with Desktop Pro. Core viewing and scripting stay available without it.</span>
-          <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={openUpgradePage}>
-            Upgrade
-          </Button>
-        </div>
+      {/* Slim CTA banner — appears when the modal has been dismissed but the
+          selected model still needs a key. Re-opens the modal on click. */}
+      {needsByokKey && !byokModal.open && (
+        <button
+          type="button"
+          onClick={() => openByokModal(needsAnthropicKey ? 'anthropic' : 'openai')}
+          className="w-full border-b bg-amber-500/10 px-3 py-2 text-left text-xs hover:bg-amber-500/15 transition-colors flex items-center gap-2"
+        >
+          <KeyRound className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
+          <span>
+            <strong>{needsAnthropicKey ? 'Anthropic' : 'OpenAI'} key needed</strong>{' '}
+            for this model — click to set it up
+          </span>
+        </button>
       )}
 
       {/* Clear confirmation */}
@@ -1242,6 +1552,56 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
             <span className="text-xs">Thinking...</span>
           </div>
         )}
+
+        {/* Post-authoring install CTA — rendered INLINE at the end of
+            the conversation, directly under the generated code, so the
+            "now install it" step is impossible to miss. Highlighted
+            (ring + accent) the moment a workflow is authored. */}
+        {chatToolReady && status === 'idle' && (
+          <div className="mx-3 my-3 rounded-lg border-2 border-primary bg-primary/10 p-3 shadow-sm ring-2 ring-primary/30">
+            <div className="flex items-center gap-2 mb-1">
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
+                <Wrench className="h-4 w-4" />
+              </div>
+              <div className="text-sm font-semibold">
+                {chatToolReady.kind === 'bundle'
+                  ? `"${chatToolReady.name || 'Your extension'}" is ready`
+                  : 'Your tool is ready'}
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground mb-2.5 pl-9">
+              Last step — turn this into a permanent{' '}
+              <span className="font-medium text-foreground">one-click button in your toolbar</span>.
+            </p>
+            <div className="flex items-center gap-2 pl-9">
+              <Button
+                size="sm"
+                onClick={() => {
+                  if (chatToolReady.kind === 'bundle') {
+                    setExtensionsRequestedView('installed');
+                    setExtensionsPanelVisible(true);
+                  } else {
+                    setPromoteFromChat({
+                      open: true,
+                      source: useViewerStore.getState().scriptEditorContent,
+                    });
+                  }
+                  setChatToolReady(null);
+                }}
+              >
+                <Wrench className="mr-1 h-3.5 w-3.5" />
+                {chatToolReady.kind === 'bundle' ? 'Review & install' : 'Install as tool'}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setChatToolReady(null)}
+              >
+                Not now
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Scroll to bottom button */}
@@ -1271,16 +1631,6 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                 onClick={handleContinue}
               >
                 Continue
-              </Button>
-            )}
-            {showUpgradeNudge && clerkEnabled && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-5 px-2 text-[10px]"
-                onClick={openUpgradePage}
-              >
-                Upgrade
               </Button>
             )}
             {showSupportEmail && (
@@ -1326,6 +1676,14 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
         </div>
       )}
 
+      {/* Promote-to-tool dialog, opened from the post-authoring CTA.
+          `source` was snapshotted from the editor at open time. */}
+      <PromoteToolDialog
+        open={promoteFromChat.open}
+        source={promoteFromChat.source}
+        onClose={() => setPromoteFromChat((p) => ({ ...p, open: false }))}
+      />
+
       {/* Input area */}
       <div className="shrink-0 border-t p-2">
         <div className="flex items-end gap-1.5">
@@ -1343,16 +1701,14 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                 variant="ghost"
                 size="icon-xs"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={!canAttachInput || !canUseAiAssistant}
+                disabled={!canAttachInput}
                 className="shrink-0 mb-0.5"
               >
                 <Paperclip className="h-3.5 w-3.5" />
               </Button>
             </TooltipTrigger>
             <TooltipContent>
-              {!canUseAiAssistant
-                ? 'Desktop Pro required for AI assistant'
-                : canAttachInput
+              {canAttachInput
                 ? 'Attach file or image (paste, drag & drop)'
                 : 'Selected model does not support attachments'}
             </TooltipContent>
@@ -1367,11 +1723,11 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
             }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            placeholder={canUseAiAssistant ? 'Ask anything...' : 'Desktop Pro required for AI assistant'}
+            placeholder={needsByokKey ? `Add your ${needsAnthropicKey ? 'Anthropic' : 'OpenAI'} key to chat with this model` : 'Ask anything...'}
             rows={1}
             className="flex-1 resize-none rounded-md border border-input bg-background text-foreground placeholder:text-muted-foreground px-3 py-1.5 text-sm min-h-[32px] max-h-[120px] focus:outline-none focus:ring-1 focus:ring-ring"
             style={{ height: 'auto', overflow: 'hidden' }}
-            disabled={!canUseAiAssistant}
+            disabled={needsByokKey}
           />
 
           {isActive ? (
@@ -1395,7 +1751,7 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
                   variant="default"
                   size="icon-xs"
                   onClick={handleSend}
-                  disabled={!inputText.trim() || !canUseAiAssistant}
+                  disabled={!inputText.trim() || needsByokKey}
                   className="shrink-0 mb-0.5"
                 >
                   <Send className="h-3.5 w-3.5" />
@@ -1435,6 +1791,12 @@ export function ChatPanel({ onClose }: ChatPanelProps) {
           <span className="text-[10px] text-muted-foreground/30">⌘L</span>
         </div>
       </div>
+
+      <ByokKeyModal
+        open={byokModal.open}
+        onOpenChange={(open) => (open ? openByokModal(byokModal.provider) : closeByokModal())}
+        initialProvider={byokModal.provider}
+      />
     </div>
   );
 }

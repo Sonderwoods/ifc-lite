@@ -57,17 +57,19 @@ impl AttributeValue {
     pub fn from_token(token: &Token) -> Self {
         match token {
             Token::EntityRef(id) => AttributeValue::EntityRef(*id),
-            Token::String(s) => AttributeValue::String(s.to_string()),
+            Token::String(s) => AttributeValue::String(String::from_utf8_lossy(s).into_owned()),
             Token::Integer(i) => AttributeValue::Integer(*i),
             Token::Float(f) => AttributeValue::Float(*f),
-            Token::Enum(e) => AttributeValue::Enum(e.to_string()),
+            Token::Enum(e) => AttributeValue::Enum(String::from_utf8_lossy(e).into_owned()),
             Token::List(items) => {
                 AttributeValue::List(items.iter().map(Self::from_token).collect())
             }
             Token::TypedValue(type_name, args) => {
                 // For typed values like IFCPARAMETERVALUE(0.), extract the inner value
                 // Store as a list with the type name first, followed by args
-                let mut values = vec![AttributeValue::String(type_name.to_string())];
+                let mut values = vec![AttributeValue::String(
+                    String::from_utf8_lossy(type_name).into_owned(),
+                )];
                 values.extend(args.iter().map(Self::from_token));
                 AttributeValue::List(values)
             }
@@ -325,6 +327,10 @@ impl IfcSchema {
 
         // Profile types - Parametric
         profile_types.insert(IfcType::IfcRectangleProfileDef, ProfileCategory::Parametric);
+        profile_types.insert(
+            IfcType::IfcRoundedRectangleProfileDef,
+            ProfileCategory::Parametric,
+        );
         profile_types.insert(IfcType::IfcCircleProfileDef, ProfileCategory::Parametric);
         profile_types.insert(
             IfcType::IfcCircleHollowProfileDef,
@@ -335,6 +341,10 @@ impl IfcSchema {
             ProfileCategory::Parametric,
         );
         profile_types.insert(IfcType::IfcIShapeProfileDef, ProfileCategory::Parametric);
+        profile_types.insert(
+            IfcType::IfcAsymmetricIShapeProfileDef,
+            ProfileCategory::Parametric,
+        );
         profile_types.insert(IfcType::IfcLShapeProfileDef, ProfileCategory::Parametric);
         profile_types.insert(IfcType::IfcUShapeProfileDef, ProfileCategory::Parametric);
         profile_types.insert(IfcType::IfcTShapeProfileDef, ProfileCategory::Parametric);
@@ -462,6 +472,11 @@ mod tests {
             schema.geometry_category(&IfcType::IfcTriangulatedFaceSet),
             Some(GeometryCategory::ExplicitMesh)
         );
+
+        assert_eq!(
+            schema.profile_category(&IfcType::IfcRoundedRectangleProfileDef),
+            Some(ProfileCategory::Parametric)
+        );
     }
 
     #[test]
@@ -470,7 +485,7 @@ mod tests {
         let attr = AttributeValue::from_token(&token);
         assert_eq!(attr.as_entity_ref(), Some(123));
 
-        let token = Token::String("test");
+        let token = Token::String(b"test");
         let attr = AttributeValue::from_token(&token);
         assert_eq!(attr.as_string(), Some("test"));
     }

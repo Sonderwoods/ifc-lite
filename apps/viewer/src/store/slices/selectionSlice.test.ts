@@ -24,28 +24,7 @@ describe('SelectionSlice', () => {
     state = createSelectionSlice(setState, () => state, {} as any);
   });
 
-  describe('initial state', () => {
-    it('should have null selectedEntity', () => {
-      assert.strictEqual(state.selectedEntity, null);
-    });
-
-    it('should have empty selectedEntitiesSet', () => {
-      assert.strictEqual(state.selectedEntitiesSet.size, 0);
-    });
-
-    it('should have null selectedEntityId (legacy)', () => {
-      assert.strictEqual(state.selectedEntityId, null);
-    });
-  });
-
   describe('multi-model selection: setSelectedEntity', () => {
-    it('should set primary selection with model context', () => {
-      const ref: EntityRef = { modelId: 'model-1', expressId: 123 };
-      state.setSelectedEntity(ref);
-
-      assert.deepStrictEqual(state.selectedEntity, ref);
-    });
-
     it('should NOT update selectedEntityId (caller must use setSelectedEntityId for global ID)', () => {
       // NOTE: selectedEntityId holds the GLOBAL ID for renderer highlighting,
       // while selectedEntity.expressId holds the ORIGINAL express ID for property lookup.
@@ -54,15 +33,6 @@ describe('SelectionSlice', () => {
       state.setSelectedEntity(ref);
 
       // selectedEntityId should remain null - caller must set it separately with globalId
-      assert.strictEqual(state.selectedEntityId, null);
-    });
-
-    it('should allow clearing selection with null', () => {
-      const ref: EntityRef = { modelId: 'model-1', expressId: 123 };
-      state.setSelectedEntity(ref);
-      state.setSelectedEntity(null);
-
-      assert.strictEqual(state.selectedEntity, null);
       assert.strictEqual(state.selectedEntityId, null);
     });
   });
@@ -102,6 +72,52 @@ describe('SelectionSlice', () => {
       state.addEntityToSelection(ref1);
       state.addEntityToSelection(ref2);
 
+      assert.strictEqual(state.selectedEntitiesSet.size, 2);
+    });
+  });
+
+  describe('multi-model selection: addEntitiesToSelection (batch)', () => {
+    it('should add every ref in one set call', () => {
+      const refs: EntityRef[] = [
+        { modelId: 'model-1', expressId: 1 },
+        { modelId: 'model-1', expressId: 2 },
+        { modelId: 'model-2', expressId: 3 },
+      ];
+      state.addEntitiesToSelection(refs);
+      assert.strictEqual(state.selectedEntitiesSet.size, 3);
+    });
+
+    it('should set primary selection to the LAST ref (matches single-add convention)', () => {
+      const refs: EntityRef[] = [
+        { modelId: 'model-1', expressId: 1 },
+        { modelId: 'model-2', expressId: 99 },
+      ];
+      state.addEntitiesToSelection(refs);
+      assert.deepStrictEqual(state.selectedEntity, { modelId: 'model-2', expressId: 99 });
+    });
+
+    it('should be a no-op for empty input', () => {
+      const before = state.selectedEntitiesSet;
+      state.addEntitiesToSelection([]);
+      assert.strictEqual(state.selectedEntitiesSet, before, 'state ref unchanged');
+    });
+
+    it('should compose with prior single-adds without losing entries', () => {
+      const ref0: EntityRef = { modelId: 'model-1', expressId: 0 };
+      state.addEntityToSelection(ref0);
+      state.addEntitiesToSelection([
+        { modelId: 'model-1', expressId: 1 },
+        { modelId: 'model-1', expressId: 2 },
+      ]);
+      assert.strictEqual(state.selectedEntitiesSet.size, 3);
+    });
+
+    it('should dedupe overlapping refs without changing the set size beyond the union', () => {
+      state.addEntityToSelection({ modelId: 'm', expressId: 7 });
+      state.addEntitiesToSelection([
+        { modelId: 'm', expressId: 7 }, // duplicate
+        { modelId: 'm', expressId: 8 },
+      ]);
       assert.strictEqual(state.selectedEntitiesSet.size, 2);
     });
   });
@@ -239,19 +255,6 @@ describe('SelectionSlice', () => {
     });
   });
 
-  describe('legacy selection: setSelectedEntityId', () => {
-    it('should set legacy selectedEntityId', () => {
-      state.setSelectedEntityId(123);
-      assert.strictEqual(state.selectedEntityId, 123);
-    });
-
-    it('should allow clearing with null', () => {
-      state.setSelectedEntityId(123);
-      state.setSelectedEntityId(null);
-      assert.strictEqual(state.selectedEntityId, null);
-    });
-  });
-
   describe('legacy selection: storey selection', () => {
     it('should toggle storey selection', () => {
       state.toggleStoreySelection(1);
@@ -281,6 +284,35 @@ describe('SelectionSlice', () => {
       state.clearStoreySelection();
 
       assert.strictEqual(state.selectedStoreys.size, 0);
+    });
+  });
+
+  describe('shared active storey', () => {
+    it('defaults to null', () => {
+      assert.strictEqual(state.activeStorey, null);
+    });
+
+    it('sets a model-aware active storey', () => {
+      const ref: EntityRef = { modelId: 'model-1', expressId: 42 };
+      state.setActiveStorey(ref);
+      assert.deepStrictEqual(state.activeStorey, ref);
+    });
+
+    it('clears the active storey with null', () => {
+      state.setActiveStorey({ modelId: 'model-1', expressId: 42 });
+      state.setActiveStorey(null);
+      assert.strictEqual(state.activeStorey, null);
+    });
+
+    it('is independent of the selectedStoreys renderer filter', () => {
+      // The active storey is the single, model-aware focus; selectedStoreys
+      // is the multi-select isolation filter. Writing one must not mutate the
+      // other (the hierarchy sets both deliberately on a single-storey click).
+      state.setActiveStorey({ modelId: 'model-1', expressId: 7 });
+      assert.strictEqual(state.selectedStoreys.size, 0);
+
+      state.setStoreysSelection([7, 8]);
+      assert.deepStrictEqual(state.activeStorey, { modelId: 'model-1', expressId: 7 });
     });
   });
 });

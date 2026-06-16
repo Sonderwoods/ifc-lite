@@ -56,24 +56,27 @@ export type {
   // Profile extraction
   ProfileEntry,
 
+  // Mesh outline (winding-robust footprint, issue #979)
+  MeshOutline2D,
+
   // Utility types
   EntityKey,
-} from './types';
+} from './types.js';
 
-export { DEFAULT_SECTION_CONFIG, makeEntityKey, parseEntityKey } from './types';
+export { DEFAULT_SECTION_CONFIG, makeEntityKey, parseEntityKey } from './types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SECTION CUTTING
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { SectionCutter, cutMeshesStreaming } from './section-cutter';
-export type { StreamingSectionCutterOptions } from './section-cutter';
+export { SectionCutter, cutMeshesStreaming } from './section-cutter.js';
+export type { StreamingSectionCutterOptions } from './section-cutter.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // POLYGON BUILDING
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { PolygonBuilder, simplifyPolygon, polygonBounds } from './polygon-builder';
+export { PolygonBuilder, simplifyPolygon, polygonBounds } from './polygon-builder.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINE MERGING
@@ -84,27 +87,48 @@ export {
   mergeCollinearLines,
   deduplicateLines,
   splitLineAtParams,
-} from './line-merger';
-export type { LineMergerOptions } from './line-merger';
+} from './line-merger.js';
+export type { LineMergerOptions } from './line-merger.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // EDGE EXTRACTION
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { EdgeExtractor, getViewDirection } from './edge-extractor';
+export { EdgeExtractor } from './edge-extractor.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PROFILE PROJECTION (clean silhouettes from WASM profiles)
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { projectProfiles } from './profile-projector';
+export { projectProfiles } from './profile-projector.js';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTRUCTION PROJECTION BANDS (issue #979)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export {
+  classifyDepthRange,
+  classifySegmentBand,
+  signedDepth,
+  signedAxisDepth,
+  bandVisibility,
+  projectPointForPlane,
+  getViewDirectionForPlane,
+  outlineToProjectionLines,
+} from './projection-bands.js';
+export type { ProjectionBand, ProjectionBandDepths } from './projection-bands.js';
+
+// Current-floor scoping + feature-element exclusion (issue #979 follow-up)
+export { currentFloorBands, storeyFloorsFromMeshes } from './storey-bands.js';
+export type { StoreyFloorMesh } from './storey-bands.js';
+export { isFeatureElementType } from './feature-elements.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HIDDEN LINE REMOVAL
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { HiddenLineClassifier } from './hidden-line';
-export type { VisibilitySegment, VisibilityResult, HiddenLineOptions } from './hidden-line';
+export { HiddenLineClassifier } from './hidden-line.js';
+export type { VisibilitySegment, VisibilityResult, HiddenLineOptions } from './hidden-line.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STYLES (HATCHING & LINE WEIGHTS)
@@ -126,7 +150,7 @@ export {
 
   // Paper sizes
   PAPER_SIZES,
-} from './styles';
+} from './styles.js';
 
 export type {
   HatchPatternType,
@@ -134,27 +158,27 @@ export type {
   LineStyle,
   DrawingScale,
   PaperSize,
-} from './styles';
+} from './styles.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HATCH GENERATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { HatchGenerator } from './hatch-generator';
-export type { HatchLine, HatchResult, CustomHatchSettings } from './hatch-generator';
+export { HatchGenerator } from './hatch-generator.js';
+export type { HatchLine, HatchResult, CustomHatchSettings } from './hatch-generator.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SVG EXPORT
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { SVGExporter, exportToSVG } from './svg-exporter';
-export type { SVGExportOptions } from './svg-exporter';
+export { SVGExporter, exportToSVG } from './svg-exporter.js';
+export type { SVGExportOptions } from './svg-exporter.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPU ACCELERATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-export { GPUSectionCutter, isGPUComputeAvailable } from './gpu-section-cutter';
+export { GPUSectionCutter, isGPUComputeAvailable } from './gpu-section-cutter.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HIGH-LEVEL GENERATOR
@@ -165,8 +189,8 @@ export {
   createSectionConfig,
   generateFloorPlan,
   generateSection,
-} from './drawing-generator';
-export type { GeneratorOptions, GeneratorProgress } from './drawing-generator';
+} from './drawing-generator.js';
+export type { GeneratorOptions, GeneratorProgress } from './drawing-generator.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MATH UTILITIES
@@ -229,7 +253,7 @@ export {
   reversePolygon,
   ensureCCW,
   ensureCW,
-} from './math';
+} from './math.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // OPENING HANDLING
@@ -243,7 +267,7 @@ export {
   getFillingElement,
   isOpeningElement,
   isDoorOrWindow,
-} from './openings';
+} from './openings/index.js';
 
 export type {
   // Opening types
@@ -255,7 +279,7 @@ export type {
   WindowPartitioningType,
   EntityMetadata,
   DrawingContext,
-} from './types';
+} from './types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ARCHITECTURAL SYMBOLS
@@ -268,7 +292,7 @@ export {
   generateDoorSymbol,
   generateWindowSymbol,
   generateStairArrow,
-} from './symbols';
+} from './symbols/index.js';
 
 export type {
   // Symbol types
@@ -279,7 +303,7 @@ export type {
   SlidingDoorParameters,
   WindowFrameParameters,
   StairArrowParameters,
-} from './types';
+} from './types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LINE STYLING & LAYERS
@@ -294,7 +318,7 @@ export {
   LayerMapper,
   DEFAULT_LAYERS,
   getLayerForIfcType,
-} from './styling';
+} from './styling/index.js';
 
 export type {
   // Styling types
@@ -305,10 +329,10 @@ export type {
   LayerDefinition,
   AIALayerCode,
   ArchitecturalDrawing2D,
-} from './types';
+} from './types.js';
 
 // Re-export LineStyle from types (note: this shadows the style module's LineStyle)
-export type { LineStyle as ArchitecturalLineStyle } from './types';
+export type { LineStyle as ArchitecturalLineStyle } from './types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // OBJECT STYLES (Revit-like per-category graphic configuration)
@@ -320,7 +344,7 @@ export {
   resolveObjectStyle,
   isIfcTypeVisible,
   getHiddenIfcTypes,
-} from './object-styles';
+} from './object-styles.js';
 
 export type {
   LinePatternPreset,
@@ -330,7 +354,7 @@ export type {
   ObjectStylesConfig,
   ObjectStyleOverride,
   ObjectStyleOverrides,
-} from './object-styles';
+} from './object-styles.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GRAPHIC OVERRIDES
@@ -357,7 +381,7 @@ export {
   MONOCHROME_PRESET,
   getBuiltInPreset,
   getPresetsByCategory,
-} from './graphic-overrides';
+} from './graphic-overrides/index.js';
 
 export type {
   // Override types
@@ -374,7 +398,7 @@ export type {
   ElementData,
   ResolvedGraphicStyle,
   OverrideResult,
-} from './graphic-overrides';
+} from './graphic-overrides/index.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DRAWING SHEETS (Paper, Frames, Title Blocks, Scale Bars)
@@ -413,7 +437,7 @@ export {
   renderTitleBlock,
   renderScaleBar,
   renderNorthArrow,
-} from './sheet';
+} from './sheet/index.js';
 
 export type {
   // Paper types
@@ -454,4 +478,4 @@ export type {
   TitleBlockRenderResult,
   TitleBlockExtras,
   PositionMm,
-} from './sheet';
+} from './sheet/index.js';

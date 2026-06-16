@@ -9,16 +9,22 @@
  * and deal exclusively with converting data to ISO 10303-21 STEP format strings.
  */
 
-import { serializeValue } from '@ifc-lite/parser';
+import { serializeValue, type IfcAttributeValue } from '@ifc-lite/parser';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
 
 /**
  * Escape a string for STEP format (backslash and single-quote escaping).
+ *
+ * Control characters (CR/LF and other C0 codes) are collapsed to a single
+ * space so every generated STEP entity stays on one physical line and
+ * round-trips through the line-oriented merge/convert paths.
  */
 export function escapeStepString(str: string): string {
   return str
     .replace(/\\/g, '\\\\')
-    .replace(/'/g, "''");
+    .replace(/'/g, "''")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1F\x7F]+/g, ' ');
 }
 
 /**
@@ -128,6 +134,47 @@ export function serializeAttributeValue(value: string, currentToken: string): st
 }
 
 /**
+ * Serialize a single STEP attribute value to its on-disk token.
+ *
+ * - `null` / `undefined` → `$`
+ * - booleans → `.T.` / `.F.`
+ * - numbers → STEP integer or REAL literal
+ * - strings starting with `#`, `.ENUM.`, `$`, `*` pass through unchanged
+ *   (callers tag references as the string `"#42"` or via `entityRef(42)`)
+ * - other strings are emitted as quoted STEP strings
+ * - arrays are emitted as STEP lists `(a,b,c)`, recursing on each element
+ */
+export function serializeStepValue(value: IfcAttributeValue): string {
+  if (value === null || value === undefined) return '$';
+  if (typeof value === 'boolean') return value ? '.T.' : '.F.';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return '$';
+    return Number.isInteger(value) ? String(value) : toStepReal(value);
+  }
+  if (Array.isArray(value)) {
+    return `(${value.map(serializeStepValue).join(',')})`;
+  }
+  const trimmed = String(value).trim();
+  if (trimmed === '$' || trimmed === '*') return trimmed;
+  if (/^#\d+$/.test(trimmed)) return trimmed;
+  if (/^\.[A-Z0-9_]+\.$/i.test(trimmed)) return trimmed.toUpperCase();
+  return `'${escapeStepString(String(value))}'`;
+}
+
+/**
+ * Serialize an attribute list to a STEP entity body.
+ * Example: `[1, '.AREA.', null]` → `1,.AREA.,$`
+ */
+export function serializeStepArgs(values: IfcAttributeValue[]): string {
+  return values.map(serializeStepValue).join(',');
+}
+
+/** Tag a number as a STEP entity reference (`#N`) for `serializeStepValue`. */
+export function entityRef(expressId: number): string {
+  return `#${expressId}`;
+}
+
+/**
  * Split a STEP argument list on top-level commas, respecting nested
  * parentheses and quoted strings. Used by `applyAttributeMutations`.
  */
@@ -174,7 +221,13 @@ export function splitTopLevelArgs(text: string): string[] {
     }
   }
 
-  if (current.trim() || text.endsWith(',')) {
+  // Trailing tokens: only push if there's actual content. The previous
+  // `text.endsWith(',')` check pushed an empty trailing token for inputs
+  // like `"a,"`, producing `['a', '']` — STEP doesn't allow trailing
+  // commas, so the right answer is just `['a']`. Empty interior args
+  // (e.g. `"a,,b"` → `['a', '', 'b']`) are still produced because the
+  // comma branch above handles them.
+  if (current.trim()) {
     parts.push(current.trim());
   }
 
@@ -221,4 +274,41 @@ export function splitTopLevelStepArguments(input: string): string[] {
 
   parts.push(current);
   return parts;
+}
+
+/**
+ * Assemble a STEP file from header and entity lines as a Uint8Array.
+ * Encodes each entity individually to avoid hitting V8's ~256 MB string
+ * length limit on large models. Shared by the STEP and merged exporters
+ * (was duplicated byte-for-byte in both — alignment audit).
+ */
+export function assembleStepBytes(header: string, entities: string[]): Uint8Array {
+  const encoder = new TextEncoder();
+
+  const headBytes = encoder.encode(`${header}DATA;\n`);
+  const tailBytes = encoder.encode('ENDSEC;\nEND-ISO-10303-21;\n');
+  const newline = encoder.encode('\n');
+
+  let totalSize = headBytes.byteLength + tailBytes.byteLength;
+  const entityBytes: Uint8Array[] = new Array(entities.length);
+  for (let i = 0; i < entities.length; i++) {
+    entityBytes[i] = encoder.encode(entities[i]);
+    totalSize += entityBytes[i].byteLength + newline.byteLength;
+  }
+
+  const result = new Uint8Array(totalSize);
+  let offset = 0;
+
+  result.set(headBytes, offset);
+  offset += headBytes.byteLength;
+
+  for (let i = 0; i < entityBytes.length; i++) {
+    result.set(entityBytes[i], offset);
+    offset += entityBytes[i].byteLength;
+    result.set(newline, offset);
+    offset += newline.byteLength;
+  }
+
+  result.set(tailBytes, offset);
+  return result;
 }
