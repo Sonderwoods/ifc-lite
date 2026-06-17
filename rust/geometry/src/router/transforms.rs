@@ -29,7 +29,7 @@ impl GeometryRouter {
 
         let mut transform = self.get_placement_transform(&placement, decoder)?;
         self.scale_transform(&mut transform);
-        self.transform_mesh(mesh, &transform);
+        self.transform_mesh_world(mesh, &transform);
         Ok(())
     }
 
@@ -347,24 +347,35 @@ impl GeometryRouter {
         Ok(transform)
     }
 
-    /// Transform mesh by matrix - optimized with chunk-based iteration.
+    /// Transform mesh by a local matrix without applying model RTC.
     ///
-    /// RTC policy: when the router has a non-zero RTC offset, subtract it from
-    /// EVERY mesh uniformly (unless the mesh already had RTC applied during
-    /// preprocessing — e.g. FacetedBrep batches). Previously this was gated
-    /// per-mesh on placement/vertex magnitude, which left small site-local
-    /// meshes in one space while large world-space meshes were shifted into
-    /// another. Mixing the two caused parts of a building to appear far from
-    /// the rest. Uniform application guarantees all objects under a site share
-    /// the same translation.
+    /// Use this for nested representation transforms (for example IfcMappedItem
+    /// mapping targets). RTC belongs to the final model/world coordinate step, not
+    /// intermediate local transforms.
     #[inline]
-    pub(super) fn transform_mesh(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
-        let rtc = self.rtc_offset;
+    pub(super) fn transform_mesh_local(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
+        mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
+            let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+            let t = transform.transform_point(&point);
+            chunk[0] = t.x as f32;
+            chunk[1] = t.y as f32;
+            chunk[2] = t.z as f32;
+        });
 
+        self.transform_normals(mesh, transform);
+    }
+
+    /// Transform mesh by the final world/object placement matrix.
+    ///
+    /// If a model RTC offset is active, subtract it uniformly for every mesh in
+    /// this final coordinate step. Meshes that already had RTC subtracted in f64
+    /// during raw world-coordinate triangulation are guarded by `rtc_applied`.
+    #[inline]
+    pub(super) fn transform_mesh_world(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
+        let rtc = self.rtc_offset;
         let needs_rtc = self.has_rtc_offset() && !mesh.rtc_applied;
 
         if needs_rtc {
-            // Apply RTC offset to all vertices uniformly
             mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
                 let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
                 let t = transform.transform_point(&point);
@@ -373,7 +384,6 @@ impl GeometryRouter {
                 chunk[2] = (t.z - rtc.2) as f32;
             });
         } else {
-            // No RTC offset - just transform
             mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
                 let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
                 let t = transform.transform_point(&point);
@@ -383,7 +393,11 @@ impl GeometryRouter {
             });
         }
 
-        // Transform normals (without translation)
+        self.transform_normals(mesh, transform);
+    }
+
+    #[inline]
+    fn transform_normals(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
         let rotation = transform.fixed_view::<3, 3>(0, 0);
         mesh.normals.chunks_exact_mut(3).for_each(|chunk| {
             let normal = Vector3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);

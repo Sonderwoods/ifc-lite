@@ -15,7 +15,76 @@
 use ifc_lite_processing::{
     process_geometry, process_geometry_filtered, OpeningFilterMode, ParseResponse, ProcessingResult,
 };
+use std::backtrace::Backtrace;
+use std::cell::RefCell;
+use std::io::Write;
 use std::slice;
+use std::sync::{Once, OnceLock};
+
+/// Stack size for the geometry worker threads (256 MiB).
+///
+/// IFC geometry processing recurses deeply: BSP-tree CSG (via `csgrs`) and chains of nested
+/// boolean clipping (e.g. a wall with hundreds of openings) build call stacks far past the
+/// default ~1 MiB worker stack. Overflowing it hits the guard page and aborts the whole host
+/// process (Rhino) with `STACK_OVERFLOW` (0xC00000FD) — no panic, no unwind, nothing
+/// `catch_unwind` can intercept. A large stack gives that recursion room to complete.
+const PARSE_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+/// Dedicated rayon pool whose worker threads have a large stack (see [`PARSE_STACK_SIZE`]).
+///
+/// The actual per-element geometry work runs inside `process_geometry` via
+/// `par_iter` on rayon workers, so the recursion lives on *their* stacks — not the caller's.
+/// Running the parse through `pool.install(..)` makes both the entry closure and every nested
+/// `par_iter` use these large-stack workers. Built once and reused.
+fn parse_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .stack_size(PARSE_STACK_SIZE)
+            .thread_name(|i| format!("ifc-lite-parse-{i}"))
+            .build()
+            .expect("failed to build ifc-lite parse thread pool")
+    })
+}
+
+thread_local! {
+    /// Path of the IFC file currently being parsed on this thread, so the panic hook
+    /// can name the offending file. Empty when no parse is in flight.
+    static CURRENT_IFC_PATH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+static PANIC_HOOK_INIT: Once = Once::new();
+
+/// Installs a process-wide panic hook exactly once.
+///
+/// The hook appends the IFC path being parsed, the panic message/location and a
+/// captured backtrace to `%TEMP%/ifc_lite_panic.log`, then chains to the previous
+/// hook (preserving the default stderr output). Panic hooks run *before* the runtime
+/// unwinds or aborts, so this leaves a breadcrumb identifying the file even in a
+/// `panic = "abort"` build where `catch_unwind` cannot recover.
+fn ensure_panic_logging() {
+    PANIC_HOOK_INIT.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let path = CURRENT_IFC_PATH.with(|p| p.borrow().clone());
+            let backtrace = Backtrace::force_capture();
+            let log_path = std::env::temp_dir().join("ifc_lite_panic.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(
+                    file,
+                    "==== ifc-lite panic ====\nfile: {}\n{info}\nbacktrace:\n{backtrace}\n",
+                    if path.is_empty() { "<unknown>" } else { &path },
+                );
+            }
+
+            previous_hook(info);
+        }));
+    });
+}
 
 /// Threshold in meters. If a mesh's first vertex exceeds this magnitude,
 /// the mesh is still in world-space and needs the site translation subtracted.
@@ -24,15 +93,11 @@ const LARGE_COORD_THRESHOLD: f64 = 1000.0;
 
 /// Post-process meshes to ensure all positions are in uniform site-local coordinates.
 ///
-/// DISABLED — RTC has been turned off project-wide (see `router::has_rtc_offset`).
-/// With RTC off, all meshes already share the same coordinate space straight from
-/// the IFC file, so there is nothing to normalize. Re-enable by removing the early
-/// return if RTC is ever turned back on.
+/// With the site-translation-as-RTC approach, most meshes are already site-local
+/// after `transform_mesh`. This catches any stragglers whose placement/vertices
+/// didn't trigger the RTC path (e.g. meshes with small local coords and identity
+/// placement that were already site-local in the IFC file).
 fn normalize_to_site_local(result: &mut ProcessingResult) {
-    let _ = result;
-    return;
-
-    #[allow(unreachable_code)]
     let site_tx: f64;
     let site_ty: f64;
     let site_tz: f64;
@@ -106,6 +171,8 @@ pub unsafe extern "C" fn ifc_lite_parse(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
+    ensure_panic_logging();
+
     let path_bytes = slice::from_raw_parts(path_ptr, path_len);
     let path_str = match std::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -117,9 +184,13 @@ pub unsafe extern "C" fn ifc_lite_parse(
         Err(_) => return 2,
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        process_geometry(&content)
-    }));
+    CURRENT_IFC_PATH.with(|p| *p.borrow_mut() = path_str.to_string());
+
+    let result = parse_pool().install(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| process_geometry(&content)))
+    });
+
+    CURRENT_IFC_PATH.with(|p| p.borrow_mut().clear());
 
     let mut result = match result {
         Ok(r) => r,
@@ -174,6 +245,8 @@ pub unsafe extern "C" fn ifc_lite_parse_ex(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
+    ensure_panic_logging();
+
     let path_bytes = slice::from_raw_parts(path_ptr, path_len);
     let path_str = match std::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -191,9 +264,15 @@ pub unsafe extern "C" fn ifc_lite_parse_ex(
         _ => OpeningFilterMode::Default,
     };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        process_geometry_filtered(&content, mode)
-    }));
+    CURRENT_IFC_PATH.with(|p| *p.borrow_mut() = path_str.to_string());
+
+    let result = parse_pool().install(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_geometry_filtered(&content, mode)
+        }))
+    });
+
+    CURRENT_IFC_PATH.with(|p| p.borrow_mut().clear());
 
     let mut result = match result {
         Ok(r) => r,

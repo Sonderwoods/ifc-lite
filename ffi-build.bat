@@ -9,8 +9,10 @@ if %errorlevel% neq 0 (
     exit /b %errorlevel%
 )
 echo Copying DLLs...
-copy /y target\release\ifc_lite_ffi.dll ..\LINK_EP.LINK_RH\tools\ifc-lite\
-copy /y target\release\ifc_lite_ffi.dll ..\bin\Debug\
-copy /y target\release\ifc-lite-server.exe ..\LINK_EP.LINK_RH\tools\ifc-lite\
+if not exist "..\LINK_Rhino\LINK_EP.Aioli\tools\ifc-lite\" mkdir "..\LINK_Rhino\LINK_EP.Aioli\tools\ifc-lite\"
+copy /y target\release\ifc_lite_ffi.dll "..\LINK_Rhino\LINK_EP.Aioli\tools\ifc-lite\"
+copy /y target\release\ifc-lite-server.exe "..\LINK_Rhino\LINK_EP.Aioli\tools\ifc-lite\"
+copy /y target\release\ifc_lite_ffi.dll "..\LINK_Rhino\bin\Debug\"
+if exist "..\LINK_Rhino\bin\Release\" copy /y target\release\ifc_lite_ffi.dll "..\LINK_Rhino\bin\Release\"
 echo FFI build and copy complete. Rebuild in Visual Studio and restart Rhino.
 pause

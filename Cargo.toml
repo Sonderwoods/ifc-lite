@@ -21,8 +21,12 @@ opt-level = 3           # Optimize for speed
 lto = true              # Link-time optimization
 codegen-units = 1       # Better optimization (slower compile)
 strip = true            # Strip symbols
-panic = 'abort'         # Smaller panic handler
 overflow-checks = false # Remove overflow checks in release
+# NOTE: panic strategy is intentionally left at the default ('unwind'). Do NOT set
+# panic = 'abort' here: the FFI DLL (rust/ffi) is loaded in-process by Rhino and the
+# server parses untrusted IFC files. Both rely on unwinding so a parser panic becomes a
+# catchable error (FFI -> catch_unwind -> error code 3; server -> CatchPanicLayer -> 500)
+# instead of abort() taking down the whole host process with no warning.
 
 [profile.release.package."*"]
 opt-level = 3

@@ -72,17 +72,6 @@ pub struct GeometryRouter {
 impl GeometryRouter {
     /// Create new router with default processors
     pub fn new() -> Self {
-        Self::new_with_options(false)
-    }
-
-    /// Create a router that ignores inner curves in `IfcArbitraryProfileDefWithVoids`,
-    /// producing solid wall meshes without window/door openings baked into profiles.
-    pub fn new_skip_profile_voids() -> Self {
-        Self::new_with_options(true)
-    }
-
-    /// Internal constructor with all option flags.
-    fn new_with_options(skip_profile_voids: bool) -> Self {
         let schema = IfcSchema::new();
         let schema_clone = schema.clone();
         let mut router = Self {
@@ -96,12 +85,9 @@ impl GeometryRouter {
         };
 
         // Register default P0 processors
-        let extrusion_processor = if skip_profile_voids {
-            Box::new(ExtrudedAreaSolidProcessor::new_skip_profile_voids(schema_clone.clone()))
-        } else {
-            Box::new(ExtrudedAreaSolidProcessor::new(schema_clone.clone()))
-        };
-        router.register(extrusion_processor);
+        router.register(Box::new(ExtrudedAreaSolidProcessor::new(
+            schema_clone.clone(),
+        )));
         router.register(Box::new(TriangulatedFaceSetProcessor::new()));
         router.register(Box::new(PolygonalFaceSetProcessor::new()));
         router.register(Box::new(MappedItemProcessor::new()));
@@ -188,24 +174,6 @@ impl GeometryRouter {
         router
     }
 
-    /// Create router with unit scale, RTC offset, and profile-void skipping.
-    /// When `skip_profile_voids` is true, inner curves in `IfcArbitraryProfileDefWithVoids`
-    /// are ignored so walls come out without window/door openings baked into profiles.
-    pub fn with_scale_rtc_and_skip_voids(
-        unit_scale: f64,
-        rtc_offset: (f64, f64, f64),
-        skip_profile_voids: bool,
-    ) -> Self {
-        let mut router = if skip_profile_voids {
-            Self::new_skip_profile_voids()
-        } else {
-            Self::new()
-        };
-        router.unit_scale = unit_scale;
-        router.rtc_offset = rtc_offset;
-        router
-    }
-
     /// Set the RTC offset for large coordinate handling
     pub fn set_rtc_offset(&mut self, offset: (f64, f64, f64)) {
         self.rtc_offset = offset;
@@ -216,16 +184,10 @@ impl GeometryRouter {
         self.rtc_offset
     }
 
-    /// Check if RTC offset is active (non-zero).
-    ///
-    /// NOTE: Hard-disabled — returns false regardless of `rtc_offset`.
-    /// RTC caused parts of buildings to drift apart (per-mesh veto left some
-    /// meshes in world-space while others were shifted into site-local).
-    /// Trust the IFC's own coordinates instead; accept f32 precision loss on
-    /// georeferenced models. Re-enable by restoring the original body.
+    /// Check if RTC offset is active (non-zero)
     #[inline]
     pub fn has_rtc_offset(&self) -> bool {
-        false
+        self.rtc_offset.0 != 0.0 || self.rtc_offset.1 != 0.0 || self.rtc_offset.2 != 0.0
     }
 
     /// Get the current unit scale factor
@@ -272,11 +234,22 @@ impl GeometryRouter {
             return;
         }
 
-        // RTC disabled — pass a zero offset so BREP vertices come out in the
-        // same coordinate space as all other meshes. See `has_rtc_offset`.
+        // Use batch processing for parallel triangulation.
+        // Convert RTC from meters to file units so the Brep processor
+        // subtracts the offset in the same coordinate space as the vertices.
         let processor = FacetedBrepProcessor::new();
-        let rtc_file_units = (0.0, 0.0, 0.0);
-        let results = processor.process_batch(brep_ids, decoder, rtc_file_units);
+        let rtc_file_units = (
+            self.rtc_offset.0 / self.unit_scale,
+            self.rtc_offset.1 / self.unit_scale,
+            self.rtc_offset.2 / self.unit_scale,
+        );
+        let large_coord_threshold_file_units = 10000.0 / self.unit_scale;
+        let results = processor.process_batch(
+            brep_ids,
+            decoder,
+            rtc_file_units,
+            large_coord_threshold_file_units,
+        );
 
         // Store results in cache (preallocate to avoid rehashing)
         let mut cache = self.faceted_brep_cache.borrow_mut();

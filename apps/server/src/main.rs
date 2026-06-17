@@ -31,7 +31,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{
-    compression::CompressionLayer, cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
+    catch_panic::CatchPanicLayer, compression::CompressionLayer, cors::CorsLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
 };
 
 mod config;
@@ -99,9 +100,14 @@ async fn main() {
         "Starting IFC-Lite Server"
     );
 
-    // Initialize rayon thread pool
+    // Initialize rayon thread pool.
+    // 256 MiB stack: IFC geometry processing (BSP-tree CSG, nested boolean clipping) recurses
+    // far past the default ~1 MiB worker stack on pathological files, overflowing the guard page
+    // and aborting the whole server process with STACK_OVERFLOW (0xC00000FD) — uncatchable by the
+    // CatchPanicLayer. The large stack gives that recursion room to complete.
     rayon::ThreadPoolBuilder::new()
         .num_threads(config.worker_threads)
+        .stack_size(256 * 1024 * 1024)
         .build_global()
         .expect("Failed to initialize rayon thread pool");
 
@@ -155,6 +161,11 @@ async fn main() {
         )))
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer(&config))
+        // Outermost layer: convert a panic in any handler (e.g. the IFC parser choking on a
+        // malformed file) into a 500 response instead of letting it unwind out of the task and
+        // drop the connection. Without this, the client (Rhino) hangs on a half-open socket
+        // until its own timeout. Relies on panic = 'unwind' (see workspace Cargo.toml).
+        .layer(CatchPanicLayer::new())
         .with_state(state);
 
     let addr = SocketAddr::from((config.host, config.port));

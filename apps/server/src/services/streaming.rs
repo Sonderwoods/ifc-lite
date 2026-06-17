@@ -120,24 +120,7 @@ fn prepare_streaming_data(content: String) -> PreparedData {
 
     // Preprocess FacetedBreps and extract unit_scale + rtc_offset
     let mut router = GeometryRouter::with_units(&content, &mut decoder);
-    let rtc_jobs: Vec<(u32, usize, usize, IfcType)> = jobs
-        .iter()
-        .map(|j| (j.id, j.start, j.end, j.ifc_type))
-        .collect();
-    let rtc_offset = match router.detect_rtc_offset_from_jobs(&rtc_jobs, &mut decoder) {
-        Some(offset) => offset,
-        None => {
-            // No usable translation samples — fall back to full-file coordinate scan
-            // for files where large real-world coordinates are encoded in points
-            // rather than in placement transforms.
-            scan_placement_bounds(&content).rtc_offset()
-        }
-    };
-    router.set_rtc_offset(rtc_offset);
-    if !faceted_brep_ids.is_empty() {
-        router.preprocess_faceted_breps(&faceted_brep_ids, &mut decoder);
-    }
-    // Resolve site/building placement transforms for cache consistency
+    // Resolve site/building placement transforms for cache consistency.
     let site_transform: Option<Vec<f64>> = site_entity_pos.and_then(|(start, end)| {
         let entity = decoder.decode_at(start, end).ok()?;
         let matrix = router
@@ -152,6 +135,30 @@ fn prepare_streaming_data(content: String) -> PreparedData {
             .ok()?;
         Some(matrix.to_vec())
     });
+
+    let rtc_jobs: Vec<(u32, usize, usize, IfcType)> = jobs
+        .iter()
+        .map(|j| (j.id, j.start, j.end, j.ifc_type))
+        .collect();
+    let detected_rtc_offset = match router.detect_rtc_offset_from_jobs(&rtc_jobs, &mut decoder) {
+        Some(offset) => offset,
+        None => {
+            // No usable translation samples — fall back to full-file coordinate scan
+            // for files where large real-world coordinates are encoded in points
+            // rather than in placement transforms.
+            scan_placement_bounds(&content).rtc_offset()
+        }
+    };
+
+    let rtc_offset = if let Some(ref st) = site_transform {
+        (st[12], st[13], st[14])
+    } else {
+        detected_rtc_offset
+    };
+    router.set_rtc_offset(rtc_offset);
+    if !faceted_brep_ids.is_empty() {
+        router.preprocess_faceted_breps(&faceted_brep_ids, &mut decoder);
+    }
 
     // OPTIMIZATION: Extract unit_scale before dropping router
     // This allows process_batch to use with_scale() instead of with_units() per mesh
@@ -444,7 +451,20 @@ pub fn process_streaming(
                 },
             },
             cache_key,
-            mesh_coordinate_space: Some("site_local".to_string()),
+            mesh_coordinate_space: Some(
+                if prepared.rtc_offset.0 != 0.0
+                    || prepared.rtc_offset.1 != 0.0
+                    || prepared.rtc_offset.2 != 0.0
+                {
+                    // RTC offset is the site placement translation, so meshes
+                    // are in site-local space. The C# grid alignment code keys
+                    // on this label to apply inverse(siteTransform) to grids.
+                    "site_local"
+                } else {
+                    "raw_ifc"
+                }
+                .to_string(),
+            ),
             site_transform: prepared.site_transform,
             building_transform: prepared.building_transform,
         };

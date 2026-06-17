@@ -15,8 +15,8 @@ pub struct ParseResponse {
     /// All meshes extracted from the IFC file.
     pub meshes: Vec<MeshData>,
     /// Declares the coordinate space used by serialized mesh vertices.
-    /// `site_local` means clients should bake meshes directly and only apply
-    /// placement transforms on the block instance.
+    /// `model_rtc` means a model-level RTC anchor was subtracted.
+    /// `raw_ifc` means no RTC anchor was applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh_coordinate_space: Option<String>,
     /// IfcSite ObjectPlacement as a column-major 4x4 matrix (16 f64 values, in meters).
