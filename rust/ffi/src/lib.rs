@@ -19,8 +19,7 @@
 //! `server-release` inherits `release` but restores `panic = "unwind"`.
 
 use ifc_lite_processing::{
-    extract_symbolic_data, process_geometry_filtered, OpeningFilterMode, ParseResponse,
-    ProcessingResult,
+    process_geometry_filtered, OpeningFilterMode, ParseResponse, ProcessingResult,
 };
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
@@ -166,22 +165,15 @@ fn parse_impl(path_str: &str, mode: OpeningFilterMode) -> Result<Vec<u8>, i32> {
 
     CURRENT_IFC_PATH.with(|p| *p.borrow_mut() = path_str.to_string());
 
-    // Run geometry *and* 2D symbol extraction inside the same large-stack pool
-    // and the same `catch_unwind`: both walk the untrusted IFC bytes and can
-    // panic, so both must be covered by the crash-isolation guard. This mirrors
-    // the server path (`apps/server/src/routes/parse.rs`), which likewise runs
-    // `process_geometry_*` and `extract_symbolic_data` over the same content.
-    let outcome = parse_pool().install(|| {
+    let result = parse_pool().install(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let result = process_geometry_filtered(&content, mode);
-            let symbolic_data = extract_symbolic_data(&content);
-            (result, symbolic_data)
+            process_geometry_filtered(&content, mode)
         }))
     });
 
     CURRENT_IFC_PATH.with(|p| p.borrow_mut().clear());
 
-    let (mut result, symbolic_data) = outcome.map_err(|_| 3)?;
+    let mut result = result.map_err(|_| 3)?;
 
     // Normalize all meshes to uniform site-local coordinates.
     normalize_to_site_local(&mut result);
@@ -194,9 +186,10 @@ fn parse_impl(path_str: &str, mode: OpeningFilterMode) -> Result<Vec<u8>, i32> {
         building_transform: result.building_transform,
         metadata: result.metadata,
         stats: result.stats,
-        // 2D symbol data (IfcAnnotation / IfcGrid) extracted alongside geometry,
-        // matching the server's `ParseResponse` (issue #843 parity).
-        symbolic_data,
+        // This fork's `ParseResponse` carries 2D symbol data; the FFI parse path
+        // is geometry-only, so emit an empty (default) set. `ProcessingResult`
+        // has no `symbolic_data` to forward here.
+        symbolic_data: Default::default(),
     };
 
     serde_json::to_vec(&response).map_err(|_| 4)
