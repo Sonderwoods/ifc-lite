@@ -1,0 +1,23 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+[package]
+name = "ifc-lite-ffi-smoke"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CI smoke test that loads the ifc-lite FFI DLL and exercises its C ABI"
+publish = false
+
+[[bin]]
+name = "ffi-smoke"
+path = "src/main.rs"
+
+[dependencies]
+# Loads the *built* cdylib at runtime (like a CAD host's P/Invoke) rather than
+# linking the FFI crate directly, so the test crosses the real C ABI boundary.
+libloading = "0.8"
+serde_json = "1.0"
