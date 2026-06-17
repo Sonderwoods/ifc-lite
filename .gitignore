@@ -84,3 +84,9 @@ tests/models/**/*.part
 
 # Large IFC test fixtures (downloaded separately)
 rust/geometry/tests/*.ifc
+
+# Local Windows build helpers (machine-specific paths, e.g. ffi-build.bat copying
+# the DLL into a sibling Linkajou checkout). Already-tracked .bat scripts stay
+# tracked; use `git add -f` to force-add one you really want committed.
+# See FORK_OVERRIDES.md entry #3.
+*.bat

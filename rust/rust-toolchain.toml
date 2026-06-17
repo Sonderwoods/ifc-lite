@@ -1,4 +1,9 @@
 [toolchain]
-channel = "nightly"
+# Pinned to match the root rust-toolchain.toml. wasm-pack runs inside rust/ and
+# resolves THIS file first; leaving it floating ("nightly") let it grab a newer
+# nightly (2026-03) whose LLVM wasm backend can't lower the geometry kernel's
+# 128-bit SIMD integer compares (cmp_lex) -> "Cannot select v16i8 setcc". The
+# Nov-2025 pin builds wasm+simd128 cleanly. See FORK_OVERRIDES.md entry #2.
+channel = "nightly-2025-11-15"
 components = ["rust-src"]
 targets = ["wasm32-unknown-unknown"]
