@@ -7,7 +7,7 @@
  */
 
 import type { StateCreator } from 'zustand';
-import type { CameraRotation, CameraCallbacks, ProjectionMode } from '../types.js';
+import type { CameraRotation, CameraCallbacks, ProjectionMode, SpaceMouseCallbacks } from '../types.js';
 import { CAMERA_DEFAULTS } from '../constants.js';
 
 export interface CameraSlice {
@@ -17,6 +17,12 @@ export interface CameraSlice {
   projectionMode: ProjectionMode;
   onCameraRotationChange: ((rotation: CameraRotation) => void) | null;
   onScaleChange: ((scale: number) => void) | null;
+  /** Imperative connect/disconnect handlers for a SpaceMouse (WebHID). */
+  spaceMouseCallbacks: SpaceMouseCallbacks;
+  /** True while a SpaceMouse is connected and streaming. */
+  spaceMouseConnected: boolean;
+  /** User sensitivity multiplier for SpaceMouse navigation (1 = default). */
+  spaceMouseSensitivity: number;
 
   // Actions
   setCameraRotation: (rotation: CameraRotation) => void;
@@ -27,6 +33,9 @@ export interface CameraSlice {
   updateCameraRotationRealtime: (rotation: CameraRotation) => void;
   setOnScaleChange: (callback: ((scale: number) => void) | null) => void;
   updateScaleRealtime: (scale: number) => void;
+  setSpaceMouseCallbacks: (callbacks: SpaceMouseCallbacks) => void;
+  setSpaceMouseConnected: (connected: boolean) => void;
+  setSpaceMouseSensitivity: (sensitivity: number) => void;
 }
 
 export const createCameraSlice: StateCreator<CameraSlice, [], [], CameraSlice> = (set, get) => ({
@@ -39,6 +48,9 @@ export const createCameraSlice: StateCreator<CameraSlice, [], [], CameraSlice> =
   projectionMode: 'perspective',
   onCameraRotationChange: null,
   onScaleChange: null,
+  spaceMouseCallbacks: {},
+  spaceMouseConnected: false,
+  spaceMouseSensitivity: 1,
 
   // Actions
   setCameraRotation: (cameraRotation) => set({ cameraRotation }),
@@ -73,4 +85,9 @@ export const createCameraSlice: StateCreator<CameraSlice, [], [], CameraSlice> =
     }
     // Don't update store state during real-time updates
   },
+
+  setSpaceMouseCallbacks: (spaceMouseCallbacks) => set({ spaceMouseCallbacks }),
+  setSpaceMouseConnected: (spaceMouseConnected) => set({ spaceMouseConnected }),
+  setSpaceMouseSensitivity: (spaceMouseSensitivity) =>
+    set({ spaceMouseSensitivity: Math.max(0.1, Math.min(4, spaceMouseSensitivity)) }),
 });

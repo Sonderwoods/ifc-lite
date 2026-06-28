@@ -51,6 +51,7 @@ import {
   Redo2,
   Boxes,
   Shapes,
+  Mouse,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -370,6 +371,11 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
   const setRightPanelCollapsed = useViewerStore((state) => state.setRightPanelCollapsed);
   const projectionMode = useViewerStore((state) => state.projectionMode);
   const toggleProjectionMode = useViewerStore((state) => state.toggleProjectionMode);
+  // SpaceMouse (3Dconnexion) navigation — WebHID, Chromium-only
+  const spaceMouseCallbacks = useViewerStore((state) => state.spaceMouseCallbacks);
+  const spaceMouseConnected = useViewerStore((state) => state.spaceMouseConnected);
+  const spaceMouseSensitivity = useViewerStore((state) => state.spaceMouseSensitivity);
+  const setSpaceMouseSensitivity = useViewerStore((state) => state.setSpaceMouseSensitivity);
   // Basket presentation state
   const pinboardEntities = useViewerStore((state) => state.pinboardEntities);
   const basketViewCount = useViewerStore((state) => state.basketViews.length);
@@ -1587,6 +1593,54 @@ export function MainToolbar({ onShowShortcuts }: MainToolbarProps = {} as MainTo
             <Info className="h-4 w-4 mr-2" />
             Hover tooltips
           </DropdownMenuCheckboxItem>
+          {/*
+            SpaceMouse (3Dconnexion) navigation. Only shown when WebHID is
+            available — the controls hook registers a `connect` callback only
+            on Chromium-based browsers, so its absence is the support probe.
+          */}
+          {spaceMouseCallbacks.connect && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                SpaceMouse
+              </DropdownMenuLabel>
+              <DropdownMenuItem
+                onClick={() => {
+                  if (spaceMouseConnected) {
+                    spaceMouseCallbacks.disconnect?.();
+                  } else {
+                    void spaceMouseCallbacks.connect?.();
+                  }
+                }}
+              >
+                <Mouse className="h-4 w-4 mr-2" />
+                {spaceMouseConnected ? 'Disconnect SpaceMouse' : 'Connect SpaceMouse'}
+              </DropdownMenuItem>
+              {spaceMouseConnected && (
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger>
+                    <Move className="h-4 w-4 mr-2" />
+                    Sensitivity
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent>
+                    {([
+                      ['Low', 0.5],
+                      ['Normal', 1],
+                      ['High', 2],
+                    ] as const).map(([label, value]) => (
+                      <DropdownMenuCheckboxItem
+                        key={label}
+                        checked={Math.abs(spaceMouseSensitivity - value) < 1e-6}
+                        onCheckedChange={() => setSpaceMouseSensitivity(value)}
+                      >
+                        {label}
+                      </DropdownMenuCheckboxItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              )}
+            </>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
 

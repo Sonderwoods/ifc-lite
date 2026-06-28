@@ -234,6 +234,19 @@ export interface CameraRotation {
 
 export type ProjectionMode = 'perspective' | 'orthographic';
 
+/**
+ * Imperative handlers for a connected SpaceMouse (3Dconnexion) device.
+ * Registered by `useSpaceMouseControls` and invoked from the toolbar —
+ * WebHID device selection must run inside a user gesture, so it can't be
+ * triggered purely from store state. Empty when WebHID is unsupported.
+ */
+export interface SpaceMouseCallbacks {
+  /** Prompt for / open a device. Resolves true once streaming. */
+  connect?: () => Promise<boolean>;
+  /** Close the active device and stop the navigation loop. */
+  disconnect?: () => void;
+}
+
 export interface CameraViewpoint {
   position: { x: number; y: number; z: number };
   target: { x: number; y: number; z: number };

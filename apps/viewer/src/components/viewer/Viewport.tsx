@@ -38,6 +38,7 @@ import { useMouseControls, type MouseState } from './useMouseControls.js';
 import { RectSelectionOverlay, type RectSelectionRect } from './RectSelectionOverlay.js';
 import { useTouchControls, type TouchState } from './useTouchControls.js';
 import { useKeyboardControls } from './useKeyboardControls.js';
+import { useSpaceMouseControls } from './useSpaceMouseControls.js';
 import { useAnimationLoop } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
 import { usePointCloudSync } from './usePointCloudSync.js';
@@ -233,7 +234,14 @@ export function Viewport({
   } = useToolState();
 
   // Camera state
-  const { updateCameraRotationRealtime, updateScaleRealtime, setCameraCallbacks } = useCameraState();
+  const {
+    updateCameraRotationRealtime,
+    updateScaleRealtime,
+    setCameraCallbacks,
+    setSpaceMouseCallbacks,
+    setSpaceMouseConnected,
+    spaceMouseSensitivity,
+  } = useCameraState();
 
   // Theme state
   const {
@@ -397,6 +405,7 @@ export function Viewport({
     solarSunAltitude,
   ]);
   const environmentRef = useLatestRef(environment);
+  const spaceMouseSensitivityRef = useLatestRef(spaceMouseSensitivity);
   useEffect(() => {
     rendererRef.current?.requestRender();
   }, [environment]);
@@ -1132,6 +1141,18 @@ export function Viewport({
     sectionRangeRef,
     updateCameraRotationRealtime,
     calculateScale,
+  });
+
+  useSpaceMouseControls({
+    rendererRef,
+    isInitialized,
+    firstPersonModeRef,
+    isInteractingRef,
+    sensitivityRef: spaceMouseSensitivityRef,
+    updateCameraRotationRealtime,
+    calculateScale,
+    setSpaceMouseCallbacks,
+    setSpaceMouseConnected,
   });
 
   useAnimationLoop({

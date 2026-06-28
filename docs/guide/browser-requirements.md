@@ -84,6 +84,32 @@ function checkWASM(): boolean {
 }
 ```
 
+## SpaceMouse / WebHID (Optional)
+
+The viewer supports **3Dconnexion SpaceMouse** 6-degrees-of-freedom
+navigation devices through the **WebHID** API. This is an optional input
+method — the viewer is fully usable with mouse, touch, and keyboard when no
+device or WebHID support is present.
+
+| Browser | WebHID | SpaceMouse navigation |
+|---------|--------|-----------------------|
+| Chrome / Edge | 89+ | :material-check-circle:{ .success } Supported |
+| Firefox | — | :material-close-circle:{ .error } No WebHID |
+| Safari | — | :material-close-circle:{ .error } No WebHID |
+
+To use a SpaceMouse, open the viewer's **View options** menu (the grid icon
+in the toolbar) and choose **Connect SpaceMouse**. The browser will prompt
+you to grant access to the device — this prompt only appears in response to
+that click, per the WebHID permission model. Once connected:
+
+- **Push / pull the cap** to dolly (zoom) in and out
+- **Slide the cap** to pan, **lift** it to pan vertically
+- **Tilt** to look up/down, **twist** to orbit around the model
+- In **Walk mode** (`C`), translation drives first-person movement instead
+
+Sensitivity (Low / Normal / High) is adjustable from the same menu. The
+**Connect SpaceMouse** entry is hidden entirely on browsers without WebHID.
+
 ## JavaScript Requirements
 
 IFClite requires ES2022+ features:

@@ -139,11 +139,17 @@ export function useCameraState() {
   const updateCameraRotationRealtime = useViewerStore((state) => state.updateCameraRotationRealtime);
   const updateScaleRealtime = useViewerStore((state) => state.updateScaleRealtime);
   const setCameraCallbacks = useViewerStore((state) => state.setCameraCallbacks);
+  const setSpaceMouseCallbacks = useViewerStore((state) => state.setSpaceMouseCallbacks);
+  const setSpaceMouseConnected = useViewerStore((state) => state.setSpaceMouseConnected);
+  const spaceMouseSensitivity = useViewerStore((state) => state.spaceMouseSensitivity);
 
   return {
     updateCameraRotationRealtime,
     updateScaleRealtime,
     setCameraCallbacks,
+    setSpaceMouseCallbacks,
+    setSpaceMouseConnected,
+    spaceMouseSensitivity,
   };
 }
 
