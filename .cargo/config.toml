@@ -3,6 +3,11 @@ rustflags = [
   "-C", "link-arg=--max-memory=4294967296",
   "-C", "link-arg=-zstack-size=8388608",
   "-C", "target-feature=+simd128",
+  # Workaround for an LLVM wasm backend ICE on nightly-2025-11-15:
+  # SLP-vectorizing bnum's [u64; N] compare loops (e.g. geometry::kernel::fixed::cmp_lex)
+  # emits an `i64x2` setcc the wasm backend cannot select ("Cannot select v2i64 setcc").
+  # Disabling SLP avoids the fused vector compare; simd128 stays on for everything else.
+  "-C", "llvm-args=-vectorize-slp=false",
 ]
 
 [unstable]
