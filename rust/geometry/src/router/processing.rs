@@ -815,6 +815,37 @@ impl GeometryRouter {
             return Ok(mesh);
         }
 
+        // Raw national-grid surface models (UTM-scale polyloop points). The processor reads the
+        // points in f64 and the f32 cast is what costs the precision (0.5 m steps at a 6.7 million
+        // northing), so subtract a whole-unit anchor IN f64 first and carry it in `mesh.origin`
+        // (PRE-transform translation, metres) for the world transform to add back in f64. Not
+        // cached: the content hash cannot tell two anchors apart.
+        if matches!(
+            item.ifc_type,
+            IfcType::IfcFaceBasedSurfaceModel | IfcType::IfcShellBasedSurfaceModel
+        ) && self.processors.contains_key(&item.ifc_type)
+        {
+            if let Some(first) = self.raw_first_vertex(item, decoder) {
+                if self.raw_coordinate_is_large(first) {
+                    let anchor = (first.0.round(), first.1.round(), first.2.round());
+                    let processor = &self.processors[&item.ifc_type];
+                    let mut mesh = crate::processors::with_raw_anchor(anchor, || {
+                        processor.process(item, decoder, &self.schema, self.tessellation_quality)
+                    })?;
+                    mesh.validate_indices();
+                    self.scale_mesh(&mut mesh);
+                    if !mesh.positions.is_empty() {
+                        mesh.origin = [
+                            anchor.0 * self.unit_scale,
+                            anchor.1 * self.unit_scale,
+                            anchor.2 * self.unit_scale,
+                        ];
+                    }
+                    return Ok(mesh);
+                }
+            }
+        }
+
         // Check if we have a processor for this type
         if let Some(processor) = self.processors.get(&item.ifc_type) {
             let mut mesh =

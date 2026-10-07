@@ -94,6 +94,28 @@ impl GeometryRouter {
         // in geometry vertices with identity placement — placement-only sampling
         // would miss the large coordinates and fail to detect the need for RTC.
         const NEAR_ORIGIN: f64 = 1000.0;
+
+        // A FAR placement is not proof of a far element. Files that carry absolute national-grid
+        // points (UTM, ~6.7 million northing) and cancel them with a negative context/placement
+        // translation (the IfcGeometricRepresentationContext WCS) have a huge placement AND huge
+        // vertices that sum to a small world position. Trusting the placement alone picked it as
+        // the RTC anchor, so the subtraction ADDED the offset back and the mesh left here at
+        // ~6.7 million, where f32 steps are 0.5 m (stair-stepped terrain and slabs). So probe the
+        // vertex here too and vote with where the element REALLY is; if the probe cannot read a
+        // vertex (swept solids), fall through to the placement exactly as before.
+        if tx.abs() >= NEAR_ORIGIN || ty.abs() >= NEAR_ORIGIN || tz.abs() >= NEAR_ORIGIN {
+            if let Some((vx, vy, vz)) = self.sample_first_geometry_vertex(entity, decoder) {
+                let world = transform.transform_point(&nalgebra::Point3::new(
+                    vx * self.unit_scale,
+                    vy * self.unit_scale,
+                    vz * self.unit_scale,
+                ));
+                if world.x.is_finite() && world.y.is_finite() && world.z.is_finite() {
+                    return Some((world.x, world.y, world.z));
+                }
+            }
+        }
+
         if tx.abs() < NEAR_ORIGIN && ty.abs() < NEAR_ORIGIN && tz.abs() < NEAR_ORIGIN {
             if let Some((vx, vy, vz)) = self.sample_first_geometry_vertex(entity, decoder) {
                 // Transform vertex by placement to get world-space position.
@@ -335,7 +357,7 @@ impl GeometryRouter {
         Some((x, y, z))
     }
 
-    fn raw_coordinate_is_large(&self, point: (f64, f64, f64)) -> bool {
+    pub(super) fn raw_coordinate_is_large(&self, point: (f64, f64, f64)) -> bool {
         let max_abs = point.0.abs().max(point.1.abs()).max(point.2.abs());
         max_abs * self.unit_scale > LARGE_COORD_THRESHOLD_METERS
     }
@@ -345,7 +367,19 @@ impl GeometryRouter {
         item: &DecodedEntity,
         decoder: &mut EntityDecoder,
     ) -> bool {
-        let first_vertex = match item.ifc_type {
+        self.raw_first_vertex(item, decoder)
+            .map(|point| self.raw_coordinate_is_large(point))
+            .unwrap_or(false)
+    }
+
+    /// First raw vertex of a representation item, in FILE units, for the item types whose
+    /// processors store raw (un-placed) coordinates. `None` for everything else.
+    pub(super) fn raw_first_vertex(
+        &self,
+        item: &DecodedEntity,
+        decoder: &mut EntityDecoder,
+    ) -> Option<(f64, f64, f64)> {
+        match item.ifc_type {
             IfcType::IfcFacetedBrep | IfcType::IfcFacetedBrepWithVoids => {
                 self.brep_first_vertex(item, decoder)
             }
@@ -354,16 +388,16 @@ impl GeometryRouter {
             | IfcType::IfcPolygonalFaceSet => self.tessellated_first_vertex(item, decoder),
             IfcType::IfcFaceBasedSurfaceModel | IfcType::IfcShellBasedSurfaceModel => {
                 let Some(shells_attr) = item.get(0) else {
-                    return false;
+                    return None;
                 };
                 let Some(shells) = shells_attr.as_list() else {
-                    return false;
+                    return None;
                 };
                 let Some(shell_ref) = shells.first() else {
-                    return false;
+                    return None;
                 };
                 let Some(shell_id) = shell_ref.as_entity_ref() else {
-                    return false;
+                    return None;
                 };
                 match decoder.decode_by_id(shell_id) {
                     Ok(shell) => self.shell_first_vertex(&shell, decoder),
@@ -371,11 +405,7 @@ impl GeometryRouter {
                 }
             }
             _ => None,
-        };
-
-        first_vertex
-            .map(|point| self.raw_coordinate_is_large(point))
-            .unwrap_or(false)
+        }
     }
 
     /// Detect RTC offset by scanning the file for building elements.

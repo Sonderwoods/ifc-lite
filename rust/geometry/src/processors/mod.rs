@@ -44,6 +44,7 @@ pub use brep::{
     FaceBasedSurfaceModelProcessor, FacetedBrepProcessor, ShellBasedSurfaceModelProcessor,
 };
 pub use csg_primitive::{BlockProcessor, CsgSolidProcessor};
+pub use helpers::with_raw_anchor;
 pub use sphere::SphereProcessor;
 pub use extrusion::ExtrudedAreaSolidProcessor;
 pub use extrusion_tapered::ExtrudedAreaSolidTaperedProcessor;

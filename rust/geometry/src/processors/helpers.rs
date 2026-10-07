@@ -151,11 +151,14 @@ pub(super) fn extract_loop_points_by_id(
     decoder: &mut EntityDecoder,
 ) -> Option<Vec<Point3<f64>>> {
     let point_ids = decoder.get_polyloop_point_ids_fast(loop_id)?;
+    let (ax, ay, az) = RAW_ANCHOR.with(|a| a.get());
 
     let mut points = Vec::with_capacity(point_ids.len());
     for point_id in point_ids {
         let (x, y, z) = decoder.get_cartesian_point_fast(point_id)?;
-        points.push(Point3::new(x, y, z));
+        // Subtract in f64, BEFORE the f32 cast further down, so absolute national-grid
+        // coordinates (~6.7 million) keep their millimetres. Zero anchor is a no-op.
+        points.push(Point3::new(x - ax, y - ay, z - az));
     }
 
     if points.len() >= 3 {
@@ -163,6 +166,21 @@ pub(super) fn extract_loop_points_by_id(
     } else {
         None
     }
+}
+
+thread_local! {
+    /// File-unit anchor [`extract_loop_points_by_id`] subtracts from every raw point in f64.
+    static RAW_ANCHOR: std::cell::Cell<(f64, f64, f64)> = const { std::cell::Cell::new((0.0, 0.0, 0.0)) };
+}
+
+/// Runs `f` with `anchor` (file units) subtracted from every polyloop point the surface-model
+/// processors read, restoring the previous anchor afterwards. The caller owns re-adding it
+/// (see `Mesh::origin`), because a float32 at 6.7 million has a 0.5 m step.
+pub fn with_raw_anchor<R>(anchor: (f64, f64, f64), f: impl FnOnce() -> R) -> R {
+    let prev = RAW_ANCHOR.with(|a| a.replace(anchor));
+    let out = f();
+    RAW_ANCHOR.with(|a| a.set(prev));
+    out
 }
 
 /// Get transform from IfcAxis2Placement3D by entity ID.

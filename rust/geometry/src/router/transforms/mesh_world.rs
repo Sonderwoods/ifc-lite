@@ -16,8 +16,12 @@ impl GeometryRouter {
     /// intermediate local transforms.
     #[inline]
     pub(crate) fn transform_mesh_local(&self, mesh: &mut Mesh, transform: &Matrix4<f64>) {
+        // A raw-anchored item (see `process_representation_item_uncached`) carries a PRE-transform
+        // f64 translation in `origin`; fold it in here, where positions are f32 again anyway.
+        let [ox, oy, oz] = mesh.origin;
+        mesh.origin = [0.0; 3];
         mesh.positions.chunks_exact_mut(3).for_each(|chunk| {
-            let point = Point3::new(chunk[0] as f64, chunk[1] as f64, chunk[2] as f64);
+            let point = Point3::new(chunk[0] as f64 + ox, chunk[1] as f64 + oy, chunk[2] as f64 + oz);
             let t = transform.transform_point(&point);
             chunk[0] = t.x as f32;
             chunk[1] = t.y as f32;
@@ -79,6 +83,22 @@ impl GeometryRouter {
             Some([min[0], min[1], min[2], max[0], max[1], max[2]])
         };
         mesh.local_to_world = Some(super::mat4_to_row_major(transform));
+
+        // PRE-transform f64 translation of a raw-anchored item: world = M * (p + origin)
+        // = (M * T(origin)) * p, so fold it into the matrix and keep the whole thing in f64.
+        let pre_origin = mesh.origin;
+        let folded;
+        let transform = if pre_origin != [0.0; 3] {
+            folded = transform * Matrix4::new_translation(&nalgebra::Vector3::new(
+                pre_origin[0],
+                pre_origin[1],
+                pre_origin[2],
+            ));
+            mesh.origin = [0.0; 3];
+            &folded
+        } else {
+            transform
+        };
 
         let rtc = self.rtc_offset;
         let needs_rtc = self.has_rtc_offset() && !mesh.rtc_applied;
