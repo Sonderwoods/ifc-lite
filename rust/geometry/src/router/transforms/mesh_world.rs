@@ -87,6 +87,9 @@ impl GeometryRouter {
         // PRE-transform f64 translation of a raw-anchored item: world = M * (p + origin)
         // = (M * T(origin)) * p, so fold it into the matrix and keep the whole thing in f64.
         let pre_origin = mesh.origin;
+        // Normals use the placement alone: a translation cannot change them, but the big
+        // translation does add float noise to the inverse-transpose.
+        let normal_transform = transform;
         let folded;
         let transform = if pre_origin != [0.0; 3] {
             folded = transform * Matrix4::new_translation(&nalgebra::Vector3::new(
@@ -126,7 +129,7 @@ impl GeometryRouter {
             if needs_rtc {
                 mesh.rtc_applied = true;
             }
-            self.transform_normals(mesh, transform);
+            self.transform_normals(mesh, normal_transform);
             return;
         }
 
@@ -190,7 +193,7 @@ impl GeometryRouter {
             mesh.rtc_applied = true;
         }
 
-        self.transform_normals(mesh, transform);
+        self.transform_normals(mesh, normal_transform);
     }
 
     #[inline]
