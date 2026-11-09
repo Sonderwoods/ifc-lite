@@ -17,15 +17,16 @@ import { getViewerStoreApi } from '@/store';
 import type { ViewerState } from '@/store';
 import { loadIdsContent } from '@/hooks/ids/loadIdsContent';
 import { EVENT_ADD_MODEL, EVENT_LOAD_FILE } from './events';
+import { publicUrl } from '@/lib/public-url';
 
 const BASE_NAME = 'building-architecture.ifc';
 const REV_B_NAME = 'building-architecture-rev-b.ifc';
 
 export const DEMO_KIT_PATHS = {
-  base: `/samples/${BASE_NAME}`,
-  revB: `/samples/${REV_B_NAME}`,
-  ids: '/samples/building-architecture.ids',
-  manifest: '/samples/demo-kit.json',
+  base: publicUrl(`/samples/${BASE_NAME}`),
+  revB: publicUrl(`/samples/${REV_B_NAME}`),
+  ids: publicUrl('/samples/building-architecture.ids'),
+  manifest: publicUrl('/samples/demo-kit.json'),
 } as const;
 
 /**

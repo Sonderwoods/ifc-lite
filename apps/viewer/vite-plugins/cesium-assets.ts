@@ -6,7 +6,7 @@ import type { Plugin } from 'vite';
 const require = createRequire(import.meta.url);
 
 // CesiumJS loads its prebuilt Workers / Assets / Widgets / ThirdParty at runtime
-// from CESIUM_BASE_URL (= '/cesium', set in vite.config's `define`), so they must
+// from CESIUM_BASE_URL (= '<base>cesium', from vite.config's cesiumBaseUrl()), so they must
 // sit at  <outDir>/cesium/<Subdir>/…  and be served at  /cesium/<Subdir>/…  in dev.
 //
 // We copy them ourselves rather than via vite-plugin-static-copy: in its v4 line

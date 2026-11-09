@@ -65,6 +65,7 @@ import {
 } from './data';
 import type { CatalogTool, McpClient, McpClientId, ToolCategory } from './types';
 import { scrollToAnchor, useCopyToClipboard, useDocumentMeta, useFonts } from './use-mcp-page';
+import { publicUrl } from '@/lib/public-url';
 
 const NIGHT = '#0a0a0c';
 const NIGHT_2 = '#121215';
@@ -139,7 +140,7 @@ function TopBar(): ReactNode {
           {/* Brand also acts as the back-to-viewer affordance, but the
               Viewer link in the nav makes that explicit so it doesn't
               rely on users guessing. */}
-          <a href="/" className="text-[16px] tracking-tight" style={{ color: PAPER, fontWeight: 600 }}>
+          <a href={publicUrl('/')} className="text-[16px] tracking-tight" style={{ color: PAPER, fontWeight: 600 }}>
             ifc-lite
           </a>
           <span style={{ ...mono, color: PAPER_DIM }} className="text-[10px] uppercase tracking-[0.22em]">
@@ -148,7 +149,7 @@ function TopBar(): ReactNode {
         </div>
         <nav className="hidden items-center gap-7 text-[13.5px] sm:flex" style={{ color: PAPER_DIM, fontWeight: 500 }}>
           <a
-            href="/"
+            href={publicUrl('/')}
             className="group inline-flex items-center gap-1 transition-colors hover:text-[var(--paper)]"
             style={{ ['--paper' as never]: PAPER }}
           >
@@ -160,7 +161,7 @@ function TopBar(): ReactNode {
           <a href="#tools" className="transition-colors hover:text-[var(--paper)]" style={{ ['--paper' as never]: PAPER }}>Tools</a>
         </nav>
         <a
-          href="/mcp/playground"
+          href={publicUrl('/mcp/playground')}
           className="group relative inline-flex items-center gap-1.5 px-4 py-2 text-[13px] font-medium tracking-tight transition-colors"
           style={{ background: ACCENT, color: NIGHT, borderRadius: 999 }}
         >
@@ -204,7 +205,7 @@ function Hero(): ReactNode {
             </p>
             <div className="mt-10 flex flex-wrap items-center gap-3">
               <a
-                href="/mcp/playground"
+                href={publicUrl('/mcp/playground')}
                 className="group relative inline-flex items-center gap-2 px-7 py-4 text-[15px] font-semibold tracking-tight"
                 style={{ background: ACCENT, color: NIGHT, borderRadius: 6 }}
               >
@@ -1230,7 +1231,7 @@ function Footer(): ReactNode {
               <span style={{ fontStyle: 'italic', color: ACCENT }}>We brought the tools.</span>
             </h3>
             <a
-              href="/mcp/playground"
+              href={publicUrl('/mcp/playground')}
               className="mt-6 inline-flex items-center gap-2 px-6 py-3 text-[14px] font-semibold"
               style={{ background: ACCENT, color: NIGHT, borderRadius: 6 }}
             >

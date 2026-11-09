@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import Icons from 'unplugin-icons/vite';
 import { FileSystemIconLoader } from 'unplugin-icons/loaders';
@@ -217,6 +217,23 @@ const appVersion = viewerPkg.version || rootPkg.version;
 // GITHUB_SHA; falls back to 'dev' for local builds.
 const buildSha = (process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || 'dev').slice(0, 12);
 
+/**
+ * Cesium fetches its workers and assets from CESIUM_BASE_URL, which the
+ * cesium-assets plugin stages at `<outDir>/cesium`. Defined from the base so
+ * the globe still loads when the viewer is built with `--base=/Some/Path/`
+ * and served under that subpath; a `config` hook sees the CLI's base merged
+ * in, where a literal in `define` could not.
+ */
+function cesiumBaseUrl(): Plugin {
+  return {
+    name: 'ifc-lite:cesium-base-url',
+    config(config) {
+      const base = (config.base ?? '/').replace(/\/+$/, '');
+      return { define: { CESIUM_BASE_URL: JSON.stringify(`${base}/cesium`) } };
+    },
+  };
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -247,6 +264,7 @@ export default defineConfig({
     // relay. Dev runs the SAME handler production does (#2792), rather than a
     // second proxy config that can drift from it.
     daluxRelayRoute(),
+    cesiumBaseUrl(),
   ],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
@@ -254,7 +272,7 @@ export default defineConfig({
     __BUILD_DATE__: JSON.stringify(new Date().toISOString()),
     __RELEASE_HISTORY__: JSON.stringify(parseChangelogs()),
     __PACKAGE_VERSIONS__: JSON.stringify(collectPackageVersions()),
-    CESIUM_BASE_URL: JSON.stringify('/cesium'),
+    // CESIUM_BASE_URL comes from the cesiumBaseUrl() plugin, which follows the base.
   },
   resolve: {
     alias: {

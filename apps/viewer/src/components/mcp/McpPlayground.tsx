@@ -38,6 +38,7 @@ import { PlaygroundChat } from './PlaygroundChat';
 import { PlaygroundViewer } from './PlaygroundViewer';
 import type { ViewerController } from './playground-viewer-types';
 import { playgroundFiles, usePlaygroundFiles, formatBytes as formatFileBytes } from './playground-files';
+import { publicUrl } from '@/lib/public-url';
 
 const NIGHT = '#0a0a0c';
 const PANEL = '#101014';
@@ -68,9 +69,9 @@ interface SampleEntry {
 }
 
 const SAMPLES: SampleEntry[] = [
-  { id: 'hello-wall',          label: 'Hello Wall',          blurb: 'IFC4 minimal · 1 wall, 1 storey',          url: '/samples/hello-wall.ifc',          approxBytes:  78_000 },
-  { id: 'building-architecture', label: 'Building / Architecture', blurb: 'buildingSMART sample · 444 entities, IFC4', url: '/samples/building-architecture.ifc', approxBytes: 220_000 },
-  { id: 'infra-bridge',        label: 'Infra Bridge',        blurb: 'Infrastructure · IFC4 bridge sample',      url: '/samples/infra-bridge.ifc',        approxBytes: 1_800_000 },
+  { id: 'hello-wall',          label: 'Hello Wall',          blurb: 'IFC4 minimal · 1 wall, 1 storey',          url: publicUrl('/samples/hello-wall.ifc'),          approxBytes:  78_000 },
+  { id: 'building-architecture', label: 'Building / Architecture', blurb: 'buildingSMART sample · 444 entities, IFC4', url: publicUrl('/samples/building-architecture.ifc'), approxBytes: 220_000 },
+  { id: 'infra-bridge',        label: 'Infra Bridge',        blurb: 'Infrastructure · IFC4 bridge sample',      url: publicUrl('/samples/infra-bridge.ifc'),        approxBytes: 1_800_000 },
 ];
 
 export function McpPlayground(): ReactNode {
@@ -192,13 +193,13 @@ export function McpPlayground(): ReactNode {
 function TopBar({ onClose, hasModel }: { onClose: () => void; hasModel: boolean }): ReactNode {
   return (
     <div className="flex items-center justify-between border-b border-white/10 px-5 py-3">
-      <a href="/mcp" className="flex items-center gap-2 text-[13px] text-white/70 hover:text-white">
+      <a href={publicUrl('/mcp')} className="flex items-center gap-2 text-[13px] text-white/70 hover:text-white">
         <ArrowLeft size={14} />
         <span>back to /mcp</span>
       </a>
       <div className="flex items-center gap-3">
         <a
-          href="/"
+          href={publicUrl('/')}
           className="hidden items-center gap-1 text-[10.5px] uppercase tracking-[0.22em] text-white/40 hover:text-white sm:inline-flex"
           style={mono}
         >
@@ -378,10 +379,10 @@ function ModelSummary({ model }: { model: LoadedPlaygroundModel }): ReactNode {
 function FooterLinks(): ReactNode {
   return (
     <div className="mt-auto flex items-center justify-between gap-2 border-t border-white/10 pt-3 text-[10.5px]" style={{ ...mono, color: PAPER_DIM }}>
-      <a href="/mcp" className="hover:text-white">tools</a>
+      <a href={publicUrl('/mcp')} className="hover:text-white">tools</a>
       <a href="https://github.com/LTplus-AG/ifc-lite" className="hover:text-white">github</a>
       <a href="https://www.npmjs.com/package/@ifc-lite/mcp" className="hover:text-white">npm</a>
-      <a href="/" className="hover:text-white">viewer</a>
+      <a href={publicUrl('/')} className="hover:text-white">viewer</a>
     </div>
   );
 }

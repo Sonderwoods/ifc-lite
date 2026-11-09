@@ -23,6 +23,7 @@ import {
   setProvenance,
   IFCX_VERSION,
 } from '@ifc-lite/ifcx';
+import { publicUrl } from '@/lib/public-url';
 
 /** hello-wall entity paths (IFC5 UUID-style; path IS the identity). */
 const WALL = '93791d5d-5beb-437b-b8ec-2f1f0ba4bf3b';
@@ -32,7 +33,7 @@ const WINDOW_B = '2c2d549f-f9fe-4e22-8590-562fda81a690';
 const FIRE = 'bsi::ifc::v5a::Pset_FireSafety::FireRating';
 const COMBUSTIBLE = 'bsi::ifc::v5a::Pset_FireSafety::Combustible';
 
-const SAMPLE_PATH = '/samples/hello-wall.ifcx';
+const SAMPLE_PATH = publicUrl('/samples/hello-wall.ifcx');
 
 /** Load-a-layer-stack request; the listener lives next to the load-file
  *  one in MainToolbar and routes to `loadFederatedIfcx`. */

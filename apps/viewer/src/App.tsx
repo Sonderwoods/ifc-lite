@@ -20,6 +20,7 @@ import { Toaster } from './components/ui/toast';
 import { ChunkErrorBoundary } from './components/ChunkErrorBoundary';
 import { Suspense, lazy, useEffect, useState } from 'react';
 import { Analytics } from '@vercel/analytics/react';
+import { appPathname } from './lib/public-url';
 
 // The /mcp marketing surface pulls in three.js (HeroScene / PlaygroundViewer)
 // and its own component tree — none of which the main `/` viewer route needs.
@@ -44,10 +45,10 @@ function RouteFallback() {
 }
 
 export function App() {
-  const [pathname, setPathname] = useState(() => window.location.pathname);
+  const [pathname, setPathname] = useState(() => appPathname(window.location.pathname));
 
   useEffect(() => {
-    const onRouteChange = () => setPathname(window.location.pathname);
+    const onRouteChange = () => setPathname(appPathname(window.location.pathname));
     window.addEventListener('popstate', onRouteChange);
     return () => window.removeEventListener('popstate', onRouteChange);
   }, []);

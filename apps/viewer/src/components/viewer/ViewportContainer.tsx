@@ -62,6 +62,7 @@ import type { MeshData, CoordinateInfo, GeometryResult, PointCloudAsset } from '
 import { type IfcDataStore, type MapConversion } from '@ifc-lite/parser';
 import { getEffectiveGeoreference } from '@/lib/geo/effective-georef';
 import { isMeshVisibleInViewMode, meshClassIsPlaced, meshIsNonOccurrence } from '@/lib/type-view-visibility';
+import { publicUrl } from '@/lib/public-url';
 
 const ZERO_VEC3 = { x: 0, y: 0, z: 0 };
 const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
@@ -1251,7 +1252,7 @@ export function ViewportContainer() {
               {/* Logo Container */}
               <div className="relative z-10 animate-float-slow transition-transform duration-300 group-hover/logo:scale-110">
                 <img 
-                  src="/logo.png" 
+                  src={publicUrl('/logo.png')}
                   alt="IFClite Logo" 
                   className="h-28 w-auto drop-shadow-lg"
                 />
@@ -1334,7 +1335,7 @@ export function ViewportContainer() {
                 <span>Open from cloud</span>
               </button>
               <a
-                href="/mcp"
+                href={publicUrl('/mcp')}
                 className="group inline-flex items-center gap-1.5 px-3 py-1.5 font-mono text-[11px] border border-dashed border-zinc-300 dark:border-[#3b4261] text-zinc-500 dark:text-[#7a82a5] hover:border-primary hover:text-primary transition-all cursor-pointer"
               >
                 <Sparkles className="h-3 w-3 transition-transform group-hover:-translate-y-0.5" />
